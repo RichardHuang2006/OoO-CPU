@@ -9,6 +9,8 @@
 #include <functional>
 #include <initializer_list>
 #include <optional>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -19,6 +21,7 @@
 #include "decoder.h"
 #include "alu.h"
 #include "memory.h"
+#include "loader.h"
 
 // ---------------------------------------------------------- harness plumbing ---
 namespace test {
@@ -454,6 +457,179 @@ SECTION("memory") {
     Memory zero;
     zero.write_bytes(0x3000, data, 0);
     REQUIRE(zero.num_pages() == 0);
+}
+
+// ------------------------------------------------------ @section("loader") ---
+namespace loadertest {
+    // Build a minimal ELF32 little-endian executable with one PT_LOAD segment.
+    inline std::vector<uint8_t> make_elf32(uint32_t entry, uint32_t vaddr,
+                                           const uint8_t* payload,
+                                           uint32_t size, uint32_t p_flags) {
+        constexpr uint16_t ehdr_size = 52;
+        constexpr uint16_t phdr_size = 32;
+        const std::size_t payload_off = ehdr_size + phdr_size;
+        std::vector<uint8_t> elf(payload_off + size, 0);
+
+        auto wr8  = [&](std::size_t o, uint8_t v)  { elf[o] = v; };
+        auto wr16 = [&](std::size_t o, uint16_t v) {
+            elf[o]     = static_cast<uint8_t>(v);
+            elf[o + 1] = static_cast<uint8_t>(v >> 8);
+        };
+        auto wr32 = [&](std::size_t o, uint32_t v) {
+            elf[o]     = static_cast<uint8_t>(v);
+            elf[o + 1] = static_cast<uint8_t>(v >>  8);
+            elf[o + 2] = static_cast<uint8_t>(v >> 16);
+            elf[o + 3] = static_cast<uint8_t>(v >> 24);
+        };
+
+        // Ehdr
+        wr8(0, 0x7F); wr8(1, 'E'); wr8(2, 'L'); wr8(3, 'F');
+        wr8(4, 1);            // ELFCLASS32
+        wr8(5, 1);            // ELFDATA2LSB
+        wr8(6, 1);            // EV_CURRENT
+        wr16(16, 2);          // e_type = ET_EXEC
+        wr16(18, 0xF3);       // e_machine = EM_RISCV
+        wr32(20, 1);          // e_version
+        wr32(24, entry);
+        wr32(28, ehdr_size);  // e_phoff
+        wr32(32, 0);          // e_shoff
+        wr32(36, 0);          // e_flags
+        wr16(40, ehdr_size);
+        wr16(42, phdr_size);
+        wr16(44, 1);          // e_phnum
+        wr16(46, 40);         // e_shentsize
+        wr16(48, 0);          // e_shnum
+        wr16(50, 0);          // e_shstrndx
+
+        // Phdr
+        wr32(ehdr_size +  0, 1);                                             // PT_LOAD
+        wr32(ehdr_size +  4, static_cast<uint32_t>(payload_off));            // p_offset
+        wr32(ehdr_size +  8, vaddr);                                         // p_vaddr
+        wr32(ehdr_size + 12, vaddr);                                         // p_paddr
+        wr32(ehdr_size + 16, size);                                          // p_filesz
+        wr32(ehdr_size + 20, size);                                          // p_memsz
+        wr32(ehdr_size + 24, p_flags);                                       // p_flags
+        wr32(ehdr_size + 28, 4);                                             // p_align
+
+        for (uint32_t i = 0; i < size; ++i) elf[payload_off + i] = payload[i];
+        return elf;
+    }
+
+    inline bool threw(std::function<void()> fn) {
+        try { fn(); return false; } catch (const std::exception&) { return true; }
+    }
+}
+
+SECTION("loader") {
+    // Common payload: three 32-bit words at base 0x1000.
+    const uint32_t words[] = {0xDEADBEEFu, 0xCAFEBABEu, 0x12345678u};
+    const uint32_t base = 0x1000;
+
+    uint8_t payload[sizeof(words)];
+    for (std::size_t i = 0; i < 3; ++i) {
+        payload[i*4 + 0] = static_cast<uint8_t>(words[i]);
+        payload[i*4 + 1] = static_cast<uint8_t>(words[i] >>  8);
+        payload[i*4 + 2] = static_cast<uint8_t>(words[i] >> 16);
+        payload[i*4 + 3] = static_cast<uint8_t>(words[i] >> 24);
+    }
+
+    // ---- Hex ----------------------------------------------------------------
+    Memory m_hex;
+    {
+        std::istringstream ss(
+            "DEADBEEF\n"
+            "# a comment on its own line\n"
+            "\n"
+            "  0xCAFEBABE  // trailing comment, leading spaces\n"
+            "12345678\n");
+        const auto r = load_hex(m_hex, ss, base);
+        REQUIRE(r.entry == base);
+        REQUIRE(r.ro_ranges.empty());
+    }
+
+    // ---- Raw ----------------------------------------------------------------
+    Memory m_raw;
+    {
+        std::string bytes(reinterpret_cast<const char*>(payload), sizeof(payload));
+        std::istringstream ss(bytes);
+        const auto r = load_raw(m_raw, ss, base);
+        REQUIRE(r.entry == base);
+        REQUIRE(r.ro_ranges.empty());
+    }
+
+    // ---- ELF32 --------------------------------------------------------------
+    Memory m_elf;
+    {
+        const auto blob = loadertest::make_elf32(base, base, payload,
+                                                 sizeof(payload),
+                                                 /*PF_R | PF_X =*/ 5);
+        std::string s(reinterpret_cast<const char*>(blob.data()), blob.size());
+        std::istringstream ss(s);
+        const auto r = load_elf(m_elf, ss);
+        REQUIRE(r.entry == base);
+        REQUIRE(r.ro_ranges.size() == 1);
+        REQUIRE(r.ro_ranges[0].first  == base);
+        REQUIRE(r.ro_ranges[0].second == base + sizeof(payload));
+    }
+
+    // ---- The plan's marquee assertion: all three lands identical bytes ----
+    for (std::size_t i = 0; i < 3; ++i) {
+        REQUIRE(m_hex.load_u32(base + i * 4) == words[i]);
+        REQUIRE(m_raw.load_u32(base + i * 4) == words[i]);
+        REQUIRE(m_elf.load_u32(base + i * 4) == words[i]);
+    }
+
+    // ---- Writable ELF segment does NOT get flagged read-only --------------
+    {
+        Memory m;
+        const auto blob = loadertest::make_elf32(base, base, payload,
+                                                 sizeof(payload),
+                                                 /*PF_R | PF_W =*/ 6);
+        std::string s(reinterpret_cast<const char*>(blob.data()), blob.size());
+        std::istringstream ss(s);
+        const auto r = load_elf(m, ss);
+        REQUIRE(r.ro_ranges.empty());
+    }
+
+    // ---- ELF BSS (p_memsz > p_filesz) reads back as zeros -----------------
+    {
+        Memory m;
+        // Build ELF with p_filesz=size, p_memsz=size+8 (fake BSS tail).
+        auto blob = loadertest::make_elf32(base, base, payload,
+                                           sizeof(payload), 6);
+        // Patch p_memsz at Phdr offset 20 → size + 8.
+        const std::size_t phdr = 52;
+        const uint32_t new_memsz = sizeof(payload) + 8;
+        blob[phdr + 20] = static_cast<uint8_t>(new_memsz);
+        blob[phdr + 21] = static_cast<uint8_t>(new_memsz >>  8);
+        blob[phdr + 22] = static_cast<uint8_t>(new_memsz >> 16);
+        blob[phdr + 23] = static_cast<uint8_t>(new_memsz >> 24);
+        std::string s(reinterpret_cast<const char*>(blob.data()), blob.size());
+        std::istringstream ss(s);
+        (void)load_elf(m, ss);
+        REQUIRE(m.load_u32(base) == words[0]);
+        // Bytes beyond p_filesz read as zero (Memory returns 0 for unmapped).
+        REQUIRE(m.load_u32(base + sizeof(payload))     == 0u);
+        REQUIRE(m.load_u32(base + sizeof(payload) + 4) == 0u);
+    }
+
+    // ---- Error paths ------------------------------------------------------
+    REQUIRE(loadertest::threw([]{
+        Memory m; std::istringstream ss("NOTHEX\n"); load_hex(m, ss, 0);
+    }));
+    REQUIRE(loadertest::threw([]{
+        Memory m; std::istringstream ss("not an elf at all"); load_elf(m, ss);
+    }));
+    REQUIRE(loadertest::threw([]{
+        // Correct magic but ELFCLASS64
+        Memory m;
+        std::string s(52, '\0');
+        s[0] = 0x7F; s[1] = 'E'; s[2] = 'L'; s[3] = 'F';
+        s[4] = 2;    // ELFCLASS64
+        s[5] = 1;
+        std::istringstream ss(s);
+        load_elf(m, ss);
+    }));
 }
 
 
