@@ -22,6 +22,7 @@
 #include "alu.h"
 #include "memory.h"
 #include "loader.h"
+#include "asm.h"
 
 // Include the driver TU so parse_args / print_help / run_program are
 // unit-testable without shelling out. Its own int main() is guarded off.
@@ -727,6 +728,224 @@ SECTION("cli") {
     REQUIRE(t.trapped);
     REQUIRE(!t.halted);
     REQUIRE(t.retired == 1);
+}
+
+// --------------------------------------------------------- @section("asm") ---
+SECTION("asm") {
+    using namespace asmc;
+
+    // ---- Every instruction encodes byte-exact vs. the enc:: reference ---
+    // The enc:: helpers were pinned in @section("decode") against 57
+    // instructions, so this is a genuine differential check.
+    {
+        Assembler a;
+        a.addi (a0, a1, 5);
+        a.sub  (t0, t1, t2);
+        a.sll  (s0, s1, s2);
+        a.slli (s0, s1, 5);
+        a.slti (a0, a1, -1);
+        a.sltiu(a0, a1, 100);
+        a.xori (a0, a1, 0xFF);
+        a.ori  (a0, a1, 0x1);
+        a.andi (a0, a1, 0xFF);
+        a.srli (s0, s1, 7);
+        a.srai (s0, s1, 7);
+        a.slt  (s0, s1, s2);
+        a.sltu (s0, s1, s2);
+        a.xor_ (s0, s1, s2);
+        a.srl  (s0, s1, s2);
+        a.sra  (s0, s1, s2);
+        a.or_  (s0, s1, s2);
+        a.and_ (s0, s1, s2);
+        a.lui  (a0, 0x12345);
+        a.auipc(a0, 0x12345);
+        a.lb   (a0, sp, -4);
+        a.lh   (a0, sp,  0);
+        a.lw   (a0, sp,  4);
+        a.lbu  (a0, sp,  8);
+        a.lhu  (a0, sp, 12);
+        a.sb   (a0, sp, -4);
+        a.sh   (a0, sp,  0);
+        a.sw   (a0, sp,  4);
+        a.jalr (ra, a0, 4);
+        a.mul   (a0, a1, a2);
+        a.mulh  (a0, a1, a2);
+        a.mulhsu(a0, a1, a2);
+        a.mulhu (a0, a1, a2);
+        a.div_  (a0, a1, a2);
+        a.divu  (a0, a1, a2);
+        a.rem   (a0, a1, a2);
+        a.remu  (a0, a1, a2);
+        a.fence();
+        a.fence_i();
+        a.ecall();
+        a.ebreak();
+        const auto w = a.assemble();
+
+        const uint32_t exp[] = {
+            enc::I(0x13, a0, 0x0, a1,  5),
+            enc::R(0x33, t0, 0x0, t1, t2, 0x20),          // sub
+            enc::R(0x33, s0, 0x1, s1, s2, 0x00),          // sll
+            enc::R(0x13, s0, 0x1, s1, 5,  0x00),          // slli
+            enc::I(0x13, a0, 0x2, a1, -1),
+            enc::I(0x13, a0, 0x3, a1, 100),
+            enc::I(0x13, a0, 0x4, a1, 0xFF),
+            enc::I(0x13, a0, 0x6, a1, 0x1),
+            enc::I(0x13, a0, 0x7, a1, 0xFF),
+            enc::R(0x13, s0, 0x5, s1, 7, 0x00),           // srli
+            enc::R(0x13, s0, 0x5, s1, 7, 0x20),           // srai
+            enc::R(0x33, s0, 0x2, s1, s2, 0x00),          // slt
+            enc::R(0x33, s0, 0x3, s1, s2, 0x00),          // sltu
+            enc::R(0x33, s0, 0x4, s1, s2, 0x00),          // xor
+            enc::R(0x33, s0, 0x5, s1, s2, 0x00),          // srl
+            enc::R(0x33, s0, 0x5, s1, s2, 0x20),          // sra
+            enc::R(0x33, s0, 0x6, s1, s2, 0x00),          // or
+            enc::R(0x33, s0, 0x7, s1, s2, 0x00),          // and
+            enc::U(0x37, a0, 0x12345),                    // lui
+            enc::U(0x17, a0, 0x12345),                    // auipc
+            enc::I(0x03, a0, 0x0, sp, -4),                // lb
+            enc::I(0x03, a0, 0x1, sp,  0),
+            enc::I(0x03, a0, 0x2, sp,  4),
+            enc::I(0x03, a0, 0x4, sp,  8),
+            enc::I(0x03, a0, 0x5, sp, 12),
+            enc::S(0x0, sp, a0, -4),
+            enc::S(0x1, sp, a0,  0),
+            enc::S(0x2, sp, a0,  4),
+            enc::I(0x67, ra, 0x0, a0, 4),                 // jalr
+            enc::R(0x33, a0, 0x0, a1, a2, 0x01),          // mul
+            enc::R(0x33, a0, 0x1, a1, a2, 0x01),
+            enc::R(0x33, a0, 0x2, a1, a2, 0x01),
+            enc::R(0x33, a0, 0x3, a1, a2, 0x01),
+            enc::R(0x33, a0, 0x4, a1, a2, 0x01),
+            enc::R(0x33, a0, 0x5, a1, a2, 0x01),
+            enc::R(0x33, a0, 0x6, a1, a2, 0x01),
+            enc::R(0x33, a0, 0x7, a1, a2, 0x01),
+            0x0000000Fu, 0x0000100Fu, 0x00000073u, 0x00100073u,
+        };
+        REQUIRE(w.size() == sizeof(exp) / sizeof(exp[0]));
+        for (std::size_t i = 0; i < w.size(); ++i) REQUIRE(w[i] == exp[i]);
+    }
+
+    // ---- Labels: forward + backward, both branches and jal --------------
+    {
+        Assembler a;
+        a.label("start");             // pc = 0
+        a.beq(a0, a1, "end");         // pc = 0, target = 12  → off = +12
+        a.j("start");                 // pc = 4, target =  0  → off =  -4
+        a.addi(a0, a0, 1);            // pc = 8
+        a.label("end");               // pc = 12
+        a.ret_();
+        const auto w = a.assemble();
+        REQUIRE(w.size() == 4);
+        REQUIRE(w[0] == enc::B(0x0, a0, a1,  12));
+        REQUIRE(w[1] == enc::J(0, -4));
+        REQUIRE(w[2] == enc::I(0x13, a0, 0x0, a0, 1));
+        REQUIRE(w[3] == enc::I(0x67, 0, 0x0, 1, 0));   // ret = jalr x0, x1, 0
+    }
+
+    // ---- Pseudoinstructions expand as documented ------------------------
+    {
+        Assembler a;
+        a.nop();                                     // → addi x0, x0, 0
+        a.mv(a0, a1);                                // → addi a0, a1, 0
+        a.li(a0, 42);                                // small → single addi
+        a.li(t0, -1);                                // fits in 12-bit imm
+        a.jr(ra);                                    // → jalr x0, ra, 0
+        const auto w = a.assemble();
+        REQUIRE(w.size() == 5);
+        REQUIRE(w[0] == 0x00000013u);                                // canonical NOP
+        REQUIRE(w[1] == enc::I(0x13, a0, 0x0, a1, 0));
+        REQUIRE(w[2] == enc::I(0x13, a0, 0x0, 0,   42));
+        REQUIRE(w[3] == enc::I(0x13, t0, 0x0, 0,   -1));
+        REQUIRE(w[4] == enc::I(0x67, 0,  0x0, ra,   0));
+    }
+
+    // ---- li with large immediate uses the lui + addi pair with the
+    // ---- lower-12 sign-compensation trick -------------------------------
+    {
+        // 0x12345678: low 12 = 0x678 (positive) → hi20 rounds to 0x12345.
+        Assembler a;
+        a.li(a0, static_cast<int32_t>(0x12345678));
+        const auto w = a.assemble();
+        REQUIRE(w.size() == 2);
+        REQUIRE(w[0] == enc::U(0x37, a0, 0x12345));
+        REQUIRE(w[1] == enc::I(0x13, a0, 0x0, a0, 0x678));
+
+        // 0x12345800: low 12 = 0x800 → high bit set → hi20 rounds up to
+        // 0x12346, lo12 = -0x800. Then 0x12346000 + sext(-0x800) = 0x12345800.
+        Assembler b;
+        b.li(a0, static_cast<int32_t>(0x12345800));
+        const auto wb = b.assemble();
+        REQUIRE(wb.size() == 2);
+        REQUIRE(wb[0] == enc::U(0x37, a0, 0x12346));
+        REQUIRE(wb[1] == enc::I(0x13, a0, 0x0, a0, -0x800));
+    }
+
+    // ---- call target: auipc + jalr, sum lands on the label --------------
+    {
+        Assembler a;
+        a.call("target");             // pc 0..7, ra <- pc + 8
+        a.nop();                      // pc 8
+        a.label("target");            // pc 12
+        a.ecall();
+        const auto w = a.assemble();
+        REQUIRE(w.size() == 4);
+        // Split (target - call_pc) = 12 through the (imm + 0x800) >> 12 trick.
+        // For offset = 12, hi20 = 0, lo12 = 12.
+        REQUIRE(w[0] == enc::U(0x17, ra, 0));
+        REQUIRE(w[1] == enc::I(0x67, ra, 0x0, ra, 12));
+
+        // Decode both halves and simulate: auipc ra, 0 → ra = pc0 + 0 = 0.
+        // jalr ra, ra, 12 → next PC = (0 + 12) & ~1 = 12 → target ✓
+    }
+
+    // ---- The assembled program actually runs on the interpreter ---------
+    // Sanity: sum 1..10 = 55, exit(55) via ECALL a7=93.
+    {
+        Assembler p;
+        p.li(a0, 0);                          // sum = 0
+        p.li(a1, 1);                          // i = 1
+        p.li(a2, 11);                         // limit
+        p.label("loop");
+        p.beq(a1, a2, "done");
+        p.add(a0, a0, a1);                    // sum += i
+        p.addi(a1, a1, 1);
+        p.j("loop");
+        p.label("done");
+        p.li(a7, 93);
+        p.ecall();
+        const auto words = p.assemble();
+
+        Memory mem;
+        for (std::size_t i = 0; i < words.size(); ++i) {
+            mem.store_u32(0x1000 + static_cast<uint32_t>(i * 4), words[i]);
+        }
+        const RunResult r = run_program(mem, 0x1000, /*max_insts=*/1000, /*trace=*/false);
+        REQUIRE(r.halted);
+        REQUIRE(!r.trapped);
+        REQUIRE(r.exit_code == 55);
+        REQUIRE(r.regs[10]  == 55);
+    }
+
+    // ---- Error paths ----------------------------------------------------
+    // Undefined label throws at assemble time, not silently.
+    {
+        Assembler a;
+        a.j("nope");
+        bool threw = false;
+        try { (void)a.assemble(); } catch (const std::runtime_error&) { threw = true; }
+        REQUIRE(threw);
+    }
+    // Branch offset out of range (>4094 bytes) throws.
+    {
+        Assembler a;
+        a.beq(a0, a1, "far");
+        for (int i = 0; i < 2050; ++i) a.nop();           // ~8 KiB gap
+        a.label("far");
+        bool threw = false;
+        try { (void)a.assemble(); } catch (const std::runtime_error&) { threw = true; }
+        REQUIRE(threw);
+    }
 }
 
 
