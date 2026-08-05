@@ -16,6 +16,7 @@
 
 #include "types.h"
 #include "config.h"
+#include "decoder.h"
 
 // ---------------------------------------------------------- harness plumbing ---
 namespace test {
@@ -127,6 +128,186 @@ SECTION("config") {
     Config small_prf = c;
     small_prf.prf_size = 32;
     REQUIRE(small_prf.prf_can_starve());
+}
+
+// ------------------------------------------------------ @section("decode") ---
+namespace enc {
+    // File-local encoders — enough to build the decode-test cases without
+    // duplicating raw hex constants. Step 2.1's asm.h supersedes these.
+    constexpr uint32_t R(uint32_t op, uint32_t rd, uint32_t f3,
+                         uint32_t rs1, uint32_t rs2, uint32_t f7) {
+        return (f7 << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op;
+    }
+    constexpr uint32_t I(uint32_t op, uint32_t rd, uint32_t f3,
+                         uint32_t rs1, int32_t imm) {
+        const uint32_t u = static_cast<uint32_t>(imm) & 0xFFF;
+        return (u << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op;
+    }
+    constexpr uint32_t S(uint32_t f3, uint32_t rs1, uint32_t rs2, int32_t imm) {
+        const uint32_t u = static_cast<uint32_t>(imm) & 0xFFF;
+        const uint32_t hi = (u >> 5) & 0x7F;
+        const uint32_t lo = u & 0x1F;
+        return (hi << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (lo << 7) | 0x23;
+    }
+    constexpr uint32_t B(uint32_t f3, uint32_t rs1, uint32_t rs2, int32_t imm) {
+        const uint32_t u = static_cast<uint32_t>(imm) & 0x1FFF;
+        const uint32_t b12   = (u >> 12) & 0x1;
+        const uint32_t b11   = (u >> 11) & 0x1;
+        const uint32_t b10_5 = (u >> 5) & 0x3F;
+        const uint32_t b4_1  = (u >> 1) & 0xF;
+        return (b12 << 31) | (b10_5 << 25) | (rs2 << 20) | (rs1 << 15) |
+               (f3 << 12) | (b4_1 << 8) | (b11 << 7) | 0x63;
+    }
+    constexpr uint32_t U(uint32_t op, uint32_t rd, uint32_t imm_hi20) {
+        return ((imm_hi20 & 0xFFFFF) << 12) | (rd << 7) | op;
+    }
+    constexpr uint32_t J(uint32_t rd, int32_t imm) {
+        const uint32_t u = static_cast<uint32_t>(imm) & 0x1FFFFF;
+        const uint32_t b20    = (u >> 20) & 0x1;
+        const uint32_t b19_12 = (u >> 12) & 0xFF;
+        const uint32_t b11    = (u >> 11) & 0x1;
+        const uint32_t b10_1  = (u >> 1)  & 0x3FF;
+        return (b20 << 31) | (b10_1 << 21) | (b11 << 20) | (b19_12 << 12) |
+               (rd << 7) | 0x6F;
+    }
+    // pseudos for ECALL / EBREAK / FENCE (system with fixed imm)
+    constexpr uint32_t ECALL()   { return 0x00000073u; }
+    constexpr uint32_t EBREAK()  { return 0x00100073u; }
+    constexpr uint32_t FENCE()   { return 0x0000000Fu; }  // pred=succ=0
+    constexpr uint32_t FENCE_I() { return 0x0000100Fu; }
+}
+
+SECTION("decode") {
+    struct C {
+        uint32_t raw;
+        Op       op;
+        OpKind   kind;
+        ArchReg  rd, rs1, rs2;
+        int32_t  imm;
+        bool     br, ld, st, wrd;
+    };
+
+    // ---- U-type, sign-preserved --------------------------------------------
+    const C cases[] = {
+        {enc::U(0x37, 5, 0xABCDE), Op::LUI,   OpKind::ALU,    5, 0, 0, int32_t(0xABCDE000), 0,0,0, 1},
+        {enc::U(0x37, 1, 0x80000), Op::LUI,   OpKind::ALU,    1, 0, 0, int32_t(0x80000000), 0,0,0, 1},
+        {enc::U(0x17, 6, 0x12345), Op::AUIPC, OpKind::ALU,    6, 0, 0, int32_t(0x12345000), 0,0,0, 1},
+        // rd = 0 → writes_rd false (a defined no-op result)
+        {enc::U(0x37, 0, 0x1),     Op::LUI,   OpKind::ALU,    0, 0, 0, int32_t(0x00001000), 0,0,0, 0},
+
+        // ---- J-type ------------------------------------------------------
+        {enc::J(1,  8),   Op::JAL, OpKind::BRANCH, 1, 0, 0,   8, 1,0,0, 1},
+        {enc::J(0, -12),  Op::JAL, OpKind::BRANCH, 0, 0, 0, -12, 1,0,0, 0},  // `j` pseudo
+        {enc::J(5,  1048574), Op::JAL, OpKind::BRANCH, 5, 0, 0,  1048574, 1,0,0, 1}, // +max
+        {enc::J(5, -1048576), Op::JAL, OpKind::BRANCH, 5, 0, 0, -1048576, 1,0,0, 1}, // -max
+
+        // ---- I-type ALU (immediate) --------------------------------------
+        {enc::I(0x13, 1, 0x0, 2,     5), Op::ADD,  OpKind::ALU, 1, 2, 0,     5, 0,0,0, 1},
+        {enc::I(0x13, 1, 0x0, 2,    -1), Op::ADD,  OpKind::ALU, 1, 2, 0,    -1, 0,0,0, 1},
+        {enc::I(0x13, 1, 0x0, 2,  2047), Op::ADD,  OpKind::ALU, 1, 2, 0,  2047, 0,0,0, 1},
+        {enc::I(0x13, 1, 0x0, 2, -2048), Op::ADD,  OpKind::ALU, 1, 2, 0, -2048, 0,0,0, 1},
+        {enc::I(0x13, 3, 0x2, 4,    -1), Op::SLT,  OpKind::ALU, 3, 4, 0,    -1, 0,0,0, 1},
+        {enc::I(0x13, 3, 0x3, 4,   100), Op::SLTU, OpKind::ALU, 3, 4, 0,   100, 0,0,0, 1},
+        {enc::I(0x13, 3, 0x4, 4,  0xFF), Op::XOR,  OpKind::ALU, 3, 4, 0,  0xFF, 0,0,0, 1},
+        {enc::I(0x13, 3, 0x6, 4,  0x01), Op::OR,   OpKind::ALU, 3, 4, 0,  0x01, 0,0,0, 1},
+        {enc::I(0x13, 3, 0x7, 4,  0xFF), Op::AND,  OpKind::ALU, 3, 4, 0,  0xFF, 0,0,0, 1},
+        // shifts: shamt encoded in rs2 field, f7 selects arithmetic vs. logical
+        {enc::R(0x13, 5, 0x1, 6, 5, 0x00), Op::SLL, OpKind::ALU, 5, 6, 0,  5, 0,0,0, 1}, // SLLI
+        {enc::R(0x13, 5, 0x5, 6, 7, 0x00), Op::SRL, OpKind::ALU, 5, 6, 0,  7, 0,0,0, 1}, // SRLI
+        {enc::R(0x13, 5, 0x5, 6, 7, 0x20), Op::SRA, OpKind::ALU, 5, 6, 0,  7, 0,0,0, 1}, // SRAI
+
+        // ---- R-type ALU --------------------------------------------------
+        {enc::R(0x33, 3, 0x0, 1, 2, 0x00), Op::ADD,  OpKind::ALU, 3, 1, 2, 0, 0,0,0, 1},
+        {enc::R(0x33, 3, 0x0, 1, 2, 0x20), Op::SUB,  OpKind::ALU, 3, 1, 2, 0, 0,0,0, 1},
+        {enc::R(0x33, 3, 0x1, 1, 2, 0x00), Op::SLL,  OpKind::ALU, 3, 1, 2, 0, 0,0,0, 1},
+        {enc::R(0x33, 3, 0x2, 1, 2, 0x00), Op::SLT,  OpKind::ALU, 3, 1, 2, 0, 0,0,0, 1},
+        {enc::R(0x33, 3, 0x3, 1, 2, 0x00), Op::SLTU, OpKind::ALU, 3, 1, 2, 0, 0,0,0, 1},
+        {enc::R(0x33, 3, 0x4, 1, 2, 0x00), Op::XOR,  OpKind::ALU, 3, 1, 2, 0, 0,0,0, 1},
+        {enc::R(0x33, 3, 0x5, 1, 2, 0x00), Op::SRL,  OpKind::ALU, 3, 1, 2, 0, 0,0,0, 1},
+        {enc::R(0x33, 3, 0x5, 1, 2, 0x20), Op::SRA,  OpKind::ALU, 3, 1, 2, 0, 0,0,0, 1},
+        {enc::R(0x33, 3, 0x6, 1, 2, 0x00), Op::OR,   OpKind::ALU, 3, 1, 2, 0, 0,0,0, 1},
+        {enc::R(0x33, 3, 0x7, 1, 2, 0x00), Op::AND,  OpKind::ALU, 3, 1, 2, 0, 0,0,0, 1},
+
+        // ---- M extension (both halves) -----------------------------------
+        {enc::R(0x33, 5, 0x0, 6, 7, 0x01), Op::MUL,    OpKind::MUL, 5, 6, 7, 0, 0,0,0, 1},
+        {enc::R(0x33, 5, 0x1, 6, 7, 0x01), Op::MULH,   OpKind::MUL, 5, 6, 7, 0, 0,0,0, 1},
+        {enc::R(0x33, 5, 0x2, 6, 7, 0x01), Op::MULHSU, OpKind::MUL, 5, 6, 7, 0, 0,0,0, 1},
+        {enc::R(0x33, 5, 0x3, 6, 7, 0x01), Op::MULHU,  OpKind::MUL, 5, 6, 7, 0, 0,0,0, 1},
+        {enc::R(0x33, 5, 0x4, 6, 7, 0x01), Op::DIV,    OpKind::DIV, 5, 6, 7, 0, 0,0,0, 1},
+        {enc::R(0x33, 5, 0x5, 6, 7, 0x01), Op::DIVU,   OpKind::DIV, 5, 6, 7, 0, 0,0,0, 1},
+        {enc::R(0x33, 5, 0x6, 6, 7, 0x01), Op::REM,    OpKind::DIV, 5, 6, 7, 0, 0,0,0, 1},
+        {enc::R(0x33, 5, 0x7, 6, 7, 0x01), Op::REMU,   OpKind::DIV, 5, 6, 7, 0, 0,0,0, 1},
+
+        // ---- Branches ----------------------------------------------------
+        {enc::B(0x0, 1, 2,   8), Op::BEQ,  OpKind::BRANCH, 0, 1, 2,    8, 1,0,0, 0},
+        {enc::B(0x1, 1, 2,  -8), Op::BNE,  OpKind::BRANCH, 0, 1, 2,   -8, 1,0,0, 0},
+        {enc::B(0x4, 1, 2,  16), Op::BLT,  OpKind::BRANCH, 0, 1, 2,   16, 1,0,0, 0},
+        {enc::B(0x5, 1, 2, -16), Op::BGE,  OpKind::BRANCH, 0, 1, 2,  -16, 1,0,0, 0},
+        {enc::B(0x6, 1, 2,  32), Op::BLTU, OpKind::BRANCH, 0, 1, 2,   32, 1,0,0, 0},
+        {enc::B(0x7, 1, 2, -32), Op::BGEU, OpKind::BRANCH, 0, 1, 2,  -32, 1,0,0, 0},
+
+        // ---- Loads -------------------------------------------------------
+        {enc::I(0x03, 1, 0x0, 2,  0), Op::LB,  OpKind::LOAD, 1, 2, 0,  0, 0,1,0, 1},
+        {enc::I(0x03, 1, 0x1, 2,  4), Op::LH,  OpKind::LOAD, 1, 2, 0,  4, 0,1,0, 1},
+        {enc::I(0x03, 1, 0x2, 2, -4), Op::LW,  OpKind::LOAD, 1, 2, 0, -4, 0,1,0, 1},
+        {enc::I(0x03, 1, 0x4, 2,  8), Op::LBU, OpKind::LOAD, 1, 2, 0,  8, 0,1,0, 1},
+        {enc::I(0x03, 1, 0x5, 2, 12), Op::LHU, OpKind::LOAD, 1, 2, 0, 12, 0,1,0, 1},
+
+        // ---- Stores ------------------------------------------------------
+        {enc::S(0x0, 2, 1,   0), Op::SB, OpKind::STORE, 0, 2, 1,   0, 0,0,1, 0},
+        {enc::S(0x1, 2, 1,   4), Op::SH, OpKind::STORE, 0, 2, 1,   4, 0,0,1, 0},
+        {enc::S(0x2, 2, 1,  -4), Op::SW, OpKind::STORE, 0, 2, 1,  -4, 0,0,1, 0},
+
+        // ---- JALR / MISC-MEM / SYSTEM -----------------------------------
+        {enc::I(0x67, 1, 0x0, 2, 4), Op::JALR, OpKind::BRANCH, 1, 2, 0, 4, 1,0,0, 1},
+        {enc::FENCE(),   Op::FENCE,   OpKind::NOP,  0, 0, 0, 0, 0,0,0, 0},
+        {enc::FENCE_I(), Op::FENCE_I, OpKind::NOP,  0, 0, 0, 0, 0,0,0, 0},
+        {enc::ECALL(),   Op::ECALL,   OpKind::TRAP, 0, 0, 0, 0, 0,0,0, 0},
+        {enc::EBREAK(),  Op::EBREAK,  OpKind::TRAP, 0, 0, 0, 0, 0,0,0, 0},
+    };
+
+    for (const C& c : cases) {
+        const Decoded d = decode(c.raw);
+        REQUIRE(d.op        == c.op);
+        REQUIRE(d.kind      == c.kind);
+        REQUIRE(d.rd        == c.rd);
+        REQUIRE(d.rs1       == c.rs1);
+        REQUIRE(d.rs2       == c.rs2);
+        REQUIRE(d.imm       == c.imm);
+        REQUIRE(d.is_branch == bool(c.br));
+        REQUIRE(d.is_load   == bool(c.ld));
+        REQUIRE(d.is_store  == bool(c.st));
+        REQUIRE(d.writes_rd == bool(c.wrd));
+    }
+
+    // ---- Invalid encodings must trap, not crash --------------------------
+    const uint32_t traps[] = {
+        0x00000000,                       // opcode 0
+        0xFFFFFFFFu,                      // opcode 0x7F, all ones
+        enc::I(0x67, 1, 0x1, 2, 0),       // JALR with non-zero funct3
+        enc::R(0x33, 1, 0x0, 2, 3, 0x40), // ADD with reserved funct7
+        enc::R(0x13, 1, 0x1, 2, 5, 0x20), // SLLI with non-zero funct7 bit
+        enc::B(0x2, 1, 2, 0),             // BRANCH funct3=2 (reserved)
+        enc::I(0x03, 1, 0x3, 2, 0),       // LOAD funct3=3 (reserved)
+        enc::S(0x3, 2, 1, 0),             // STORE funct3=3 (reserved)
+        0x00000073u | (0x2u << 20),       // SYSTEM with imm != {0, 1}
+    };
+    for (uint32_t raw : traps) {
+        const Decoded d = decode(raw);
+        REQUIRE(d.op == Op::INVALID);
+        REQUIRE(d.kind == OpKind::TRAP);
+    }
+
+    // ---- Sign-extension boundary spot-checks ----------------------------
+    // I-type: +2047 / -2048
+    REQUIRE(decode(enc::I(0x13, 1, 0, 0,  2047)).imm ==  2047);
+    REQUIRE(decode(enc::I(0x13, 1, 0, 0, -2048)).imm == -2048);
+    // S-type: +2047 / -2048
+    REQUIRE(decode(enc::S(0x2, 1, 2,  2047)).imm ==  2047);
+    REQUIRE(decode(enc::S(0x2, 1, 2, -2048)).imm == -2048);
+    // B-type: +4094 / -4096 (13-bit, low bit always 0)
+    REQUIRE(decode(enc::B(0x0, 1, 2,  4094)).imm ==  4094);
+    REQUIRE(decode(enc::B(0x0, 1, 2, -4096)).imm == -4096);
 }
 
 // -------------------------------------------------------------------- main ---
