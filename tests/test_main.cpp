@@ -17,6 +17,7 @@
 #include "types.h"
 #include "config.h"
 #include "decoder.h"
+#include "alu.h"
 
 // ---------------------------------------------------------- harness plumbing ---
 namespace test {
@@ -309,6 +310,81 @@ SECTION("decode") {
     REQUIRE(decode(enc::B(0x0, 1, 2,  4094)).imm ==  4094);
     REQUIRE(decode(enc::B(0x0, 1, 2, -4096)).imm == -4096);
 }
+
+// --------------------------------------------------------- @section("alu") ---
+SECTION("alu") {
+    // ---- Integer ALU -------------------------------------------------------
+    REQUIRE(alu::add(3, 5) == 8u);
+    REQUIRE(alu::add(0xFFFFFFFFu, 1) == 0u);                        // wrap
+    REQUIRE(alu::sub(3, 5) == static_cast<uint32_t>(-2));
+
+    REQUIRE(alu::sll(1u, 4)  == 16u);
+    REQUIRE(alu::sll(1u, 36) == 16u);                               // shamt & 0x1F
+    REQUIRE(alu::srl(0x80000000u, 4)  == 0x08000000u);              // logical
+    REQUIRE(alu::srl(0x80000000u, 0)  == 0x80000000u);              // 0-shift edge
+    REQUIRE(alu::sra(0x80000000u, 4)  == 0xF8000000u);              // arithmetic
+    REQUIRE(alu::sra(0x80000000u, 0)  == 0x80000000u);              // 0-shift edge
+    REQUIRE(alu::sra(0xFFFFFFFFu, 31) == 0xFFFFFFFFu);              // all-ones preserved
+    REQUIRE(alu::sra(0x40000000u, 4)  == 0x04000000u);              // positive → logical
+
+    REQUIRE(alu::and_(0xF0F0u, 0x0FF0u) == 0x00F0u);
+    REQUIRE(alu::or_ (0xF0F0u, 0x0FF0u) == 0xFFF0u);
+    REQUIRE(alu::xor_(0xF0F0u, 0x0FF0u) == 0xFF00u);
+
+    REQUIRE(alu::slt (static_cast<uint32_t>(-1), 1) == 1u);         // -1 < 1 signed
+    REQUIRE(alu::sltu(static_cast<uint32_t>(-1), 1) == 0u);         // -1 > 1 unsigned
+    REQUIRE(alu::slt (1u, 1u) == 0u);
+    REQUIRE(alu::sltu(1u, 1u) == 0u);
+
+    // ---- M extension: MUL family ------------------------------------------
+    REQUIRE(alu::mul  (3u, 5u) == 15u);
+    REQUIRE(alu::mul  (0xFFFFFFFFu, 2u) == 0xFFFFFFFEu);            // low 32 wraps
+    // (-1) × (-1) = 1 as 64-bit; upper 32 = 0.
+    REQUIRE(alu::mulh (static_cast<uint32_t>(-1), static_cast<uint32_t>(-1)) == 0u);
+    // 0xFFFFFFFF × 0xFFFFFFFF = 0xFFFFFFFE_00000001; upper 32 = 0xFFFFFFFE.
+    REQUIRE(alu::mulhu(static_cast<uint32_t>(-1), static_cast<uint32_t>(-1)) == 0xFFFFFFFEu);
+    // (-1) signed × 1 unsigned = -1 as int64; two's-complement upper 32 = -1.
+    REQUIRE(alu::mulhsu(static_cast<uint32_t>(-1), 1u) == 0xFFFFFFFFu);
+
+    // ---- M extension: DIV / REM edge cases (RISC-V §7.2) ------------------
+    constexpr uint32_t INT_MIN_U = 0x80000000u;
+    // The two cases the plan pins by name:
+    REQUIRE(alu::div(INT_MIN_U, static_cast<uint32_t>(-1)) == INT_MIN_U);  // no trap
+    REQUIRE(alu::div(10u, 0u) == 0xFFFFFFFFu);                              // /0 → -1
+    // The remainder counterparts:
+    REQUIRE(alu::rem(INT_MIN_U, static_cast<uint32_t>(-1)) == 0u);
+    REQUIRE(alu::rem(10u, 0u) == 10u);                                      // %0 → dividend
+    // Unsigned variants:
+    REQUIRE(alu::divu(10u, 0u) == 0xFFFFFFFFu);
+    REQUIRE(alu::remu(10u, 0u) == 10u);
+    // Normal signed and unsigned division; truncate toward zero, not floor.
+    REQUIRE(alu::div (10u, 3u) == 3u);
+    REQUIRE(alu::div (static_cast<uint32_t>(-10), 3u) == static_cast<uint32_t>(-3));
+    REQUIRE(alu::div (10u, static_cast<uint32_t>(-3)) == static_cast<uint32_t>(-3));
+    REQUIRE(alu::divu(10u, 3u) == 3u);
+    REQUIRE(alu::rem (10u, 3u) == 1u);
+    REQUIRE(alu::rem (static_cast<uint32_t>(-10), 3u) == static_cast<uint32_t>(-1));
+    REQUIRE(alu::remu(10u, 3u) == 1u);
+
+    // ---- Branch conditions ------------------------------------------------
+    REQUIRE( alu::beq(5, 5));   REQUIRE(!alu::beq(5, 6));
+    REQUIRE( alu::bne(5, 6));   REQUIRE(!alu::bne(5, 5));
+    // Signed / unsigned split around -1 vs. 1
+    REQUIRE( alu::blt (static_cast<uint32_t>(-1), 1));
+    REQUIRE( alu::bge (1, static_cast<uint32_t>(-1)));
+    REQUIRE(!alu::blt (1, static_cast<uint32_t>(-1)));
+    REQUIRE( alu::bltu(1, static_cast<uint32_t>(-1)));
+    REQUIRE( alu::bgeu(static_cast<uint32_t>(-1), 1));
+    REQUIRE(!alu::bltu(static_cast<uint32_t>(-1), 1));
+
+    // A few compile-time sanity checks — a regression in the pure primitives
+    // fails to build rather than fails to run.
+    static_assert(alu::add(3, 5) == 8u);
+    static_assert(alu::div(0x80000000u, 0xFFFFFFFFu) == 0x80000000u);
+    static_assert(alu::rem(0x80000000u, 0xFFFFFFFFu) == 0u);
+    static_assert(alu::sra(0x80000000u, 4)           == 0xF8000000u);
+}
+
 
 // -------------------------------------------------------------------- main ---
 int main() {
