@@ -18,6 +18,7 @@
 #include "config.h"
 #include "decoder.h"
 #include "alu.h"
+#include "memory.h"
 
 // ---------------------------------------------------------- harness plumbing ---
 namespace test {
@@ -383,6 +384,76 @@ SECTION("alu") {
     static_assert(alu::div(0x80000000u, 0xFFFFFFFFu) == 0x80000000u);
     static_assert(alu::rem(0x80000000u, 0xFFFFFFFFu) == 0u);
     static_assert(alu::sra(0x80000000u, 4)           == 0xF8000000u);
+}
+
+// ------------------------------------------------------ @section("memory") ---
+SECTION("memory") {
+    // ---- Fresh memory: no pages, loads return zero and don't allocate ----
+    Memory m;
+    REQUIRE(m.num_pages() == 0);
+    REQUIRE(m.load_u8 (0x1000) == 0);
+    REQUIRE(m.load_u16(0x1000) == 0);
+    REQUIRE(m.load_u32(0x1000) == 0);
+    REQUIRE(m.num_pages() == 0);
+
+    // A single store lazily allocates one page.
+    m.store_u8(0x1000, 0xAA);
+    REQUIRE(m.num_pages() == 1);
+    REQUIRE( m.has_page(0x1000));
+    REQUIRE( m.has_page(0x1FFF));      // last byte of same page
+    REQUIRE(!m.has_page(0x2000));      // next page not yet touched
+    REQUIRE(m.load_u8(0x1000) == 0xAA);
+
+    m.store_u8(0x2000, 0xBB);
+    REQUIRE(m.num_pages() == 2);
+
+    // ---- The plan's marquee test ------------------------------------------
+    // Store 0xDEADBEEF at 0x1002 (misaligned within a page), then read the
+    // same bytes back as one lw, two lh's, and four lb's — little-endian.
+    Memory misa;
+    misa.store_u32(0x1002, 0xDEADBEEFu);
+    REQUIRE(misa.load_u32(0x1002) == 0xDEADBEEFu);
+    REQUIRE(misa.load_u16(0x1002) == 0xBEEFu);
+    REQUIRE(misa.load_u16(0x1004) == 0xDEADu);
+    REQUIRE(misa.load_u8 (0x1002) == 0xEFu);
+    REQUIRE(misa.load_u8 (0x1003) == 0xBEu);
+    REQUIRE(misa.load_u8 (0x1004) == 0xADu);
+    REQUIRE(misa.load_u8 (0x1005) == 0xDEu);
+    // Bytes 0x1002..0x1005 all fall in the 0x1000 page.
+    REQUIRE(misa.num_pages() == 1);
+
+    // ---- Cross-page misaligned store --------------------------------------
+    // 0x0FFE..0x1001 straddles the 0x0000 and 0x1000 pages.
+    Memory cross;
+    cross.store_u32(0x0FFE, 0xCAFEBABEu);
+    REQUIRE(cross.num_pages() == 2);
+    REQUIRE(cross.load_u32(0x0FFE) == 0xCAFEBABEu);
+    REQUIRE(cross.load_u16(0x0FFE) == 0xBABEu);   // low half in page 0x0000
+    REQUIRE(cross.load_u16(0x1000) == 0xCAFEu);   // high half in page 0x1000
+    REQUIRE(cross.load_u8(0x0FFE) == 0xBEu);
+    REQUIRE(cross.load_u8(0x0FFF) == 0xBAu);
+    REQUIRE(cross.load_u8(0x1000) == 0xFEu);
+    REQUIRE(cross.load_u8(0x1001) == 0xCAu);
+
+    // ---- Speculative reads must not allocate ------------------------------
+    Memory readonly;
+    (void)readonly.load_u8 (0xDEAD);
+    (void)readonly.load_u16(0xDEAD);
+    (void)readonly.load_u32(0xDEAD);
+    (void)readonly.load_u32(0x0FFE);   // even the straddling case
+    REQUIRE(readonly.num_pages() == 0);
+
+    // ---- write_bytes: loader.h's bulk-copy path ---------------------------
+    Memory bulk;
+    const uint8_t data[] = {0x11, 0x22, 0x33, 0x44, 0x55};
+    bulk.write_bytes(0x2000, data, sizeof(data));
+    REQUIRE(bulk.load_u32(0x2000) == 0x44332211u);
+    REQUIRE(bulk.load_u8 (0x2004) == 0x55u);
+
+    // A zero-length write is a no-op and does not allocate.
+    Memory zero;
+    zero.write_bytes(0x3000, data, 0);
+    REQUIRE(zero.num_pages() == 0);
 }
 
 
