@@ -23,6 +23,11 @@
 #include "memory.h"
 #include "loader.h"
 
+// Include the driver TU so parse_args / print_help / run_program are
+// unit-testable without shelling out. Its own int main() is guarded off.
+#define MINI_CPU_NO_ENTRY
+#include "main.cpp"
+
 // ---------------------------------------------------------- harness plumbing ---
 namespace test {
 
@@ -630,6 +635,98 @@ SECTION("loader") {
         std::istringstream ss(s);
         load_elf(m, ss);
     }));
+}
+
+// --------------------------------------------------------- @section("cli") ---
+SECTION("cli") {
+    // Small helper: argv from a vector<const char*> so string literals compose.
+    auto parse = [](std::initializer_list<const char*> argv_in, CliOpts& out) {
+        std::vector<char*> argv;
+        std::vector<std::string> owned(argv_in.begin(), argv_in.end());
+        for (auto& s : owned) argv.push_back(s.data());
+        return parse_args(static_cast<int>(argv.size()), argv.data(), out);
+    };
+
+    // Every Config knob has a matching --flag, and setting it round-trips.
+    {
+        CliOpts o;
+        REQUIRE(parse({"oooc", "--width", "4", "--rob", "128", "--prf=192",
+                       "--iq", "32", "--cdb=3", "--mem-lat", "5",
+                       "--ghr=8", "--pht", "1024", "--chkpt=8"}, o) == 0);
+        REQUIRE(o.cfg.width == 4);
+        REQUIRE(o.cfg.rob_size == 128);
+        REQUIRE(o.cfg.prf_size == 192);        // via = syntax
+        REQUIRE(o.cfg.iq_size == 32);
+        REQUIRE(o.cfg.num_cdb == 3);
+        REQUIRE(o.cfg.mem_latency == 5);
+        REQUIRE(o.cfg.ghr_bits == 8);
+        REQUIRE(o.cfg.pht_size == 1024);
+        REQUIRE(o.cfg.num_checkpoints == 8);
+    }
+
+    // Every knob in KNOBS parses under both --flag=value and --flag value.
+    for (const auto& k : KNOBS) {
+        CliOpts o;
+        std::string eq = std::string(k.flag) + "=17";
+        REQUIRE(parse({"oooc", eq.c_str()}, o) == 0);
+        REQUIRE(o.cfg.*(k.member) == 17u);
+
+        CliOpts o2;
+        REQUIRE(parse({"oooc", k.flag, "19"}, o2) == 0);
+        REQUIRE(o2.cfg.*(k.member) == 19u);
+    }
+
+    // Boolean flags.
+    { CliOpts o; REQUIRE(parse({"oooc", "--regs"},  o) == 0); REQUIRE(o.print_regs); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--trace"}, o) == 0); REQUIRE(o.trace); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--help"},  o) == 0); REQUIRE(o.show_help); }
+
+    // Base with hex-prefixed and decimal values.
+    { CliOpts o; REQUIRE(parse({"oooc", "--base", "0x1000"}, o) == 0);
+      REQUIRE(o.has_base); REQUIRE(o.base == 0x1000); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--base=4096"},      o) == 0);
+      REQUIRE(o.has_base); REQUIRE(o.base == 4096); }
+
+    // Positional ELF path.
+    { CliOpts o; REQUIRE(parse({"oooc", "prog.elf"}, o) == 0);
+      REQUIRE(o.elf_path == "prog.elf"); }
+
+    // Rejects: unknown flag, bad number, missing value, two positionals.
+    { CliOpts o; REQUIRE(parse({"oooc", "--nope"},           o) != 0); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--width", "boom"},  o) != 0); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--width"},          o) != 0); }
+    { CliOpts o; REQUIRE(parse({"oooc", "a.elf", "b.elf"},   o) != 0); }
+
+    // ---- end-to-end interpreter drive ------------------------------------
+    // Program (RV32I): 3 + 5 = 8, then ECALL with a7=93 → exit(a0).
+    //   addi x17, x0, 93   ; 0x05D00893
+    //   addi x10, x0, 3    ; 0x00300513
+    //   addi x11, x0, 5    ; 0x00500593
+    //   add  x10, x10, x11 ; 0x00B50533
+    //   ecall              ; 0x00000073
+    Memory mem;
+    mem.store_u32(0x1000, 0x05D00893);
+    mem.store_u32(0x1004, 0x00300513);
+    mem.store_u32(0x1008, 0x00500593);
+    mem.store_u32(0x100C, 0x00B50533);
+    mem.store_u32(0x1010, 0x00000073);
+    const RunResult r = run_program(mem, 0x1000, /*max_insts=*/16, /*trace=*/false);
+    REQUIRE(r.halted);
+    REQUIRE(!r.trapped);
+    REQUIRE(r.retired == 5);
+    REQUIRE(r.exit_code == 8);
+    REQUIRE(r.regs[10] == 8);
+    REQUIRE(r.regs[11] == 5);
+    REQUIRE(r.regs[17] == 93);
+    REQUIRE(r.regs[0]  == 0);
+
+    // Illegal instruction traps at commit, doesn't spin.
+    Memory bad;
+    bad.store_u32(0x0, 0xFFFFFFFFu);   // opcode 0x7F → INVALID → TRAP
+    const RunResult t = run_program(bad, 0, /*max_insts=*/8, /*trace=*/false);
+    REQUIRE(t.trapped);
+    REQUIRE(!t.halted);
+    REQUIRE(t.retired == 1);
 }
 
 
