@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "types.h"
+#include "config.h"
 
 // ---------------------------------------------------------- harness plumbing ---
 namespace test {
@@ -86,6 +87,48 @@ SECTION("types") {
     static_assert(static_cast<int>(OpKind::NOP)  != static_cast<int>(OpKind::ALU));
 }
 
+// ------------------------------------------------------ @section("config") ---
+SECTION("config") {
+    Config c;
+
+    // defaults match DESIGN.md §9.1
+    REQUIRE(c.width           == 2);
+    REQUIRE(c.rob_size        == 32);
+    REQUIRE(c.prf_size        == 64);
+    REQUIRE(c.iq_size         == 16);
+    REQUIRE(c.lq_size         == 8);
+    REQUIRE(c.sq_size         == 8);
+    REQUIRE(c.num_cdb         == 2);
+    REQUIRE(c.num_alu         == 2);
+    REQUIRE(c.num_branch      == 1);
+    REQUIRE(c.num_mul         == 1);
+    REQUIRE(c.num_mem         == 1);
+    REQUIRE(c.alu_latency     == 1);
+    REQUIRE(c.mem_latency     == 2);
+    REQUIRE(c.mul_latency     == 3);
+    REQUIRE(c.div_latency     == 20);
+    REQUIRE(c.ghr_bits        == 12);
+    REQUIRE(c.pht_size        == 4096);
+    REQUIRE(c.btb_sets * c.btb_ways == 512);
+    REQUIRE(c.ras_size        == 16);
+    REQUIRE(c.num_checkpoints == 16);
+
+    // §3.2 starvation-free rule at the default sizing
+    REQUIRE(!c.prf_can_starve());
+
+    // exact boundary: prf_size == rob_size + 32 is safe; one less starves
+    Config edge = c;
+    edge.prf_size = edge.rob_size + 32;
+    REQUIRE(!edge.prf_can_starve());
+    edge.prf_size = edge.rob_size + 32 - 1;
+    REQUIRE(edge.prf_can_starve());
+
+    // the specific stress config used later in the six-config sweep
+    Config small_prf = c;
+    small_prf.prf_size = 32;
+    REQUIRE(small_prf.prf_can_starve());
+}
+
 // -------------------------------------------------------------------- main ---
 int main() {
     int passes = 0, fails = 0;
@@ -96,7 +139,7 @@ int main() {
         if (test::assertion_failures > before) ++fails;
         else                                   ++passes;
     }
-    std::printf("\n%d section%s ok, %d failing (%d assertion%s total)\n",
+    std::printf("\n%d section%s ok, %d failing (%d assertion failure%s)\n",
                 passes, passes == 1 ? "" : "s",
                 fails,
                 test::assertion_failures, test::assertion_failures == 1 ? "" : "s");
