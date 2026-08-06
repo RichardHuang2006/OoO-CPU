@@ -24,6 +24,7 @@
 #include "rob.h"
 #include "prf.h"
 #include "freelist.h"
+#include "rat.h"
 #include "cpu.h"
 #include "asm.h"
 #include "ref.h"
@@ -2987,6 +2988,98 @@ SECTION("rob") {
         REQUIRE(rob.pop_head_if_complete().has_value());
         REQUIRE(!rob.full());                       // and unstalls on one commit
     }
+}
+
+
+// --------------------------------------------------------- @section("rat") ---
+SECTION("rat") {
+    Config cfg;                    // num_checkpoints = 16
+    Rat rat(cfg);
+
+    // ---- Reset state: identity mapping and full pool --------------------
+    for (ArchReg a = 0; a < Rat::ARCH_REGS; ++a) REQUIRE(rat.map(a) == a);
+    REQUIRE(rat.num_checkpoints()      == cfg.num_checkpoints);
+    REQUIRE(rat.num_free_checkpoints() == cfg.num_checkpoints);
+
+    // ---- set() writes; set(0, _) is a no-op ----------------------------
+    rat.set(5, 40);
+    REQUIRE(rat.map(5) == 40u);
+    rat.set(0, 99);
+    REQUIRE(rat.map(0) == 0u);
+    rat.set(31, 63);
+    REQUIRE(rat.map(31) == 63u);
+
+    // ---- alloc_checkpoint snapshots the current state -------------------
+    const auto cp = rat.alloc_checkpoint();
+    REQUIRE(cp.has_value());
+    REQUIRE(rat.num_free_checkpoints() == cfg.num_checkpoints - 1);
+
+    // ---- Restore reproduces the RAT bit-identical -----------------------
+    // Snapshot the pre-restore mapping so we can compare byte-for-byte.
+    const auto expected = rat.mapping();
+    // Arbitrary writes on top of the snapshot.
+    for (ArchReg a = 1; a < Rat::ARCH_REGS; ++a) rat.set(a, 100 + a);
+    // The RAT is now different.
+    bool differ = false;
+    for (ArchReg a = 0; a < Rat::ARCH_REGS; ++a)
+        if (rat.mapping()[a] != expected[a]) differ = true;
+    REQUIRE(differ);
+    // Restore.
+    rat.restore_checkpoint(*cp);
+    for (ArchReg a = 0; a < Rat::ARCH_REGS; ++a)
+        REQUIRE(rat.mapping()[a] == expected[a]);
+
+    // ---- Restore does not release the slot ------------------------------
+    REQUIRE(rat.num_free_checkpoints() == cfg.num_checkpoints - 1);
+    // Restoring twice is idempotent.
+    rat.set(5, 999);
+    rat.restore_checkpoint(*cp);
+    REQUIRE(rat.map(5) == expected[5]);
+
+    // ---- free_checkpoint returns the slot -------------------------------
+    rat.free_checkpoint(*cp);
+    REQUIRE(rat.num_free_checkpoints() == cfg.num_checkpoints);
+
+    // ---- Pool refuses allocation when full instead of overwriting -------
+    std::vector<CheckpointId> held;
+    while (auto id = rat.alloc_checkpoint()) held.push_back(*id);
+    REQUIRE(held.size() == cfg.num_checkpoints);
+    REQUIRE(!rat.alloc_checkpoint().has_value());
+    // Every id is distinct.
+    for (std::size_t i = 0; i < held.size(); ++i)
+        for (std::size_t j = i + 1; j < held.size(); ++j)
+            REQUIRE(held[i] != held[j]);
+    // Free one, alloc succeeds.
+    rat.free_checkpoint(held[0]);
+    const auto again = rat.alloc_checkpoint();
+    REQUIRE(again.has_value());
+    REQUIRE(!rat.alloc_checkpoint().has_value());
+
+    // ---- free_checkpoint tolerates the sentinels commit paths pass ------
+    rat.free_checkpoint(INVALID_CHECKPOINT);
+    rat.free_checkpoint(cfg.num_checkpoints);
+    rat.free_checkpoint(cfg.num_checkpoints + 10);
+
+    // ---- Independent snapshots survive intervening writes ---------------
+    // Take two snapshots of different states, restore both, verify each
+    // reproduces its own state and does not leak into the other.
+    Rat r2(4);
+    r2.set(1, 100);
+    const auto snap_a = r2.alloc_checkpoint();
+    r2.set(1, 200);
+    const auto snap_b = r2.alloc_checkpoint();
+    r2.set(1, 300);              // now RAT[1] = 300, neither snapshot
+    r2.restore_checkpoint(*snap_a);
+    REQUIRE(r2.map(1) == 100u);
+    r2.restore_checkpoint(*snap_b);
+    REQUIRE(r2.map(1) == 200u);
+    r2.restore_checkpoint(*snap_a);
+    REQUIRE(r2.map(1) == 100u);
+
+    // ---- reset() restores identity mapping and full pool ----------------
+    rat.reset();
+    for (ArchReg a = 0; a < Rat::ARCH_REGS; ++a) REQUIRE(rat.map(a) == a);
+    REQUIRE(rat.num_free_checkpoints() == cfg.num_checkpoints);
 }
 
 
