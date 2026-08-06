@@ -28,7 +28,7 @@ TOOLS_SRC  = tools/gen_examples.cpp
 # test harness replaces with its own.
 LIB_SRC = $(filter-out src/main.cpp,$(CPU_SRC))
 
-.PHONY: all debug test clean help
+.PHONY: all debug test examples clean help
 .DEFAULT_GOAL := all
 
 # ---------------------------------------------------------------- release ---
@@ -57,14 +57,17 @@ $(DBGDIR)/%.o: src/%.cpp | $(DBGDIR)
 
 # --------------------------------------------------------------- tooling ---
 $(BUILD)/gen_examples: $(TOOLS_SRC) | $(BUILD)
-	@if [ ! -f $(TOOLS_SRC) ]; then \
-	  echo "no $(TOOLS_SRC) yet — see PLAN.md Step 8.4"; exit 1; \
-	fi
 	$(CXX) $(CXXFLAGS_REL) $(TOOLS_SRC) -o $@
 
-examples: $(BUILD)/gen_examples
-	@mkdir -p examples
-	./$(BUILD)/gen_examples
+# The generator arrives in Step 8.4. Until then `make test` skips example
+# generation instead of failing on a prerequisite that cannot exist yet.
+examples:
+	@if [ -f $(TOOLS_SRC) ]; then \
+	  $(MAKE) --no-print-directory $(BUILD)/gen_examples && \
+	  mkdir -p examples && ./$(BUILD)/gen_examples; \
+	else \
+	  echo "examples: skipped, no $(TOOLS_SRC) yet (PLAN.md Step 8.4)"; \
+	fi
 
 # ------------------------------------------------------------------ test ---
 $(BUILD)/test_main: $(TEST_SRC) $(LIB_SRC) | $(BUILD)

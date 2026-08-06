@@ -1,14 +1,14 @@
 // Top-level driver for Mini-CPU.
 //
 // This file is unusual: `int main()` is guarded so tests can
-// `#include "main.cpp"` and unit-test parse_args / print_help / the
-// interpreter without shelling out to the binary. Everything else is inline
-// or file-static, so double-inclusion (release build + test include) does
-// not violate ODR.
+// `#include "main.cpp"` and unit-test parse_args / print_help without
+// shelling out to the binary. Everything else is inline or file-static, so
+// double-inclusion (release build + test include) does not violate ODR.
 //
-// The interpreter loop below is a placeholder; Step 2.2 extracts it to
-// tests/ref.h and this file starts calling into it. Until then, `oooc` runs
-// the loop in-place so `--regs` prints something meaningful right now.
+// Execution is delegated to the in-order reference interpreter in
+// tests/ref.h. Until Phase 3 lands a pipeline model, that interpreter *is*
+// the machine `oooc` runs; afterwards it stays reachable as the oracle every
+// simulated run is diffed against.
 
 #include <cstddef>
 #include <cstdint>
@@ -20,11 +20,10 @@
 #include <string>
 #include <vector>
 
-#include "alu.h"
 #include "config.h"
-#include "decoder.h"
 #include "loader.h"
 #include "memory.h"
+#include "ref.h"
 
 // ============================================================================
 // CLI surface
@@ -200,119 +199,6 @@ inline void print_help() {
 }
 
 // ============================================================================
-// In-order interpreter (placeholder; Step 2.2 extracts to tests/ref.h).
-// ============================================================================
-
-struct RunResult {
-    uint32_t regs[32]   = {};
-    uint32_t exit_code  = 0;
-    uint64_t retired    = 0;
-    bool     halted     = false;   // ECALL a7 == 93
-    bool     trapped    = false;   // illegal / EBREAK / unhandled ECALL
-};
-
-static RunResult run_program(Memory& mem, uint32_t entry_pc,
-                             uint64_t max_insts, bool trace) {
-    RunResult r;
-    uint32_t pc = entry_pc;
-    while (r.retired < max_insts) {
-        const uint32_t raw = mem.load_u32(pc);
-        const Decoded  d   = decode(raw);
-        const uint32_t rs1 = r.regs[d.rs1];
-        const uint32_t rs2 = r.regs[d.rs2];
-        const uint32_t opc = raw & 0x7F;
-        const bool     imm_form = (opc == 0x13);      // OP-IMM
-        const uint32_t opb = imm_form ? static_cast<uint32_t>(d.imm) : rs2;
-
-        uint32_t next_pc    = pc + 4;
-        uint32_t result     = 0;
-        bool     has_result = false;
-
-        switch (d.op) {
-            case Op::ADD:   result = alu::add (rs1, opb); has_result = true; break;
-            case Op::SUB:   result = alu::sub (rs1, rs2); has_result = true; break;
-            case Op::SLL:   result = alu::sll (rs1, opb); has_result = true; break;
-            case Op::SRL:   result = alu::srl (rs1, opb); has_result = true; break;
-            case Op::SRA:   result = alu::sra (rs1, opb); has_result = true; break;
-            case Op::AND:   result = alu::and_(rs1, opb); has_result = true; break;
-            case Op::OR:    result = alu::or_ (rs1, opb); has_result = true; break;
-            case Op::XOR:   result = alu::xor_(rs1, opb); has_result = true; break;
-            case Op::SLT:   result = alu::slt (rs1, opb); has_result = true; break;
-            case Op::SLTU:  result = alu::sltu(rs1, opb); has_result = true; break;
-
-            case Op::LUI:   result = static_cast<uint32_t>(d.imm);       has_result = true; break;
-            case Op::AUIPC: result = pc + static_cast<uint32_t>(d.imm);  has_result = true; break;
-
-            case Op::MUL:    result = alu::mul   (rs1, rs2); has_result = true; break;
-            case Op::MULH:   result = alu::mulh  (rs1, rs2); has_result = true; break;
-            case Op::MULHU:  result = alu::mulhu (rs1, rs2); has_result = true; break;
-            case Op::MULHSU: result = alu::mulhsu(rs1, rs2); has_result = true; break;
-            case Op::DIV:    result = alu::div   (rs1, rs2); has_result = true; break;
-            case Op::DIVU:   result = alu::divu  (rs1, rs2); has_result = true; break;
-            case Op::REM:    result = alu::rem   (rs1, rs2); has_result = true; break;
-            case Op::REMU:   result = alu::remu  (rs1, rs2); has_result = true; break;
-
-            case Op::BEQ:  if (alu::beq (rs1, rs2)) next_pc = pc + static_cast<uint32_t>(d.imm); break;
-            case Op::BNE:  if (alu::bne (rs1, rs2)) next_pc = pc + static_cast<uint32_t>(d.imm); break;
-            case Op::BLT:  if (alu::blt (rs1, rs2)) next_pc = pc + static_cast<uint32_t>(d.imm); break;
-            case Op::BGE:  if (alu::bge (rs1, rs2)) next_pc = pc + static_cast<uint32_t>(d.imm); break;
-            case Op::BLTU: if (alu::bltu(rs1, rs2)) next_pc = pc + static_cast<uint32_t>(d.imm); break;
-            case Op::BGEU: if (alu::bgeu(rs1, rs2)) next_pc = pc + static_cast<uint32_t>(d.imm); break;
-
-            case Op::JAL:  result = pc + 4; has_result = true;
-                           next_pc = pc + static_cast<uint32_t>(d.imm); break;
-            case Op::JALR: result = pc + 4; has_result = true;
-                           next_pc = (rs1 + static_cast<uint32_t>(d.imm)) & ~1u; break;
-
-            case Op::LB: {
-                const auto b = static_cast<int8_t>(mem.load_u8(rs1 + static_cast<uint32_t>(d.imm)));
-                result = static_cast<uint32_t>(static_cast<int32_t>(b)); has_result = true; break;
-            }
-            case Op::LH: {
-                const auto h = static_cast<int16_t>(mem.load_u16(rs1 + static_cast<uint32_t>(d.imm)));
-                result = static_cast<uint32_t>(static_cast<int32_t>(h)); has_result = true; break;
-            }
-            case Op::LW:  result = mem.load_u32(rs1 + static_cast<uint32_t>(d.imm)); has_result = true; break;
-            case Op::LBU: result = mem.load_u8 (rs1 + static_cast<uint32_t>(d.imm)); has_result = true; break;
-            case Op::LHU: result = mem.load_u16(rs1 + static_cast<uint32_t>(d.imm)); has_result = true; break;
-
-            case Op::SB: mem.store_u8 (rs1 + static_cast<uint32_t>(d.imm), static_cast<uint8_t> (rs2)); break;
-            case Op::SH: mem.store_u16(rs1 + static_cast<uint32_t>(d.imm), static_cast<uint16_t>(rs2)); break;
-            case Op::SW: mem.store_u32(rs1 + static_cast<uint32_t>(d.imm), rs2); break;
-
-            case Op::FENCE:
-            case Op::FENCE_I:
-                break;
-
-            case Op::ECALL:
-                if (r.regs[17] == 93) {                       // a7 == 93 → exit(a0)
-                    r.exit_code = r.regs[10];
-                    r.halted = true;
-                } else {
-                    r.trapped = true;
-                }
-                break;
-            case Op::EBREAK:
-            case Op::INVALID:
-                r.trapped = true;
-                break;
-        }
-
-        if (has_result && d.writes_rd) r.regs[d.rd] = result;
-        r.regs[0] = 0;                                        // x0 hardwired
-
-        if (trace) {
-            std::fprintf(stderr, "%08X: %08X  next=%08X\n", pc, raw, next_pc);
-        }
-
-        pc = next_pc;
-        ++r.retired;
-        if (r.halted || r.trapped) break;
-    }
-    return r;
-}
-
-// ============================================================================
 // Entry point (compiled out when included from a test TU).
 // ============================================================================
 
@@ -355,15 +241,18 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    const RunResult r = run_program(mem, loaded.entry, opts.max_insts, opts.trace);
+    ref::Options ropts;
+    ropts.max_insts = opts.max_insts;
+    ropts.trace     = opts.trace;
+    const ref::Result r = ref::run(mem, loaded.entry, ropts);
 
     if (opts.print_regs) {
         for (int i = 0; i < 32; ++i) {
             std::printf("x%-2d = 0x%08X%s", i, r.regs[i], (i % 4 == 3) ? "\n" : "  ");
         }
     }
-    std::printf("halted=%d trapped=%d retired=%llu exit=%u\n",
-                r.halted ? 1 : 0, r.trapped ? 1 : 0,
+    std::printf("halted=%d trapped=%d budget=%d retired=%llu exit=%u\n",
+                r.halted ? 1 : 0, r.trapped ? 1 : 0, r.budget ? 1 : 0,
                 static_cast<unsigned long long>(r.retired), r.exit_code);
     return r.trapped ? 1 : static_cast<int>(r.exit_code);
 }

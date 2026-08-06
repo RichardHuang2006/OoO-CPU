@@ -5,6 +5,8 @@
 // The diff_run() helper that compares the OoO simulator against ref.h is
 // introduced in Step 2.3.
 
+#include <cstdint>
+
 #include <cstdio>
 #include <functional>
 #include <initializer_list>
@@ -23,9 +25,10 @@
 #include "memory.h"
 #include "loader.h"
 #include "asm.h"
+#include "ref.h"
 
-// Include the driver TU so parse_args / print_help / run_program are
-// unit-testable without shelling out. Its own int main() is guarded off.
+// Include the driver TU so parse_args / print_help are unit-testable
+// without shelling out. Its own int main() is guarded off.
 #define MINI_CPU_NO_ENTRY
 #include "main.cpp"
 
@@ -711,7 +714,9 @@ SECTION("cli") {
     mem.store_u32(0x1008, 0x00500593);
     mem.store_u32(0x100C, 0x00B50533);
     mem.store_u32(0x1010, 0x00000073);
-    const RunResult r = run_program(mem, 0x1000, /*max_insts=*/16, /*trace=*/false);
+    ref::Options o16;
+    o16.max_insts = 16;
+    const ref::Result r = ref::run(mem, 0x1000, o16);
     REQUIRE(r.halted);
     REQUIRE(!r.trapped);
     REQUIRE(r.retired == 5);
@@ -724,7 +729,9 @@ SECTION("cli") {
     // Illegal instruction traps at commit, doesn't spin.
     Memory bad;
     bad.store_u32(0x0, 0xFFFFFFFFu);   // opcode 0x7F → INVALID → TRAP
-    const RunResult t = run_program(bad, 0, /*max_insts=*/8, /*trace=*/false);
+    ref::Options o8;
+    o8.max_insts = 8;
+    const ref::Result t = ref::run(bad, 0, o8);
     REQUIRE(t.trapped);
     REQUIRE(!t.halted);
     REQUIRE(t.retired == 1);
@@ -920,7 +927,9 @@ SECTION("asm") {
         for (std::size_t i = 0; i < words.size(); ++i) {
             mem.store_u32(0x1000 + static_cast<uint32_t>(i * 4), words[i]);
         }
-        const RunResult r = run_program(mem, 0x1000, /*max_insts=*/1000, /*trace=*/false);
+        ref::Options o;
+        o.max_insts = 1000;
+        const ref::Result r = ref::run(mem, 0x1000, o);
         REQUIRE(r.halted);
         REQUIRE(!r.trapped);
         REQUIRE(r.exit_code == 55);
@@ -945,6 +954,396 @@ SECTION("asm") {
         bool threw = false;
         try { (void)a.assemble(); } catch (const std::runtime_error&) { threw = true; }
         REQUIRE(threw);
+    }
+}
+
+
+// --------------------------------------------------------- @section("ref") ---
+namespace reftest {
+
+inline constexpr uint32_t TEXT = 0x1000;   // where every test program loads
+inline constexpr uint32_t DATA = 0x2000;   // scratch area the programs write
+
+inline void load_words(Memory& m, uint32_t base, const std::vector<uint32_t>& w) {
+    for (std::size_t i = 0; i < w.size(); ++i) {
+        m.store_u32(base + static_cast<uint32_t>(i * 4), w[i]);
+    }
+}
+
+// Assemble-load-run in one call, for the programs whose memory image is not
+// itself under test.
+inline ref::Result run(const std::vector<uint32_t>& words, uint64_t budget = 100000) {
+    Memory m;
+    load_words(m, TEXT, words);
+    ref::Options o;
+    o.max_insts = budget;
+    return ref::run(m, TEXT, o);
+}
+
+// Render a word stream as the .hex format load_hex() accepts.
+inline std::string to_hex_text(const std::vector<uint32_t>& words) {
+    std::ostringstream ss;
+    for (uint32_t w : words) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%08X\n", w);
+        ss << buf;
+    }
+    return ss.str();
+}
+
+}  // namespace reftest
+
+SECTION("ref") {
+    using namespace asmc;
+    using reftest::TEXT;
+    using reftest::DATA;
+
+    // ---- 1. ALU coverage --------------------------------------------------
+    // Every RV32I integer operation once, results parked in callee-saved and
+    // argument registers so the exit state pins all of them at once.
+    {
+        Assembler p;
+        p.li(t0, 12);
+        p.li(t1, 5);
+        p.li(t2, -1);
+        p.add  (a1, t0, t1);          // 17
+        p.sub  (a2, t0, t1);          // 7
+        p.sll  (a3, t0, t1);          // 12 << 5
+        p.srl  (a4, t0, t1);          // 12 >> 5 → 0
+        p.sra  (a5, t2, t1);          // -1 >>a 5 → -1 (sign-fill, not 0x07FFFFFF)
+        p.and_ (s2, t0, t1);          // 4
+        p.or_  (s3, t0, t1);          // 13
+        p.xor_ (s4, t0, t1);          // 9
+        p.slt  (s5, t2, t1);          // -1 <s 5 → 1
+        p.sltu (s6, t2, t1);          // 0xFFFFFFFF <u 5 → 0
+        p.lui  (s7, 0x12345);         // 0x12345000
+        const uint32_t auipc_off = p.pc();
+        p.auipc(s8, 0);               // its own PC
+        p.addi (s9,  t0, -20);        // -8
+        p.slti (s10, t2, 0);          // 1
+        p.xori (s11, t0, 0xFF);       // 243
+        p.srai (s1,  t2, 3);          // -1
+        p.slli (s0,  t1, 2);          // 20
+        p.add  (a0, a1, a2);          // exit code 24
+        p.li(a7, 93);
+        p.ecall();
+
+        // 3 li + 17 ops + add + li + ecall, every li single-word.
+        const ref::Result r = reftest::run(p.assemble());
+        REQUIRE(r.halted);
+        REQUIRE(!r.trapped);
+        REQUIRE(!r.budget);
+        REQUIRE(r.retired   == 23);
+        REQUIRE(r.exit_code == 24);
+
+        REQUIRE(r.regs[a1]  == 17u);
+        REQUIRE(r.regs[a2]  == 7u);
+        REQUIRE(r.regs[a3]  == 384u);
+        REQUIRE(r.regs[a4]  == 0u);
+        REQUIRE(r.regs[a5]  == 0xFFFFFFFFu);
+        REQUIRE(r.regs[s2]  == 4u);
+        REQUIRE(r.regs[s3]  == 13u);
+        REQUIRE(r.regs[s4]  == 9u);
+        REQUIRE(r.regs[s5]  == 1u);
+        REQUIRE(r.regs[s6]  == 0u);
+        REQUIRE(r.regs[s7]  == 0x12345000u);
+        REQUIRE(r.regs[s8]  == TEXT + auipc_off);
+        REQUIRE(r.regs[s9]  == static_cast<uint32_t>(-8));
+        REQUIRE(r.regs[s10] == 1u);
+        REQUIRE(r.regs[s11] == 243u);
+        REQUIRE(r.regs[s1]  == 0xFFFFFFFFu);
+        REQUIRE(r.regs[s0]  == 20u);
+    }
+
+    // ---- 2. x0 stays zero -------------------------------------------------
+    {
+        Assembler p;
+        p.li(t0, 5);
+        p.add (zero, t0, t0);         // discarded
+        p.addi(zero, t0, 1);          // discarded
+        p.li(a7, 93);
+        p.li(a0, 0);
+        p.ecall();
+
+        const ref::Result r = reftest::run(p.assemble());
+        REQUIRE(r.halted);
+        REQUIRE(r.regs[0]   == 0u);
+        REQUIRE(r.exit_code == 0u);
+    }
+
+    // ---- 3. Loop ----------------------------------------------------------
+    // sum 1..100 = 5050. 100 iterations × 4 instructions, plus the exit-test
+    // branch, a 3-instruction prologue, and a 2-instruction epilogue.
+    {
+        Assembler p;
+        p.li(a0, 0);
+        p.li(a1, 1);
+        p.li(a2, 101);
+        p.label("loop");
+        p.beq(a1, a2, "done");
+        p.add(a0, a0, a1);
+        p.addi(a1, a1, 1);
+        p.j("loop");
+        p.label("done");
+        p.li(a7, 93);
+        p.ecall();
+
+        const ref::Result r = reftest::run(p.assemble());
+        REQUIRE(r.halted);
+        REQUIRE(r.exit_code == 5050);
+        REQUIRE(r.retired   == 3 + 100 * 4 + 1 + 2);
+    }
+
+    // ---- 4. Load / store, including sub-word and misaligned ---------------
+    {
+        Assembler p;
+        p.li(s0, static_cast<int32_t>(DATA));
+        p.li(t0, 0);                          // i
+        p.li(t1, 8);                          // n
+        p.li(a0, 0);                          // sum
+
+        p.label("fill");                      // a[i] = i + 1
+        p.beq(t0, t1, "fill_done");
+        p.slli(t2, t0, 2);
+        p.add(t3, s0, t2);
+        p.addi(t4, t0, 1);
+        p.sw(t4, t3, 0);
+        p.addi(t0, t0, 1);
+        p.j("fill");
+        p.label("fill_done");
+
+        p.li(t0, 0);
+        p.label("sum");                       // sum += a[i]
+        p.beq(t0, t1, "sum_done");
+        p.slli(t2, t0, 2);
+        p.add(t3, s0, t2);
+        p.lw(t5, t3, 0);
+        p.add(a0, a0, t5);
+        p.addi(t0, t0, 1);
+        p.j("sum");
+        p.label("sum_done");
+
+        p.li(t0, -3);                         // byte: sign vs. zero extension
+        p.sb(t0, s0, 100);
+        p.lb (a1, s0, 100);                   // -3
+        p.lbu(a2, s0, 100);                   // 253
+
+        p.li(t1, -300);                       // half: sign vs. zero extension
+        p.sh(t1, s0, 104);
+        p.lh (a3, s0, 104);                   // -300
+        p.lhu(a4, s0, 104);                   // 65236
+
+        p.li(t2, 0x12345678);                 // word at a misaligned address
+        p.sw(t2, s0, 202);
+        p.lw (a5, s0, 202);
+        p.lhu(a6, s0, 202);                   // 0x5678
+
+        p.li(a7, 93);
+        p.ecall();
+
+        Memory m;
+        reftest::load_words(m, TEXT, p.assemble());
+        ref::Options o;
+        const ref::Result r = ref::run(m, TEXT, o);
+
+        REQUIRE(r.halted);
+        REQUIRE(r.exit_code == 36);           // 1 + 2 + ... + 8
+        REQUIRE(r.regs[a1] == static_cast<uint32_t>(-3));
+        REQUIRE(r.regs[a2] == 253u);
+        REQUIRE(r.regs[a3] == static_cast<uint32_t>(-300));
+        REQUIRE(r.regs[a4] == 65236u);
+        REQUIRE(r.regs[a5] == 0x12345678u);
+        REQUIRE(r.regs[a6] == 0x5678u);
+
+        // The stores are visible in memory, not just in the loaded registers.
+        for (uint32_t i = 0; i < 8; ++i) {
+            REQUIRE(m.load_u32(DATA + i * 4) == i + 1);
+        }
+        REQUIRE(m.load_u8 (DATA + 100) == 0xFDu);
+        REQUIRE(m.load_u16(DATA + 104) == 0xFED4u);
+        REQUIRE(m.load_u32(DATA + 202) == 0x12345678u);
+    }
+
+    // ---- 5. Function calls: recursive fib(10) -----------------------------
+    // Exercises call / ret, the RAS-relevant jal-jalr pairing, and a real
+    // stack: 10 nested frames of saves and restores.
+    {
+        Assembler p;
+        p.li(sp, 0x8000);
+        p.li(a0, 10);
+        p.call("fib");
+        p.li(a7, 93);
+        p.ecall();                            // exit(fib(10)) = 55
+
+        p.label("fib");
+        p.addi(sp, sp, -16);
+        p.sw(ra, sp, 12);
+        p.sw(s0, sp, 8);                      // s0 = n
+        p.sw(s1, sp, 4);                      // s1 = fib(n-1)
+        p.li(t0, 2);
+        p.blt(a0, t0, "fib_done");            // n < 2 → return n unchanged
+        p.mv(s0, a0);
+        p.addi(a0, s0, -1);
+        p.call("fib");
+        p.mv(s1, a0);
+        p.addi(a0, s0, -2);
+        p.call("fib");
+        p.add(a0, a0, s1);
+        p.label("fib_done");
+        p.lw(ra, sp, 12);
+        p.lw(s0, sp, 8);
+        p.lw(s1, sp, 4);
+        p.addi(sp, sp, 16);
+        p.ret_();
+
+        const ref::Result r = reftest::run(p.assemble());
+        REQUIRE(r.halted);
+        REQUIRE(!r.trapped);
+        REQUIRE(r.exit_code == 55);
+        REQUIRE(r.regs[a0]  == 55u);
+        REQUIRE(r.regs[sp]  == 0x8000u);      // every frame popped
+        REQUIRE(r.regs[s0]  == 0u);           // callee-saved, restored
+        REQUIRE(r.regs[s1]  == 0u);
+    }
+
+    // ---- 6. mul / div, including the edge cases that trap on real hardware -
+    {
+        Assembler p;
+        p.li(a1, -1);
+        p.li(a2, 10);
+        p.li(a3, 0);
+        p.li(a4, static_cast<int32_t>(0x80000000));   // INT_MIN
+
+        p.div_(t0, a4, a1);           // INT_MIN / -1 → INT_MIN, no trap
+        p.rem (t1, a4, a1);           // → 0
+        p.div_(t2, a2, a3);           // x / 0 → -1
+        p.divu(t3, a2, a3);           // → 0xFFFFFFFF
+        p.rem (t4, a2, a3);           // x % 0 → x
+        p.remu(t5, a2, a3);           // → 10
+        p.div_(t6, a2, a1);           // 10 / -1 → -10
+
+        p.mul   (s0, a2, a2);         // 100
+        p.mulh  (s1, a1, a1);         // upper 32 of 1 → 0
+        p.mulhu (s2, a1, a1);         // 0xFFFFFFFE
+        p.mulhsu(s3, a1, a2);         // -10 >> 32 → 0xFFFFFFFF
+
+        p.li(a7, 93);
+        p.mv(a0, s0);
+        p.ecall();
+
+        const ref::Result r = reftest::run(p.assemble());
+        REQUIRE(r.halted);
+        REQUIRE(!r.trapped);                  // divide-by-zero is defined, not fatal
+        REQUIRE(r.exit_code == 100);
+        REQUIRE(r.regs[t0] == 0x80000000u);
+        REQUIRE(r.regs[t1] == 0u);
+        REQUIRE(r.regs[t2] == 0xFFFFFFFFu);
+        REQUIRE(r.regs[t3] == 0xFFFFFFFFu);
+        REQUIRE(r.regs[t4] == 10u);
+        REQUIRE(r.regs[t5] == 10u);
+        REQUIRE(r.regs[t6] == static_cast<uint32_t>(-10));
+        REQUIRE(r.regs[s0] == 100u);
+        REQUIRE(r.regs[s1] == 0u);
+        REQUIRE(r.regs[s2] == 0xFFFFFFFEu);
+        REQUIRE(r.regs[s3] == 0xFFFFFFFFu);
+    }
+
+    // ---- 7. Halt, trap, and budget are three distinct outcomes ------------
+    {
+        // ecall with a7 != 93 is not the exit syscall — it traps.
+        Assembler p;
+        p.li(a7, 42);
+        p.ecall();
+        const ref::Result r = reftest::run(p.assemble());
+        REQUIRE(r.trapped);
+        REQUIRE(!r.halted);
+        REQUIRE(r.retired == 2);
+    }
+    {
+        Assembler p;
+        p.li(t0, 1);
+        p.ebreak();
+        p.li(t1, 2);                          // must never execute
+        const ref::Result r = reftest::run(p.assemble());
+        REQUIRE(r.trapped);
+        REQUIRE(r.regs[t0] == 1u);
+        REQUIRE(r.regs[t1] == 0u);
+        REQUIRE(r.pc == TEXT + 4);            // the trap reports its own PC
+    }
+    {
+        // An unbounded loop stops at the budget without halting or trapping.
+        Assembler p;
+        p.label("spin");
+        p.j("spin");
+        const ref::Result r = reftest::run(p.assemble(), /*budget=*/50);
+        REQUIRE(r.budget);
+        REQUIRE(!r.halted);
+        REQUIRE(!r.trapped);
+        REQUIRE(r.retired == 50);
+    }
+    {
+        // Fetching from never-written memory reads zeros, which decode as
+        // an illegal instruction rather than running off into the weeds.
+        Memory empty;
+        const ref::Result r = ref::run(empty, TEXT);
+        REQUIRE(r.trapped);
+        REQUIRE(r.retired == 1);
+    }
+
+    // ---- 8. The same program via the .hex loader --------------------------
+    // Round-trips assembler → hex text → load_hex → interpreter, and pins
+    // the result against the directly-loaded image: all 32 registers.
+    {
+        Assembler p;
+        p.li(a0, 0);
+        p.li(a1, 1);
+        p.li(a2, 11);
+        p.label("loop");
+        p.beq(a1, a2, "done");
+        p.add(a0, a0, a1);
+        p.addi(a1, a1, 1);
+        p.j("loop");
+        p.label("done");
+        p.li(a7, 93);
+        p.ecall();
+        const auto words = p.assemble();
+
+        const ref::Result direct = reftest::run(words);
+
+        Memory m;
+        std::istringstream hex(reftest::to_hex_text(words));
+        const LoadResult loaded = load_hex(m, hex, TEXT);
+        REQUIRE(loaded.entry == TEXT);
+        const ref::Result via_hex = ref::run(m, loaded.entry);
+
+        REQUIRE(via_hex.halted);
+        REQUIRE(via_hex.exit_code == 55);
+        REQUIRE(via_hex.retired   == direct.retired);
+        for (int i = 0; i < 32; ++i) REQUIRE(via_hex.regs[i] == direct.regs[i]);
+    }
+
+    // ---- 9. Tracing emits output and does not perturb the result ----------
+    {
+        Assembler p;
+        p.li(a0, 7);
+        p.li(a7, 93);
+        p.ecall();
+        const auto words = p.assemble();
+
+        const ref::Result quiet = reftest::run(words);
+
+        Memory m;
+        reftest::load_words(m, TEXT, words);
+        ref::Options o;
+        o.trace = true;
+        o.trace_out = std::tmpfile();
+        const ref::Result traced = ref::run(m, TEXT, o);
+        if (o.trace_out) {
+            REQUIRE(std::ftell(o.trace_out) > 0);
+            std::fclose(o.trace_out);
+        }
+        REQUIRE(traced.retired   == quiet.retired);
+        REQUIRE(traced.exit_code == quiet.exit_code);
     }
 }
 
