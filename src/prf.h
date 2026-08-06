@@ -7,14 +7,11 @@
 #include "config.h"
 #include "types.h"
 
-// Unified physical register file (DESIGN.md section 3). Holds a value plus a
-// ready bit per register. Writeback flips ready on when it writes a value;
-// Rename flips it off when it allocates the register as a fresh destination.
-// The IQ never reads values from here — it subscribes to the ready bit — but
-// Execute reads operands after Issue selects a uop.
-//
-// p0 is hard-wired to zero and always ready. The class enforces that so
-// callers do not special-case rd == x0 before writing.
+// Unified physical register file: one value and one ready bit per register.
+// The ready bit is what the issue queue subscribes to; the value is what
+// execute reads after select. p0 is hard-wired to zero and always ready, so
+// callers never guard rd == x0 before writing.
+
 class Prf {
 public:
     explicit Prf(uint32_t capacity)
@@ -27,8 +24,7 @@ public:
         return r == 0 ? 0u : values_[r];
     }
 
-    // Sets ready. No-op for p0, so a rename that leaves dest_phys mapped to
-    // p0 (writes_rd == false) can go through Writeback without a guard.
+    // Writes the value and flips ready on. No-op for p0.
     void write(PhysReg r, uint32_t value) {
         if (r == 0) return;
         values_[r] = value;
@@ -39,8 +35,8 @@ public:
         return r == 0 || ready_[r] != 0;
     }
 
-    // Called after the free list hands out `r` at rename. p0 stays ready —
-    // no in-flight uop is ever allowed to depend on x0 producing a value.
+    // Flips ready off after a fresh allocation. p0 stays ready; no in-flight
+    // uop is ever allowed to depend on x0 producing a value.
     void mark_pending(PhysReg r) {
         if (r == 0) return;
         ready_[r] = 0;
