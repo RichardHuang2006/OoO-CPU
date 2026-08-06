@@ -23,6 +23,7 @@
 #include "loader.h"
 #include "rob.h"
 #include "prf.h"
+#include "freelist.h"
 #include "cpu.h"
 #include "asm.h"
 #include "ref.h"
@@ -2986,6 +2987,101 @@ SECTION("rob") {
         REQUIRE(rob.pop_head_if_complete().has_value());
         REQUIRE(!rob.full());                       // and unstalls on one commit
     }
+}
+
+
+// ---------------------------------------------------- @section("freelist") ---
+SECTION("freelist") {
+    // ---- Default sizing: |free| = prf_size - 32 -------------------------
+    Config cfg;                     // prf_size = 64
+    FreeList fl(cfg);
+    REQUIRE(fl.capacity() == cfg.prf_size);
+    REQUIRE(fl.num_free() == cfg.prf_size - 32);
+
+    // ---- Every alloc returns a register in [32, prf_size) ---------------
+    // p0..p31 are never handed out; the initial RAT holds them.
+    std::vector<PhysReg> seen;
+    while (auto r = fl.alloc()) seen.push_back(*r);
+    REQUIRE(seen.size() == cfg.prf_size - 32);
+    for (PhysReg r : seen) {
+        REQUIRE(r >= 32);
+        REQUIRE(r <  cfg.prf_size);
+    }
+    // And every one is distinct.
+    for (std::size_t i = 0; i < seen.size(); ++i)
+        for (std::size_t j = i + 1; j < seen.size(); ++j)
+            REQUIRE(seen[i] != seen[j]);
+
+    // ---- Starvation reports itself; no phantom p0 ----------------------
+    REQUIRE(fl.empty());
+    REQUIRE(!fl.alloc().has_value());
+
+    // ---- free() pushes back, alloc() sees them again --------------------
+    fl.free(40);
+    fl.free(41);
+    REQUIRE(fl.num_free() == 2);
+    const PhysReg first  = fl.alloc().value();
+    const PhysReg second = fl.alloc().value();
+    REQUIRE(first  == 40);          // FIFO order
+    REQUIRE(second == 41);
+    REQUIRE(fl.empty());
+
+    // ---- free() silently ignores the values commit is allowed to pass ---
+    // The commit path calls free(stale_phys) unconditionally; stale_phys is
+    // INVALID_PHYSREG when the retiring uop had writes_rd == false, and
+    // could conceivably be 0 through some future path. Both must be safe.
+    fl.free(0);
+    fl.free(INVALID_PHYSREG);
+    fl.free(cfg.prf_size);          // one past the end
+    fl.free(cfg.prf_size + 5);
+    REQUIRE(fl.empty());
+    REQUIRE(!fl.alloc().has_value());
+
+    // ---- reset() restores the initial state -----------------------------
+    for (uint32_t r = 32; r < cfg.prf_size; ++r) fl.free(r);
+    (void)fl.alloc();               // remove one
+    fl.reset();
+    REQUIRE(fl.num_free() == cfg.prf_size - 32);
+
+    // ---- Alloc / free invariant under a random-ish sequence -------------
+    // |free| + |allocated| == prf_size - 32 after every step. Reset first
+    // so the checked size is known.
+    fl.reset();
+    std::vector<PhysReg> live;
+    const uint32_t init_free = fl.num_free();
+    // Simple LCG so the sequence is deterministic and the failure is
+    // reproducible.
+    uint32_t s = 0x1234;
+    for (int step = 0; step < 500; ++step) {
+        s = s * 1103515245u + 12345u;
+        const bool do_alloc = live.empty() || (s & 1);
+        if (do_alloc) {
+            auto r = fl.alloc();
+            if (r) live.push_back(*r);
+        } else {
+            const uint32_t idx = (s >> 1) % live.size();
+            fl.free(live[idx]);
+            live[idx] = live.back();
+            live.pop_back();
+        }
+        REQUIRE(fl.num_free() + live.size() == init_free);
+    }
+
+    // ---- Starvation-config: prf_size < rob_size + 32 ---------------------
+    // The design invariant is that this can actually run out mid-run rather
+    // than merely stalling occasionally. Drain it and observe.
+    Config stress;                  // rob = 32, prf = 64 default → starvation-free
+    stress.prf_size = stress.rob_size + 4;   // deep enough to trip
+    REQUIRE(stress.prf_can_starve());
+    FreeList tight(stress);
+    // The initial free set is prf_size - 32 = rob + 4 - 32 = 4 entries. So
+    // any workload with 5+ in-flight dest-writing uops on top of the 32
+    // arch-visible mappings starves.
+    REQUIRE(tight.num_free() == stress.prf_size - 32);
+    uint32_t handed_out = 0;
+    while (tight.alloc()) ++handed_out;
+    REQUIRE(handed_out == stress.prf_size - 32);
+    REQUIRE(!tight.alloc().has_value());   // starved, reported as such
 }
 
 
