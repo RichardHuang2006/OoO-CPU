@@ -20,6 +20,7 @@
 #include "alu.h"
 #include "memory.h"
 #include "loader.h"
+#include "rob.h"
 #include "cpu.h"
 #include "asm.h"
 #include "ref.h"
@@ -2360,6 +2361,239 @@ SECTION("cpu_tick") {
             const diff::Outcome o = cputest::run_cpu(*alu_wl, cfg);
             REQUIRE(o.cycles == o.retired + 4);
         }
+    }
+}
+
+
+// --------------------------------------------------------- @section("rob") ---
+namespace robtest {
+
+// An entry whose fields all derive from `pc`, so a test can tell which
+// instruction it got back.
+inline RobEntry entry(uint32_t pc, ArchReg dest = INVALID_ARCHREG) {
+    RobEntry e;
+    e.pc         = pc;
+    e.next_pc    = pc + 4;
+    e.dest_arch  = dest;
+    e.dest_phys  = (dest == INVALID_ARCHREG) ? INVALID_PHYSREG : 100 + dest;
+    e.stale_phys = (dest == INVALID_ARCHREG) ? INVALID_PHYSREG : 200 + dest;
+    return e;
+}
+
+inline RobEntry done_entry(uint32_t pc) {
+    RobEntry e = entry(pc);
+    e.complete = true;
+    return e;
+}
+
+}  // namespace robtest
+
+SECTION("rob") {
+    using robtest::done_entry;
+    using robtest::entry;
+
+    // ---- A fresh buffer is empty and sized from the config ----------------
+    {
+        Config cfg;
+        Rob rob(cfg);
+        REQUIRE(rob.capacity() == cfg.rob_size);
+        REQUIRE(rob.size() == 0);
+        REQUIRE(rob.empty());
+        REQUIRE(!rob.full());
+        REQUIRE(rob.next_seq() == 0);
+        REQUIRE(rob.head() == INVALID_ROBINDEX);
+        REQUIRE(rob.nth(0) == INVALID_ROBINDEX);
+        REQUIRE(!rob.in_flight(0));
+        REQUIRE(!rob.pop_head_if_complete().has_value());
+        REQUIRE(rob.squash_all().empty());
+
+        Config small = cfg;
+        small.rob_size = 4;
+        REQUIRE(Rob(small).capacity() == 4);
+    }
+
+    // ---- Filling: program order, monotonic seq, full at capacity ----------
+    {
+        Rob rob(8);
+        for (uint32_t i = 0; i < 8; ++i) {
+            const RobIndex idx = rob.allocate(entry(0x1000 + 4 * i, i + 1));
+            REQUIRE(idx == i);
+            REQUIRE(rob.at(idx).seq == i);
+            REQUIRE(rob.size() == i + 1);
+            REQUIRE(rob.head() == 0);
+            REQUIRE(rob.in_flight(idx));
+        }
+        REQUIRE(rob.full());
+        REQUIRE(rob.next_seq() == 8);
+        REQUIRE(rob.tail() == rob.head());          // wrapped all the way round
+
+        // The allocated payload survives untouched.
+        REQUIRE(rob.at(3).pc == 0x100Cu);
+        REQUIRE(rob.at(3).next_pc == 0x1010u);
+        REQUIRE(rob.at(3).dest_arch == 4u);
+        REQUIRE(rob.at(3).stale_phys == 204u);
+        REQUIRE(!rob.at(3).complete);
+
+        // nth() and age_of() are inverses over the live range.
+        for (uint32_t k = 0; k < rob.size(); ++k) REQUIRE(rob.age_of(rob.nth(k)) == k);
+    }
+
+    // ---- Commit waits for the head, however the completions arrive --------
+    {
+        Rob rob(8);
+        for (uint32_t i = 0; i < 4; ++i) rob.allocate(entry(0x1000 + 4 * i));
+
+        rob.at(rob.nth(1)).complete = true;
+        rob.at(rob.nth(2)).complete = true;
+        REQUIRE(!rob.pop_head_if_complete().has_value());   // head still running
+        REQUIRE(rob.size() == 4);
+
+        rob.at(rob.head()).complete = true;
+        const std::optional<RobEntry> first = rob.pop_head_if_complete();
+        REQUIRE(first.has_value());
+        REQUIRE(first->seq == 0);
+        REQUIRE(rob.size() == 3);
+
+        // The two already-complete entries now drain back to back, and the
+        // fourth still blocks.
+        REQUIRE(rob.pop_head_if_complete()->seq == 1);
+        REQUIRE(rob.pop_head_if_complete()->seq == 2);
+        REQUIRE(!rob.pop_head_if_complete().has_value());
+        REQUIRE(rob.size() == 1);
+    }
+
+    // ---- FIFO order holds across every wrap boundary ----------------------
+    {
+        Rob rob(8);
+        SeqNum   next_out  = 0;
+        uint32_t allocated = 0;
+        for (int i = 0; i < 200; ++i) {
+            for (int k = 0; k < 2 && !rob.full(); ++k) {
+                rob.allocate(done_entry(0x1000 + 4 * allocated++));
+            }
+            if (const std::optional<RobEntry> out = rob.pop_head_if_complete()) {
+                REQUIRE(out->seq == next_out);
+                REQUIRE(out->pc  == 0x1000u + 4 * next_out);
+                ++next_out;
+            }
+        }
+        while (const std::optional<RobEntry> out = rob.pop_head_if_complete()) {
+            REQUIRE(out->seq == next_out++);
+        }
+        REQUIRE(rob.empty());
+        REQUIRE(next_out == allocated);
+        REQUIRE(allocated > 4 * rob.capacity());    // many laps, not one
+    }
+
+    // ---- truncate_to keeps its argument and everything older --------------
+    {
+        Rob rob(8);
+        for (uint32_t i = 0; i < 8; ++i) rob.allocate(entry(0x1000 + 4 * i));
+
+        const RobIndex branch = rob.nth(3);
+        const std::vector<RobEntry> killed = rob.truncate_to(branch);
+
+        // Youngest first: the order recovery frees physical registers in.
+        REQUIRE(killed.size() == 4);
+        REQUIRE(killed[0].seq == 7);
+        REQUIRE(killed[1].seq == 6);
+        REQUIRE(killed[2].seq == 5);
+        REQUIRE(killed[3].seq == 4);
+
+        REQUIRE(rob.size() == 4);
+        REQUIRE(rob.head() == 0);
+        REQUIRE(rob.at(branch).seq == 3);
+        REQUIRE(rob.in_flight(branch));
+        REQUIRE(!rob.in_flight(rob.capacity() - 1));
+
+        // The tail is restored, so the next allocation lands right behind the
+        // survivor — with a fresh sequence number, never a reused one.
+        REQUIRE(rob.tail() == 4u);
+        REQUIRE(!rob.full());
+        const RobIndex refill = rob.allocate(entry(0x2000));
+        REQUIRE(refill == 4u);
+        REQUIRE(rob.at(refill).seq == 8);
+        REQUIRE(rob.nth(4) == refill);
+    }
+
+    // ---- The same, with the live range straddling the end of storage ------
+    {
+        Rob rob(8);
+        for (uint32_t i = 0; i < 5; ++i) rob.allocate(done_entry(0x1000 + 4 * i));
+        for (uint32_t i = 0; i < 5; ++i) rob.pop_head_if_complete();
+        REQUIRE(rob.empty());
+        REQUIRE(rob.tail() == 5u);
+
+        for (uint32_t i = 0; i < 6; ++i) rob.allocate(entry(0x2000 + 4 * i));
+        REQUIRE(rob.head() == 5u);                  // slots 5,6,7,0,1,2 are live
+        REQUIRE(rob.nth(3) == 0u);
+
+        const std::vector<RobEntry> killed = rob.truncate_to(rob.nth(3));
+        REQUIRE(killed.size() == 2);
+        REQUIRE(killed[0].seq == 10);
+        REQUIRE(killed[1].seq == 9);
+        REQUIRE(rob.size() == 4);
+        REQUIRE(rob.head() == 5u);
+        REQUIRE(rob.tail() == 1u);
+        REQUIRE(rob.at(rob.nth(3)).seq == 8);
+    }
+
+    // ---- Truncation edge cases --------------------------------------------
+    {
+        Rob rob(8);
+        for (uint32_t i = 0; i < 5; ++i) rob.allocate(entry(0x1000 + 4 * i));
+
+        // Truncating to the youngest entry squashes nothing.
+        REQUIRE(rob.truncate_to(rob.nth(4)).empty());
+        REQUIRE(rob.size() == 5);
+
+        // An index that is not live squashes nothing either: one past the
+        // tail, and one out of range entirely.
+        REQUIRE(rob.truncate_to(5).empty());
+        REQUIRE(rob.truncate_to(rob.capacity()).empty());
+        REQUIRE(rob.truncate_to(INVALID_ROBINDEX).empty());
+        REQUIRE(rob.size() == 5);
+
+        // Truncating to the head leaves exactly the head.
+        const std::vector<RobEntry> killed = rob.truncate_to(rob.head());
+        REQUIRE(killed.size() == 4);
+        REQUIRE(killed.front().seq == 4);
+        REQUIRE(killed.back().seq == 1);
+        REQUIRE(rob.size() == 1);
+        REQUIRE(rob.at(rob.head()).seq == 0);
+    }
+
+    // ---- squash_all empties the buffer, youngest first --------------------
+    {
+        Rob rob(4);
+        for (uint32_t i = 0; i < 4; ++i) rob.allocate(entry(0x1000 + 4 * i));
+        REQUIRE(rob.full());
+
+        const std::vector<RobEntry> killed = rob.squash_all();
+        REQUIRE(killed.size() == 4);
+        for (uint32_t i = 0; i < 4; ++i) REQUIRE(killed[i].seq == 3 - i);
+        REQUIRE(rob.empty());
+        REQUIRE(rob.head() == INVALID_ROBINDEX);
+
+        // Sequence numbers carry on past the squash.
+        const RobIndex idx = rob.allocate(entry(0x2000));
+        REQUIRE(rob.head() == idx);
+        REQUIRE(rob.at(idx).seq == 4);
+    }
+
+    // ---- A 4-entry ROB is the structural-hazard config ---------------------
+    {
+        Config cfg;
+        cfg.rob_size = 4;
+        Rob rob(cfg);
+        for (uint32_t i = 0; i < 4; ++i) {
+            REQUIRE(!rob.full());
+            rob.allocate(entry(0x1000 + 4 * i));
+        }
+        REQUIRE(rob.full());                        // dispatch stalls here
+        rob.at(rob.head()).complete = true;
+        REQUIRE(rob.pop_head_if_complete().has_value());
+        REQUIRE(!rob.full());                       // and unstalls on one commit
     }
 }
 

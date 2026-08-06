@@ -22,8 +22,10 @@ DBG_OBJ = $(patsubst src/%.cpp,$(DBGDIR)/%.o,$(CPU_SRC))
 
 TEST_SRC   = tests/test_main.cpp
 TOOLS_SRC  = tools/gen_examples.cpp
+HDR        = $(wildcard src/*.h) $(wildcard tests/*.h)
 
-# The tests reuse every src/*.cpp but main.cpp, whose main() they replace.
+# The tests reuse every src/*.cpp but main.cpp, whose main() they replace by
+# #including it.
 LIB_SRC = $(filter-out src/main.cpp,$(CPU_SRC))
 
 .PHONY: all debug test examples clean help
@@ -64,7 +66,9 @@ examples:
 	fi
 
 # ------------------------------------------------------------------ test ---
-$(BUILD)/test_main: $(TEST_SRC) $(LIB_SRC) | $(BUILD)
+# One translation unit that pulls in nearly every header, so it is rebuilt on
+# any header change rather than tracked dependency by dependency.
+$(BUILD)/test_main: $(TEST_SRC) $(CPU_SRC) $(HDR) | $(BUILD)
 	@if [ ! -f $(TEST_SRC) ]; then echo "no $(TEST_SRC)"; exit 1; fi
 	$(CXX) $(CXXFLAGS_REL) $(TEST_SRC) $(LIB_SRC) -o $@
 
