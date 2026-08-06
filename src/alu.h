@@ -3,14 +3,10 @@
 #include <cstdint>
 #include <limits>
 
-// Pure functional model of RV32IM's ALU, MUL/DIV, and branch primitives.
-// Every function is a two-input operation returning either the ALU result
-// (uint32_t) or a branch condition (bool). No PC or immediate lives here —
-// LUI, AUIPC, JAL, JALR, and load/store address arithmetic all reduce to
-// `add`, and are dispatched by the Execute stage.
+// Pure two-input primitives for RV32IM. No PC or immediate here: LUI, AUIPC,
+// JAL, JALR and address arithmetic all reduce to add().
 //
-// `and`, `or`, `xor` are C++ alternative tokens; the three bitwise
-// operations carry a trailing underscore to escape the keyword collision.
+// and/or/xor are C++ tokens, hence the trailing underscores.
 
 namespace alu {
 
@@ -22,9 +18,8 @@ constexpr uint32_t sub (uint32_t a, uint32_t b) { return a - b; }
 constexpr uint32_t sll (uint32_t a, uint32_t b) { return a << (b & 0x1Fu); }
 constexpr uint32_t srl (uint32_t a, uint32_t b) { return a >> (b & 0x1Fu); }
 
-// Arithmetic right shift is implementation-defined for signed integers in
-// C++17; do it explicitly via a computed sign-fill so behavior is portable
-// (and so -Wpedantic + UBSan stay silent).
+// Signed right shift is implementation-defined in C++17, so fill the sign
+// bits explicitly.
 constexpr uint32_t sra (uint32_t a, uint32_t b) {
     const uint32_t sh = b & 0x1Fu;
     if (sh == 0) return a;                                   // avoids `<< 32` UB
@@ -56,8 +51,7 @@ constexpr uint32_t mulhu(uint32_t a, uint32_t b) {
     const uint64_t p = static_cast<uint64_t>(a) * static_cast<uint64_t>(b);
     return static_cast<uint32_t>(p >> 32);
 }
-// Upper 32 bits of signed rs1 × unsigned rs2. |rs1|·rs2 < 2^63 always fits
-// in int64 without overflow.
+// Upper 32 bits of signed × unsigned; the product always fits in int64.
 constexpr uint32_t mulhsu(uint32_t a, uint32_t b) {
     const int64_t p = static_cast<int64_t>(static_cast<int32_t>(a)) *
                       static_cast<int64_t>(static_cast<uint32_t>(b));
@@ -65,9 +59,8 @@ constexpr uint32_t mulhsu(uint32_t a, uint32_t b) {
 }
 
 // ---- M extension: DIV / REM ----------------------------------------------
-// RISC-V §7.2 spells out both non-standard edge cases; guarding is not
-// optional — the native `/` and `%` on either would be UB, and on x86 the
-// INT_MIN / -1 case additionally raises SIGFPE.
+// Both edge cases are defined by the ISA and must be guarded: native / and %
+// would be UB, and INT_MIN / -1 raises SIGFPE on x86.
 constexpr uint32_t div(uint32_t a, uint32_t b) {
     if (b == 0) return 0xFFFFFFFFu;                          // divide-by-zero → -1
     const int32_t sa = static_cast<int32_t>(a);

@@ -3,11 +3,9 @@
 #include <cstdint>
 #include "types.h"
 
-// Specific operation. `OpKind` (types.h) gives the latency / FU class that
-// Phase-5 dispatch routes on; `Op` picks the exact semantics that alu.h
-// dispatches on inside a class. Keeping the two enums separate means a new
-// pipelined multiply variant can drop into OpKind::MUL without adding a case
-// to the ALU switch.
+// The exact operation. `OpKind` picks the function unit, `Op` picks the
+// semantics within it; keeping them separate lets a new op join a class
+// without touching the routing.
 enum class Op : uint8_t {
     // OpKind::ALU
     ADD, SUB, SLL, SRL, SRA, AND, OR, XOR, SLT, SLTU,
@@ -33,7 +31,7 @@ enum class Op : uint8_t {
 struct Decoded {
     uint32_t raw;         // original 32-bit instruction word
     Op       op;
-    OpKind   kind;        // FU / latency class (types.h)
+    OpKind   kind;        // function-unit class
     ArchReg  rd;          // 0 if the instruction does not use rd
     ArchReg  rs1;         // 0 if unused
     ArchReg  rs2;         // 0 if unused
@@ -44,7 +42,6 @@ struct Decoded {
     bool     writes_rd;   // rd != 0 AND the op semantically writes rd
 };
 
-// Decode one 32-bit RV32IM instruction. Unknown opcode / funct combinations
-// return `Op::INVALID` with `kind = OpKind::TRAP` — the trap is precise at
-// commit rather than a decoder-time crash.
+// Decode one RV32IM instruction. Unknown encodings return Op::INVALID with
+// kind OpKind::TRAP so the trap stays precise at commit.
 Decoded decode(uint32_t raw);

@@ -1,14 +1,10 @@
 // Top-level driver for Mini-CPU.
 //
-// This file is unusual: `int main()` is guarded so tests can
-// `#include "main.cpp"` and unit-test parse_args / print_help without
-// shelling out to the binary. Everything else is inline or file-static, so
-// double-inclusion (release build + test include) does not violate ODR.
+// `int main()` is guarded so tests can #include this file and drive
+// parse_args / print_help directly. Everything else is inline or file-static,
+// so including it twice does not violate ODR.
 //
-// Execution is delegated to the in-order reference interpreter in
-// tests/ref.h. Until Phase 3 lands a pipeline model, that interpreter *is*
-// the machine `oooc` runs; afterwards it stays reachable as the oracle every
-// simulated run is diffed against.
+// Execution is delegated to the in-order interpreter in ref.h.
 
 #include <cstddef>
 #include <cstdint>
@@ -42,9 +38,8 @@ struct CliOpts {
     Config      cfg;
 };
 
-// One entry per uint32_t field in Config that the CLI exposes; the pointer-
-// to-member lets the parser assign to arbitrary fields uniformly. There is
-// exactly one entry per Config knob — Step 0.3's Done-when clause.
+// One entry per Config knob. The pointer-to-member lets the parser assign to
+// any field uniformly.
 struct ConfigKnob {
     const char*         flag;
     uint32_t Config::*  member;
@@ -104,8 +99,7 @@ inline std::string flag_of(const std::string& tok) {
 
 }  // namespace mini_cpu_cli_detail
 
-// Returns 0 on success, non-zero on error (message already on stderr).
-// argv[] must contain nul-terminated strings; typical char** from main works.
+// Returns 0 on success, non-zero on error with the message already on stderr.
 inline int parse_args(int argc, char** argv, CliOpts& opts) {
     using namespace mini_cpu_cli_detail;
     for (int i = 1; i < argc; ++i) {
@@ -192,7 +186,7 @@ inline void print_help() {
     std::printf("  --trace           print each retired instruction to stderr\n");
     std::printf("  --max-insts N     abort after N retired instructions (default 1e8)\n");
     std::printf("  --help, -h        this message\n");
-    std::printf("\nMicroarchitectural knobs (Config, see DESIGN.md section 9.1):\n");
+    std::printf("\nMicroarchitectural knobs:\n");
     for (const auto& k : KNOBS) {
         std::printf("  %-14s  %s\n", k.flag, k.desc);
     }

@@ -11,8 +11,7 @@ constexpr uint32_t rs1_of   (uint32_t x) { return (x >> 15) & 0x1F; }
 constexpr uint32_t rs2_of   (uint32_t x) { return (x >> 20) & 0x1F; }
 
 // -- sign-extension --------------------------------------------------------
-// Extends the low `bits` of `v` to a signed 32-bit int in a way that is
-// well-defined under -Wpedantic (no arithmetic on signed overflow).
+// Extends the low `bits` of `v` without relying on signed overflow.
 constexpr int32_t sext(uint32_t v, uint32_t bits) {
     const uint32_t mask = 1u << (bits - 1);
     return static_cast<int32_t>((v ^ mask) - mask);
@@ -34,8 +33,8 @@ constexpr int32_t imm_B(uint32_t x) {
     return sext(v, 13);
 }
 constexpr int32_t imm_U(uint32_t x) {
-    // Bits 31..12 are the immediate placed at bits 31..12 of the result;
-    // low 12 bits are zero. The result is already sign-correct as int32_t.
+    // Immediate stays at bits 31..12; the low 12 are zero and the result is
+    // already sign-correct.
     return static_cast<int32_t>(x & 0xFFFFF000u);
 }
 constexpr int32_t imm_J(uint32_t x) {
@@ -216,7 +215,7 @@ Decoded decode(uint32_t raw) {
         }
         return invalid_of(raw);
 
-    // -- MISC-MEM (FENCE / FENCE.I) — retire as NOPs, no reorder buffer flush
+    // -- MISC-MEM (FENCE / FENCE.I) — retire as NOPs
     case 0x0F:
         d.kind = OpKind::NOP;
         d.rd = 0; d.rs1 = 0; d.rs2 = 0; d.imm = 0;

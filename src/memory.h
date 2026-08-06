@@ -5,16 +5,9 @@
 #include <cstdint>
 #include <unordered_map>
 
-// Flat, paged, always-hit physical memory.
-//
-// * Pages are 4 KiB, allocated lazily on first write. Reads from an
-//   unmapped page return zero and do NOT allocate — the OoO simulator
-//   will speculatively touch memory (Step 6.2's load pipeline), and
-//   speculation must not allocate.
-// * RV32IM permits misaligned loads and stores; wider accesses assemble
-//   themselves from byte accesses, so a store that straddles a page
-//   boundary just allocates whichever pages it touches.
-// * Little-endian throughout — RISC-V's endianness.
+// Flat, paged, always-hit physical memory. 4 KiB pages are allocated lazily
+// on first write; reads of unmapped pages return zero without allocating, so
+// speculative loads leave no trace. Little-endian, misaligned access allowed.
 
 class Memory {
 public:
@@ -30,7 +23,7 @@ public:
     void store_u16(uint32_t addr, uint16_t v);
     void store_u32(uint32_t addr, uint32_t v);
 
-    // Bulk write used by the program loaders in Step 1.4.
+    // Bulk write, used by the program loaders.
     void write_bytes(uint32_t addr, const uint8_t* data, std::size_t len);
 
     // Introspection.
@@ -67,7 +60,7 @@ inline uint32_t Memory::load_u32(uint32_t addr) const {
 }
 
 inline void Memory::store_u8(uint32_t addr, uint8_t v) {
-    // operator[] value-initializes the mapped std::array to zeros on insert.
+    // operator[] zero-initializes a freshly inserted page.
     pages_[addr & ~PAGE_MASK][addr & PAGE_MASK] = v;
 }
 

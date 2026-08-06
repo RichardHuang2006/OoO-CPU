@@ -3,11 +3,8 @@
 #include <cstdint>
 #include <type_traits>
 
-// All structural parameters live here as one field per knob. Downstream code
-// takes a `const Config&` and reads sizes off it — no `constexpr` hardcoded
-// dimensions anywhere else. This is what makes --width, --rob, etc. sweepable
-// in Step 1.5 and what lets [§8.2](../DESIGN.md#82-configuration-sweep) run
-// the same workload across six configurations without recompilation.
+// One field per structural knob. Downstream code reads sizes off a
+// `const Config&` so a configuration sweep needs no recompilation.
 
 struct Config {
     // Pipeline width: fetch, decode, rename, dispatch, issue, commit each
@@ -44,15 +41,13 @@ struct Config {
     uint32_t ras_size        = 16;
     uint32_t num_checkpoints = 16;    // max in-flight branches with a snapshot
 
-    // DESIGN.md §3.2: PRF ≥ ROB + 32 makes register starvation impossible —
-    // every in-flight instruction can hold one new mapping on top of the 32
-    // committed ones. Smaller values are legal and simply stall Rename, which
-    // is the point of sweeping --prf during characterization.
+    // PRF >= ROB + 32 makes register starvation impossible: every in-flight
+    // instruction can hold one mapping on top of the 32 committed ones.
+    // Smaller values are legal and just stall rename.
     bool prf_can_starve() const {
         return prf_size < rob_size + 32;
     }
 };
 
-// A snapshot of Config must be bit-copyable — Step 7.4's branch checkpoints
-// don't touch this, but tooling that swaps configs across a run relies on it.
+// Configs get copied around wholesale; keep them memcpy-able.
 static_assert(std::is_trivially_copyable_v<Config>);

@@ -10,32 +10,27 @@
 
 #include "memory.h"
 
-// Three program-loading paths for `src/main.cpp` (Step 1.5). Each takes an
-// istream so tests drive them from std::istringstream and the CLI drives
-// them from std::ifstream — no filesystem coupling here.
+// Three program-loading paths. Each takes an istream so tests can drive them
+// from a string and the CLI from a file.
 
 struct LoadResult {
-    uint32_t entry = 0;    // program entry PC (base for hex/raw, e_entry for ELF)
+    uint32_t entry = 0;    // base for hex/raw, e_entry for ELF
 
-    // Read-only ranges (PF_R without PF_W) extracted from ELF PT_LOADs.
-    // Empty for hex/raw. Handed back to the caller rather than enforced in
-    // Memory itself, so the OoO simulator can decide how strictly to police
-    // wrong-path stores.
+    // Read-only ELF segments, empty for hex/raw. Reported rather than
+    // enforced, so the caller decides how strictly to police stores.
     std::vector<std::pair<uint32_t, uint32_t>> ro_ranges;   // [start, end)
 };
 
 // ---- plain hex-word format ------------------------------------------------
-// One 32-bit hex word per line. `#` and `//` start a line comment; blank
-// lines are skipped; an optional `0x` / `0X` prefix is accepted; the first
-// word lands at `base`, subsequent words at `base+4`, `base+8`, ...
+// One hex word per line, loaded consecutively from `base`. `#` and `//` start
+// a comment, blank lines are skipped, an optional 0x prefix is accepted.
 inline LoadResult load_hex(Memory& mem, std::istream& in, uint32_t base = 0) {
     LoadResult r;
     r.entry = base;
     uint32_t addr = base;
     std::string line;
     while (std::getline(in, line)) {
-        // Strip trailing '\r' (Windows line endings) before comment stripping
-        // so a '#' or '//' at end-of-line isn't shadowed by a stray '\r'.
+        // Strip '\r' first, or it hides behind an end-of-line comment.
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (auto p = line.find("//"); p != std::string::npos) line.erase(p);
         if (auto p = line.find('#');  p != std::string::npos) line.erase(p);
@@ -72,9 +67,8 @@ inline LoadResult load_raw(Memory& mem, std::istream& in, uint32_t base) {
 }
 
 // ---- ELF32 little-endian executable --------------------------------------
-// Walks program headers, loads every PT_LOAD segment at its p_vaddr, records
-// PF_R & ~PF_W segments in ro_ranges. Fields are read at fixed byte offsets
-// so no packed struct is required — no ABI risk from padding.
+// Loads every PT_LOAD at its p_vaddr and records the read-only ones. Fields
+// are read at fixed offsets, so no packed struct and no padding surprises.
 inline LoadResult load_elf(Memory& mem, std::istream& in) {
     LoadResult r;
     std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)),
@@ -126,8 +120,8 @@ inline LoadResult load_elf(Memory& mem, std::istream& in) {
             throw std::runtime_error("load_elf: PT_LOAD segment past EOF");
         }
         mem.write_bytes(p_vaddr, buf.data() + p_offset, p_filesz);
-        // p_memsz > p_filesz (BSS) leaves the tail unmapped; Memory returns 0
-        // for reads of unmapped bytes, which matches BSS semantics.
+        // A BSS tail stays unmapped; unmapped reads return 0, which is what
+        // BSS means anyway.
 
         if ((p_flags & PF_R) && !(p_flags & PF_W)) {
             r.ro_ranges.emplace_back(p_vaddr, p_vaddr + p_memsz);

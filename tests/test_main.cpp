@@ -1,9 +1,5 @@
-// Test driver. Each PLAN.md step appends one SECTION() block; the harness
-// grows here rather than fanning out across files so the whole suite is one
-// translation unit and `make test` is one binary.
-//
-// The diff_run() helper that compares the OoO simulator against ref.h is
-// introduced in Step 2.3.
+// Test driver: one SECTION() block per group of assertions, all in one
+// translation unit so `make test` builds a single binary.
 
 #include <cstdint>
 
@@ -53,9 +49,8 @@ inline void report_fail(const char* expr, const char* file, int line) {
     ++assertion_failures;
 }
 
-// A bare expression is a useless failure message for a differential run —
-// "d.ok" tells you nothing about which register diverged. Assertions that
-// can explain themselves carry the explanation.
+// For failures where the expression alone says nothing useful, such as a
+// differential run that needs to name the register that diverged.
 inline void report_fail_msg(const char* expr, const std::string& detail,
                             const char* file, int line) {
     std::fprintf(stderr, "  FAIL: %s   at %s:%d\n%s", expr, file, line, detail.c_str());
@@ -96,7 +91,7 @@ SECTION("types") {
     REQUIRE(INVALID_ROBINDEX > (1u << 16));
     REQUIRE(INVALID_SEQNUM   > (1u << 16));
 
-    // round-trip through the std::optional<PhysReg> idiom used at Step 4.2
+    // round-trip through the std::optional<PhysReg> idiom
     auto to_opt = [](PhysReg r) -> std::optional<PhysReg> {
         return (r == INVALID_PHYSREG) ? std::nullopt : std::optional<PhysReg>(r);
     };
@@ -122,7 +117,7 @@ SECTION("types") {
 SECTION("config") {
     Config c;
 
-    // defaults match DESIGN.md §9.1
+    // documented defaults
     REQUIRE(c.width           == 2);
     REQUIRE(c.rob_size        == 32);
     REQUIRE(c.prf_size        == 64);
@@ -144,7 +139,7 @@ SECTION("config") {
     REQUIRE(c.ras_size        == 16);
     REQUIRE(c.num_checkpoints == 16);
 
-    // §3.2 starvation-free rule at the default sizing
+    // the default sizing is starvation-free
     REQUIRE(!c.prf_can_starve());
 
     // exact boundary: prf_size == rob_size + 32 is safe; one less starves
@@ -154,7 +149,7 @@ SECTION("config") {
     edge.prf_size = edge.rob_size + 32 - 1;
     REQUIRE(edge.prf_can_starve());
 
-    // the specific stress config used later in the six-config sweep
+    // the stress config used by the sweep
     Config small_prf = c;
     small_prf.prf_size = 32;
     REQUIRE(small_prf.prf_can_starve());
@@ -162,8 +157,7 @@ SECTION("config") {
 
 // ------------------------------------------------------ @section("decode") ---
 namespace enc {
-    // File-local encoders — enough to build the decode-test cases without
-    // duplicating raw hex constants. Step 2.1's asm.h supersedes these.
+    // File-local encoders, so the decode cases need no raw hex constants.
     constexpr uint32_t R(uint32_t op, uint32_t rd, uint32_t f3,
                          uint32_t rs1, uint32_t rs2, uint32_t f7) {
         return (f7 << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op;
@@ -375,9 +369,9 @@ SECTION("alu") {
     // (-1) signed × 1 unsigned = -1 as int64; two's-complement upper 32 = -1.
     REQUIRE(alu::mulhsu(static_cast<uint32_t>(-1), 1u) == 0xFFFFFFFFu);
 
-    // ---- M extension: DIV / REM edge cases (RISC-V §7.2) ------------------
+    // ---- M extension: DIV / REM edge cases --------------------------------
     constexpr uint32_t INT_MIN_U = 0x80000000u;
-    // The two cases the plan pins by name:
+    // The two defined-by-the-ISA cases:
     REQUIRE(alu::div(INT_MIN_U, static_cast<uint32_t>(-1)) == INT_MIN_U);  // no trap
     REQUIRE(alu::div(10u, 0u) == 0xFFFFFFFFu);                              // /0 → -1
     // The remainder counterparts:
@@ -435,9 +429,8 @@ SECTION("memory") {
     m.store_u8(0x2000, 0xBB);
     REQUIRE(m.num_pages() == 2);
 
-    // ---- The plan's marquee test ------------------------------------------
-    // Store 0xDEADBEEF at 0x1002 (misaligned within a page), then read the
-    // same bytes back as one lw, two lh's, and four lb's — little-endian.
+    // ---- Misaligned store, read back at three widths ----------------------
+    // 0xDEADBEEF at 0x1002, read back as one lw, two lh's, four lb's.
     Memory misa;
     misa.store_u32(0x1002, 0xDEADBEEFu);
     REQUIRE(misa.load_u32(0x1002) == 0xDEADBEEFu);
@@ -597,7 +590,7 @@ SECTION("loader") {
         REQUIRE(r.ro_ranges[0].second == base + sizeof(payload));
     }
 
-    // ---- The plan's marquee assertion: all three lands identical bytes ----
+    // ---- All three formats land identical bytes ---------------------------
     for (std::size_t i = 0; i < 3; ++i) {
         REQUIRE(m_hex.load_u32(base + i * 4) == words[i]);
         REQUIRE(m_raw.load_u32(base + i * 4) == words[i]);
@@ -758,8 +751,8 @@ SECTION("asm") {
     using namespace asmc;
 
     // ---- Every instruction encodes byte-exact vs. the enc:: reference ---
-    // The enc:: helpers were pinned in @section("decode") against 57
-    // instructions, so this is a genuine differential check.
+    // enc:: was itself pinned against the decoder above, so this is a real
+    // differential check rather than a restatement.
     {
         Assembler a;
         a.addi (a0, a1, 5);
@@ -1365,20 +1358,15 @@ SECTION("ref") {
 
 
 // ================================================================ workloads ===
-// The validation corpus from DESIGN.md §8.1: thirteen hand-written programs
-// covering ALU semantics, loops, arrays, store forwarding, sub-word and
-// partial-overlap accesses, nested calls, recursive Fibonacci, an
-// unpredictable branch, mul/div including divide-by-zero, a pointer chase,
-// and a WAW/WAR renaming stress.
+// The validation corpus: thirteen programs run through both the pipeline
+// model and ref.h, covering ALU semantics, loops, arrays, store forwarding,
+// sub-word and partial-overlap accesses, nested calls, recursive Fibonacci,
+// an unpredictable branch, mul/div with divide-by-zero, a pointer chase, and
+// a WAW/WAR renaming stress.
 //
-// Every phase from 3 onward is validated by running these through both the
-// pipeline model and ref.h. They live here, in Phase 2, because Step 3.4's
-// first end-to-end differential pass is defined as "every Phase-2 workload".
-//
-// Each program computes a result whose value is known independently of the
-// simulator — by hand where the arithmetic is simple, and by an equivalent
-// C++ loop where it is not (the LCG and the division sweep). A workload
-// whose expected exit code was read off a previous run would assert nothing.
+// Every expected exit code is derived independently of the simulator: by hand
+// where the arithmetic is simple, by an equivalent C++ loop where it is not.
+// A value read off a previous run would assert nothing.
 
 namespace wl {
 
@@ -1639,9 +1627,9 @@ inline Workload sieve() {
 }
 
 // ---- 6. Store-to-load forwarding ------------------------------------------
-// Twenty dependent store→load pairs at the same address, each feeding the
-// next. Phase 6 must forward these out of the store queue; the reference
-// just sees memory, which is exactly the disagreement worth testing for.
+// Twenty dependent store→load pairs at one address, each feeding the next.
+// The pipeline forwards them out of the store queue; the reference just sees
+// memory, which is the disagreement worth testing for.
 inline Workload store_forward() {
     Assembler p;
     p.li(s0, static_cast<int32_t>(DATA));
@@ -1664,8 +1652,8 @@ inline Workload store_forward() {
 }
 
 // ---- 7. Sub-word and partial-overlap accesses -----------------------------
-// Every access below overlaps a previous store partially, which is the case
-// Phase 6 has to answer with Replay rather than a forward.
+// Each access partially overlaps an earlier store, the case a store queue
+// has to answer with a replay rather than a forward.
 inline Workload subword() {
     Assembler p;
     p.li(s0, static_cast<int32_t>(DATA));
@@ -1695,8 +1683,8 @@ inline Workload subword() {
 }
 
 // ---- 8. Nested calls ------------------------------------------------------
-// A four-deep non-recursive call chain, ten times over: exercises the RAS at
-// several depths and the ra save/restore discipline.
+// A four-deep call chain, ten times over: the return-address stack at
+// several depths, plus ra save/restore.
 inline Workload nested_calls() {
     Assembler p;
     p.li(sp, static_cast<int32_t>(STACK));
@@ -1767,9 +1755,8 @@ inline Workload fib() {
 }
 
 // ---- 10. Unpredictable branch ---------------------------------------------
-// A branch driven by a bit of an LCG stream: no history pattern can predict
-// it, so this is the workload that exercises recovery rather than prediction.
-// The expected count comes from running the same recurrence in C++.
+// A branch driven by a bit of an LCG stream, so no history pattern predicts
+// it. The expected count comes from the same recurrence in C++.
 inline Workload lcg_branch() {
     constexpr uint32_t SEED = 12345, MUL = 1103515245, INC = 12345, ITERS = 200;
 
@@ -1845,9 +1832,9 @@ inline Workload muldiv() {
 }
 
 // ---- 12. Pointer chase ----------------------------------------------------
-// 32 two-word nodes linked in a stride-7 cycle (7 is coprime with 32, so the
-// cycle covers every node). The traversal is a chain of dependent loads —
-// the pattern that no amount of issue width can accelerate.
+// 32 two-word nodes in a stride-7 cycle (7 is coprime with 32, so the cycle
+// covers every node). The traversal is a chain of dependent loads, which no
+// amount of issue width can accelerate.
 inline Workload pointer_chase() {
     Assembler p;
     p.li(s0, static_cast<int32_t>(DATA));
@@ -1885,10 +1872,9 @@ inline Workload pointer_chase() {
 }
 
 // ---- 13. WAW / WAR renaming stress ----------------------------------------
-// t0 is written five times per iteration and read in between. On the
-// in-order reference this is unremarkable; on an out-of-order machine every
-// one of those writes must land in a distinct physical register or a later
-// reader sees the wrong value.
+// t0 is written five times per iteration and read in between. Each write
+// must land in a distinct physical register or a later reader sees the
+// wrong value.
 inline Workload waw_war() {
     Assembler p;
     p.li(a0, 0);
@@ -1937,21 +1923,19 @@ inline const std::vector<Workload>& corpus() {
 }  // namespace wl
 
 // ========================================================= differential run ===
-// The comparison layer every later phase is tested through. `diff_run` runs a
-// workload on the reference and on the model under test, then compares the
-// three comparands from DESIGN.md §8.1: all 32 architectural registers, the
-// exit code, and the retired-instruction count.
+// `diff_run` runs a workload on the reference and on the model under test,
+// then compares all 32 architectural registers, the exit code, and the
+// retired-instruction count.
 //
-// The model under test is a swappable function, defaulting to the reference
-// itself. That indirection is what makes this step testable before a `Cpu`
-// exists: with both sides running ref.h the comparison must pass, and with a
-// deliberately corrupted runner it must fail and say where.
+// The model is a swappable function defaulting to the reference itself, so
+// the comparison can be tested against a known-equal pair and against
+// deliberately corrupted ones.
 
 namespace diff {
 
 // Neutral result type, so the comparison does not care whether an outcome
-// came from the interpreter or from a pipeline model. `cycles` stays zero
-// until Phase 3 has something to count.
+// came from the interpreter or the pipeline. The interpreter has no cycles
+// to report and leaves that field zero.
 struct Outcome {
     uint32_t regs[32] = {};
     uint32_t exit_code = 0;
@@ -1985,7 +1969,7 @@ inline Outcome run_reference(const wl::Workload& w, const Config&) {
 
 using Runner = std::function<Outcome(const wl::Workload&, const Config&)>;
 
-// Step 3.4 points this at the pipeline model.
+// Swap in a pipeline-backed runner to compare against the interpreter.
 inline Runner& model() {
     static Runner r = &run_reference;
     return r;
@@ -2040,9 +2024,9 @@ inline Report compare(const std::string& name, const Outcome& want, const Outcom
     return {ok, d.str()};
 }
 
-// Run `w` on both layers under configuration `cfg` and compare. A reference
-// run that did not cleanly halt is reported as a failure of the workload
-// itself — comparing two runs that both fell off the end proves nothing.
+// Run `w` on both layers and compare. A reference run that did not halt
+// cleanly is reported as a broken workload; comparing two runs that both
+// fell off the end proves nothing.
 inline Report diff_run(const wl::Workload& w, const Config& cfg) {
     const Outcome want = run_reference(w, cfg);
     if (!want.halted || want.trapped || want.budget) {
@@ -2062,7 +2046,7 @@ SECTION("diff_scaffold") {
     const Config cfg;
     const auto&  corpus = wl::corpus();
 
-    // ---- The corpus is the thirteen programs DESIGN.md §8.1 calls for -----
+    // ---- The corpus is thirteen distinctly named programs ------------------
     REQUIRE(corpus.size() == 13);
     for (std::size_t i = 0; i < corpus.size(); ++i) {
         for (std::size_t j = i + 1; j < corpus.size(); ++j) {
@@ -2071,8 +2055,8 @@ SECTION("diff_scaffold") {
     }
 
     // ---- Every workload halts, and lands on its independently known result -
-    // The retired counts printed here are the denominator of every IPC number
-    // from Phase 8, and a sudden change in one is a signal in its own right.
+    // The printed retired counts are the denominator of every IPC number, so
+    // a change in one is a signal in its own right.
     for (const wl::Workload& w : corpus) {
         const diff::Outcome o = diff::run_reference(w, cfg);
         REQUIRE_MSG(o.halted && !o.trapped && !o.budget,
@@ -2090,8 +2074,8 @@ SECTION("diff_scaffold") {
     }
 
     // ---- Determinism: the same program twice is bit-identical -------------
-    // Every tie-break in the simulator is age- or index-ordered and nothing
-    // reads the clock, so a failure at cycle 41,382 has to reproduce.
+    // Nothing reads the clock and every tie-break is age- or index-ordered,
+    // so a failure has to reproduce exactly.
     for (const wl::Workload& w : corpus) {
         const diff::Outcome a = diff::run_reference(w, cfg);
         const diff::Outcome b = diff::run_reference(w, cfg);
@@ -2099,17 +2083,16 @@ SECTION("diff_scaffold") {
                     "    " + w.name + ": two runs disagreed");
     }
 
-    // ---- The scaffold itself: reference against reference -----------------
-    // Trivially true — which is the point. It proves diff_run's plumbing
-    // works before a Cpu exists to be blamed for a failure.
+    // ---- Reference against reference --------------------------------------
+    // Trivially true, which is the point: it exercises diff_run's plumbing
+    // with nothing else that could be at fault.
     for (const wl::Workload& w : corpus) {
         const diff::Report r = diff::diff_run(w, cfg);
         REQUIRE_MSG(r.ok, r.detail);
     }
 
     // ---- Negative controls ------------------------------------------------
-    // A comparison that never fails is worse than no comparison. Corrupt one
-    // comparand at a time and require diff_run to catch each, and to name it.
+    // Corrupt one comparand at a time; diff_run must catch each and name it.
     const wl::Workload& probe = corpus.front();
     {
         diff::ScopedModel swap([](const wl::Workload& w, const Config& c) {
@@ -2132,8 +2115,7 @@ SECTION("diff_scaffold") {
         REQUIRE(r.detail.find("exit code") != std::string::npos);
     }
     {
-        // The wrong-path-retire signal: same architectural state, more
-        // instructions committed than the program contains.
+        // The wrong-path-retire signal: right registers, too many commits.
         diff::ScopedModel swap([](const wl::Workload& w, const Config& c) {
             diff::Outcome o = diff::run_reference(w, c);
             o.retired += 1;
@@ -2188,9 +2170,7 @@ inline Memory image(const std::vector<uint32_t>& words) {
     return m;
 }
 
-// The pipeline model dressed as a diff::Runner. Step 3.4 installs this as
-// the model under test for the whole corpus; here it drives the one workload
-// the scaffold can already execute end to end.
+// The pipeline model dressed as a diff::Runner.
 inline diff::Outcome run_cpu(const wl::Workload& w, const Config& cfg) {
     Memory m = image(w.words);
     Cpu cpu(m, cfg, wl::TEXT);
@@ -2227,11 +2207,9 @@ SECTION("cpu_tick") {
     }
 
     // ---- One addi, cycle by cycle -----------------------------------------
-    // Five stages, one uop per latch, so the instruction fetched in cycle 1
-    // is in Decode in cycle 2, Execute in 3, Writeback in 4, Commit in 5.
-    // The register write is visible at the end of cycle 4 and the retirement
-    // at the end of cycle 5 — pipeline depth 5, with the two events one cycle
-    // apart because Writeback and Commit are separate stages here.
+    // Fetched in cycle 1, decoded in 2, executed in 3, written back in 4,
+    // retired in 5. Writeback and commit are separate stages, so the register
+    // write lands one cycle before the retirement.
     {
         Assembler p;
         p.addi(a0, zero, 42);
@@ -2263,9 +2241,8 @@ SECTION("cpu_tick") {
     }
 
     // ---- Steady state: one instruction per cycle --------------------------
-    // With no stalls, N instructions retire in N + 4 cycles — the pipeline
-    // fill is the only overhead. This is the baseline every later IPC number
-    // is measured against.
+    // With no stalls, N instructions retire in N + 4 cycles; the pipeline
+    // fill is the only overhead.
     {
         Assembler p;
         for (int i = 0; i < 100; ++i) p.nop();
@@ -2292,8 +2269,8 @@ SECTION("cpu_tick") {
     }
 
     // ---- Nothing behind a halt may retire ---------------------------------
-    // The two instructions after the ecall would both trap if they ever
-    // reached commit, so a clean halt is proof the squash worked.
+    // Both instructions after the ecall would trap if they reached commit,
+    // so a clean halt means the squash worked.
     {
         Assembler p;
         p.addi(a0, zero, 42);
@@ -2325,7 +2302,7 @@ SECTION("cpu_tick") {
         REQUIRE(cpu.retired() == 1);
         REQUIRE(cpu.cycle()   == 5);
 
-        // Ticking a finished machine is a no-op, however long you do it.
+        // Ticking a finished machine is a no-op.
         const uint64_t cycle = cpu.cycle();
         const uint64_t retired = cpu.retired();
         for (int i = 0; i < 1000; ++i) cpu.tick();
@@ -2333,7 +2310,7 @@ SECTION("cpu_tick") {
         REQUIRE(cpu.retired() == retired);
     }
 
-    // ---- Op classes this phase cannot execute are loud, not silent --------
+    // ---- Op classes without a function unit trap, they do not no-op -------
     {
         struct Case { const char* what; std::vector<uint32_t> words; };
         std::vector<Case> cases;
@@ -2366,10 +2343,9 @@ SECTION("cpu_tick") {
     }
 
     // ---- First differential pass ------------------------------------------
-    // The `alu` workload is pure ALU plus the exit ecall, so the scaffold can
-    // already run it end to end. Every other workload needs Step 3.4's
-    // function units; this one pins that the stage plumbing, the x0 rule, and
-    // the ecall path agree with ref.h on all 32 registers.
+    // The `alu` workload is pure ALU plus the exit ecall, the only one the
+    // pipeline can run so far. Pins the stage plumbing, the x0 rule, and the
+    // ecall path against ref.h on all 32 registers.
     {
         const wl::Workload* alu_wl = nullptr;
         for (const wl::Workload& w : wl::corpus()) {

@@ -4,16 +4,12 @@
 
 namespace {
 
-// OP-IMM is the only class whose second ALU operand comes from the immediate
-// instead of rs2 — ADDI and ADD decode to the same Op deliberately, since the
-// function unit does not care where the operand came from. Deriving this here
-// rather than sharing tests/ref.h's copy is intentional: the two execution
-// paths are supposed to be independent implementations, because a shared bug
-// is invisible to a differential test.
+// OP-IMM is the only class taking its second operand from the immediate;
+// ADDI and ADD share an Op because the function unit does not care where the
+// operand came from.
 bool uses_immediate(const Decoded& d) { return (d.raw & 0x7Fu) == 0x13u; }
 
-// The single-cycle integer ALU class. Everything else — branches, memory,
-// mul/div — arrives with Step 3.4's function units.
+// The single-cycle integer ALU class.
 bool execute_alu(const Uop& u, uint32_t rs1, uint32_t opb, uint32_t& out) {
     switch (u.dec.op) {
     case Op::ADD:   out = alu::add (rs1, opb); return true;
@@ -37,16 +33,14 @@ bool execute_alu(const Uop& u, uint32_t rs1, uint32_t opb, uint32_t& out) {
 Cpu::Cpu(Memory& mem, const Config& cfg, uint32_t entry_pc)
     : mem_(mem), cfg_(cfg), pc_(entry_pc), arch_pc_(entry_pc) {}
 
-// Reverse pipeline order: each stage drains its output latch before its
-// producer refills it, so one uop moves through every stage per cycle
-// (DESIGN.md §2). Read this function top to bottom and the pipeline runs
-// backwards; that is the point.
+// Stages run in reverse order so each drains its output latch before the
+// producer refills it, giving one uop per stage per cycle.
 void Cpu::tick() {
     if (done()) return;
 
     ++cycle_;
     commit();
-    if (done()) return;   // the halt squashed everything behind it; no stage may refill
+    if (done()) return;   // squashed by the halt; no stage may refill
 
     writeback();
     execute();
@@ -66,7 +60,7 @@ void Cpu::fetch() {
     u.seq = next_seq_++;
     u.pc  = pc_;
     u.raw = mem_.load_u32(pc_);
-    pc_ += 4;                                 // sequential only; redirect is Step 3.4
+    pc_ += 4;                                 // sequential fetch only, so far
     if_id_ = u;
 }
 
@@ -106,8 +100,7 @@ void Cpu::execute() {
         case OpKind::STORE:
         case OpKind::MUL:
         case OpKind::DIV:
-            // Step 3.4 gives these real function units. Until then they must
-            // be loud, not silent.
+            // No function units for these yet; fail loudly, not silently.
             u.trap = TrapCause::UNIMPLEMENTED;
             break;
         }
@@ -138,8 +131,8 @@ void Cpu::commit() {
 
     if (u.seq != retired_) commit_in_order_ = false;
 
-    // Architectural effects that are not register writes happen here and
-    // nowhere else — the invariant that makes Phase 7's recovery simple.
+    // Every architectural effect that is not a register write happens here
+    // and nowhere else.
     TrapCause cause = u.trap;
     if (cause == TrapCause::NONE && u.dec.kind == OpKind::TRAP) {
         if (u.dec.op == Op::ECALL) {
@@ -162,7 +155,7 @@ void Cpu::commit() {
     arch_pc_ = u.next_pc;
     ++retired_;
 
-    // The halting instruction retires; everything fetched behind it does not.
+    // The halting instruction retires; anything behind it does not.
     if (done()) squash_in_flight();
 }
 

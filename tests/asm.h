@@ -1,15 +1,8 @@
 #pragma once
 
-// Header-only RV32IM assembler used by the test suite. Two-pass over labels
-// (forward branches resolve), covers every instruction in the ISA plus the
-// pseudos li / mv / nop / j / jr / ret / call. Emits a std::vector<uint32_t>
-// that plugs directly into Memory::store_u32 or the OoO simulator's fetch.
-//
-// This file exists so `make test` needs no external riscv-toolchain. When
-// the assembler diverges from the decoder, the differential runner in
-// Step 2.3 will surface it — but the primary correctness signal at this
-// step is byte-exact match against enc:: (the decoder test's independently
-// validated encoders in test_main.cpp).
+// Header-only RV32IM assembler for the tests, so no external riscv-toolchain
+// is needed. Covers the whole ISA plus the pseudos li / mv / nop / j / jr /
+// ret / call, resolves labels in a second pass, and emits a word vector.
 
 #include <cstdint>
 #include <stdexcept>
@@ -50,8 +43,7 @@ public:
     void auipc(uint32_t rd, uint32_t imm20) { emit(enc_U(0x17, rd, imm20)); }
 
     // ---- J-type ----------------------------------------------------------
-    // Absolute-offset form. Callers use the label-taking overload for
-    // anything but a directly-known offset.
+    // Absolute-offset form; use the label overload for everything else.
     void jal(uint32_t rd, int32_t imm) { emit(enc_J(rd, imm)); }
     void jal(uint32_t rd, std::string_view lbl) {
         add_fixup(FixKind::J, lbl);
@@ -139,8 +131,7 @@ public:
         addi(rd, rd, lo12);
     }
     void call(std::string_view lbl) {
-        // auipc ra, 0 / jalr ra, ra, 0 — the CALL fixup patches both halves
-        // once the label resolves.
+        // auipc ra + jalr ra; the fixup patches both once the label resolves.
         add_fixup(FixKind::CALL, lbl);
         emit(enc_U(0x17, 1, 0));                      // placeholder auipc ra
         emit(enc_I(0x67, 1, 0x0, 1, 0));              // placeholder jalr ra
@@ -199,8 +190,7 @@ private:
             break;
         }
         case FixKind::CALL: {
-            // auipc rd, hi + jalr rd, rd, lo, where hi + sign-extended lo
-            // sum to `off`. Same lower-12 sign-compensation trick as `li`.
+            // hi and the sign-extended lo must sum to `off`, same trick as li.
             const int32_t off32 = static_cast<int32_t>(off);
             const uint32_t hi20 = (static_cast<uint32_t>(off32) + 0x800u) >> 12;
             const int32_t  lo12 = off32 - static_cast<int32_t>(hi20 << 12);
@@ -249,8 +239,8 @@ private:
         return 0x6F | ((rd & 0x1F) << 7) | j_imm_bits(imm);
     }
 
-    // Pack the immediate bits for B/J formats; leaves other fields alone
-    // so a placeholder-strip-then-OR patches cleanly.
+    // Pack B/J immediates, leaving other fields alone so a fixup can strip
+    // and re-OR them.
     static constexpr uint32_t kBmask = (1u << 31) | (0x3Fu << 25) | (0xFu << 8) | (1u << 7);
     static constexpr uint32_t b_imm_bits(int32_t imm) {
         const uint32_t u = static_cast<uint32_t>(imm) & 0x1FFF;
