@@ -22,6 +22,7 @@
 #include "memory.h"
 #include "loader.h"
 #include "rob.h"
+#include "prf.h"
 #include "cpu.h"
 #include "asm.h"
 #include "ref.h"
@@ -2985,6 +2986,72 @@ SECTION("rob") {
         REQUIRE(rob.pop_head_if_complete().has_value());
         REQUIRE(!rob.full());                       // and unstalls on one commit
     }
+}
+
+
+// --------------------------------------------------------- @section("prf") ---
+SECTION("prf") {
+    Config cfg;
+    Prf prf(cfg);
+    REQUIRE(prf.capacity() == cfg.prf_size);
+
+    // ---- reset state: every register zero and ready ---------------------
+    for (uint32_t r = 0; r < prf.capacity(); ++r) {
+        REQUIRE(prf.read(r) == 0u);
+        REQUIRE(prf.is_ready(r));
+    }
+
+    // ---- basic write / read / ready round-trip --------------------------
+    prf.write(5, 0xDEADBEEF);
+    REQUIRE(prf.read(5) == 0xDEADBEEFu);
+    REQUIRE(prf.is_ready(5));
+
+    prf.write(cfg.prf_size - 1, 0x12345678);
+    REQUIRE(prf.read(cfg.prf_size - 1) == 0x12345678u);
+    REQUIRE(prf.is_ready(cfg.prf_size - 1));
+
+    // ---- mark_pending clears ready without touching the value -----------
+    // The stale value survives; the IQ is what prevents a stale read, not
+    // the PRF. Verifying the value here pins that PRF is storage, not
+    // policy.
+    prf.mark_pending(5);
+    REQUIRE(!prf.is_ready(5));
+    REQUIRE(prf.read(5) == 0xDEADBEEFu);
+    prf.write(5, 42);
+    REQUIRE(prf.is_ready(5));
+    REQUIRE(prf.read(5) == 42u);
+
+    // ---- p0 is hard-wired to zero and always ready ----------------------
+    REQUIRE(prf.read(0) == 0u);
+    REQUIRE(prf.is_ready(0));
+    prf.write(0, 0xFFFFFFFFu);
+    REQUIRE(prf.read(0) == 0u);
+    REQUIRE(prf.is_ready(0));
+    prf.mark_pending(0);
+    REQUIRE(prf.is_ready(0));
+    REQUIRE(prf.read(0) == 0u);
+
+    // ---- reset() returns to the initial state ---------------------------
+    prf.mark_pending(1);
+    prf.mark_pending(2);
+    prf.write(10, 0xABCDABCD);
+    prf.reset();
+    for (uint32_t r = 0; r < prf.capacity(); ++r) {
+        REQUIRE(prf.read(r) == 0u);
+        REQUIRE(prf.is_ready(r));
+    }
+
+    // ---- Raw-size constructor for tests that need an atypical PRF -------
+    Prf tiny(4);
+    REQUIRE(tiny.capacity() == 4);
+    tiny.write(3, 99);
+    REQUIRE(tiny.read(3) == 99u);
+    REQUIRE(tiny.is_ready(3));
+    tiny.mark_pending(3);
+    REQUIRE(!tiny.is_ready(3));
+    // p0 hard-wired even in a starved PRF where p0 would otherwise be free.
+    tiny.mark_pending(0);
+    REQUIRE(tiny.is_ready(0));
 }
 
 
