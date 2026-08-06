@@ -44,10 +44,15 @@ public:
     RobIndex head() const { return empty() ? INVALID_ROBINDEX : head_; }
     RobIndex tail() const { return wrap(head_ + count_); }
 
-    // The k-th oldest entry, k == 0 being the head.
+    // Slot of the k-th oldest entry, k == 0 being the head.
     RobIndex nth(uint32_t k) const {
         return k < count_ ? wrap(head_ + k) : INVALID_ROBINDEX;
     }
+
+    // The k-th oldest entry itself, for callers walking the live range. Takes
+    // the age rather than a slot, so no sentinel can reach the storage.
+    RobEntry&       nth_entry(uint32_t k)       { return slots_[wrap(head_ + k)]; }
+    const RobEntry& nth_entry(uint32_t k) const { return slots_[wrap(head_ + k)]; }
 
     // Distance from the head, or an out-of-range value if `idx` is not live.
     uint32_t age_of(RobIndex idx) const {

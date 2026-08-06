@@ -3,6 +3,7 @@
 
 #include <cstdint>
 
+#include <algorithm>
 #include <cstdio>
 #include <functional>
 #include <initializer_list>
@@ -2192,7 +2193,11 @@ inline diff::Outcome run_cpu(const wl::Workload& w, const Config& cfg) {
 
 SECTION("cpu_tick") {
     using namespace asmc;
-    const Config cfg;
+
+    // Stage timing is clearest one instruction at a time; what width changes
+    // is @section("frontend")'s subject.
+    Config cfg;
+    cfg.width = 1;
 
     // ---- A fresh machine has nothing in flight ----------------------------
     {
@@ -2277,7 +2282,7 @@ SECTION("cpu_tick") {
         p.addi(a0, zero, 42);
         p.li(a7, 93);
         p.ecall();
-        p.sw(a0, zero, 0);                            // unimplemented → would trap
+        p.sw(a0, zero, 0);                            // would corrupt memory
         p.ebreak();                                   // would trap
         Memory m = cputest::image(p.assemble());
         Cpu cpu(m, cfg, wl::TEXT);
@@ -2311,26 +2316,32 @@ SECTION("cpu_tick") {
         REQUIRE(cpu.retired() == retired);
     }
 
-    // ---- Op classes without a function unit trap, they do not no-op -------
+    // ---- One instruction of every class, in one program -------------------
     {
-        struct Case { const char* what; std::vector<uint32_t> words; };
-        std::vector<Case> cases;
-        {
-            Assembler p; p.lw(a0, zero, 0);   cases.push_back({"load",   p.assemble()});
-        }
-        {
-            Assembler p; p.mul(a0, a0, a0);   cases.push_back({"mul",    p.assemble()});
-        }
-        {
-            Assembler p; p.j("self"); p.label("self"); cases.push_back({"branch", p.assemble()});
-        }
-        for (const Case& c : cases) {
-            Memory m = cputest::image(c.words);
-            Cpu cpu(m, cfg, wl::TEXT);
-            REQUIRE(cpu.run(1000));
-            REQUIRE_MSG(cpu.trapped() && cpu.trap_cause() == TrapCause::UNIMPLEMENTED,
-                        std::string("    ") + c.what + ": expected UNIMPLEMENTED trap");
-        }
+        Assembler p;
+        p.li(t0, 7);
+        p.li(t1, 6);
+        p.mul(t2, t0, t1);                            // 42, on the mul unit
+        p.div_(t3, t2, t1);                           // 7, on the div unit
+        p.li(t4, 0x2000);
+        p.sw(t2, t4, 0);
+        p.lw(a0, t4, 0);                              // reads the store back
+        p.fence();
+        p.beq(a0, t2, "ok");
+        p.li(a0, 0);                                  // skipped if the branch works
+        p.label("ok");
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(10000));
+
+        REQUIRE(cpu.halted());
+        REQUIRE(!cpu.trapped());
+        REQUIRE(cpu.exit_code() == 42);
+        REQUIRE(cpu.reg(t3) == 7);
+        REQUIRE(m.load_u32(0x2000) == 42);            // the store reached memory
+        REQUIRE(cpu.commit_in_order());
     }
     {
         Assembler p;
@@ -2360,6 +2371,385 @@ SECTION("cpu_tick") {
 
             const diff::Outcome o = cputest::run_cpu(*alu_wl, cfg);
             REQUIRE(o.cycles == o.retired + 4);
+        }
+    }
+}
+
+
+// ---------------------------------------------------- @section("frontend") ---
+namespace fetest {
+
+// N back-to-back addis, then the exit sequence.
+inline std::vector<uint32_t> addi_chain(int n) {
+    asmc::Assembler p;
+    for (int i = 0; i < n; ++i) p.addi(asmc::t0, asmc::zero, i);
+    p.li(asmc::a7, 93);
+    p.ecall();
+    return p.assemble();
+}
+
+}  // namespace fetest
+
+SECTION("frontend") {
+    using namespace asmc;
+
+    // ---- 20 addis decode in program order, `width` per cycle --------------
+    // Nothing here stalls, so decode runs at full width from the cycle the
+    // first bundle lands until the program runs out.
+    for (uint32_t width : {1u, 2u, 4u}) {
+        Config cfg;
+        cfg.width   = width;
+        cfg.num_alu = width;     // so the back end is never the bottleneck
+        cfg.num_cdb = width;
+        Memory m = cputest::image(fetest::addi_chain(20));
+        Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_decode(true);
+        REQUIRE(cpu.run(2000));
+
+        const std::vector<Cpu::DecodeRecord>& log = cpu.decode_log();
+        const std::string tag = "    width=" + std::to_string(width) + ": ";
+
+        // Program order, no gaps, no repeats: 20 addis plus li + ecall.
+        REQUIRE_MSG(log.size() == 22, tag + "decoded " + std::to_string(log.size()));
+        for (std::size_t i = 0; i < log.size(); ++i) {
+            REQUIRE_MSG(log[i].seq == i, tag + "seq out of order at " + std::to_string(i));
+            REQUIRE_MSG(log[i].pc == wl::TEXT + 4 * static_cast<uint32_t>(i),
+                        tag + "pc out of order at " + std::to_string(i));
+        }
+
+        // Decode never exceeds width in a cycle, and reaches it while the
+        // front end is running flat out.
+        std::vector<uint32_t> per_cycle(cpu.cycle() + 2, 0);
+        for (const Cpu::DecodeRecord& r : log) ++per_cycle[r.cycle];
+        uint32_t peak = 0;
+        for (uint32_t c : per_cycle) {
+            REQUIRE_MSG(c <= width, tag + "decoded more than width in one cycle");
+            peak = std::max(peak, c);
+        }
+        REQUIRE_MSG(peak == width, tag + "never reached full width");
+
+        // The whole chain is decoded in the ceiling of 22/width cycles, plus
+        // the cycle fetch spends filling the first bundle.
+        const uint64_t span = log.back().cycle - log.front().cycle + 1;
+        REQUIRE_MSG(span == (22 + width - 1) / width,
+                    tag + "decode took " + std::to_string(span) + " cycles");
+    }
+
+    // ---- Fetch runs ahead of decode, then back-pressures ------------------
+    // A 20-cycle divide jams issue, so the dispatch queue fills, then decode
+    // stops, then the fetch queue fills, and only then does fetch stop. Every
+    // stage stalls because its consumer did, not on a timer.
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 1000);
+        p.li(t1, 3);
+        p.div_(t2, t0, t1);            // 20 cycles, blocking
+        p.add(t3, t2, t2);             // waits on the divide
+        for (int i = 0; i < 10; ++i) p.nop();
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+
+        bool saw_full_dispatch = false;
+        bool saw_full_fetch    = false;
+        for (int i = 0; i < 40 && !cpu.done(); ++i) {
+            cpu.tick();
+            REQUIRE(cpu.dispatch_queue() <= cpu.dispatch_queue_capacity());
+            REQUIRE(cpu.fetch_queue()    <= cpu.fetch_queue_capacity());
+            if (cpu.dispatch_queue() == cpu.dispatch_queue_capacity()) {
+                saw_full_dispatch = true;
+                // Decode cannot have drained into a full queue, so the fetch
+                // queue is what absorbs the next bundles.
+                if (cpu.fetch_queue() == cpu.fetch_queue_capacity()) saw_full_fetch = true;
+            }
+        }
+        REQUIRE(saw_full_dispatch);
+        REQUIRE(saw_full_fetch);
+
+        // Back-pressure only stalls; it never drops or duplicates work.
+        REQUIRE(cpu.run(2000));
+        REQUIRE(cpu.halted());
+        REQUIRE(cpu.retired() == 16);
+        REQUIRE(cpu.commit_in_order());
+    }
+
+    // ---- No wrong-path fetch: decode stops at a control transfer ----------
+    {
+        Config cfg;
+        cfg.width = 2;
+        Assembler p;
+        p.j("target");
+        for (int i = 0; i < 8; ++i) p.ebreak();        // never fetched
+        p.label("target");
+        p.li(a0, 5);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_decode(true);
+        REQUIRE(cpu.run(1000));
+
+        REQUIRE(cpu.halted());
+        REQUIRE(cpu.exit_code() == 5);
+        for (const Cpu::DecodeRecord& r : cpu.decode_log()) {
+            REQUIRE(r.raw != 0x00100073u);             // no ebreak ever decoded
+        }
+        REQUIRE(cpu.decode_log().size() == 4);         // jal, li, li, ecall
+    }
+
+    // ---- A taken branch costs one fetch bubble ----------------------------
+    // Decode stalls the front end in the cycle it sees the jump; execute
+    // redirects the PC and, running earlier in the same cycle than fetch,
+    // lets fetch resume from the target immediately.
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.j("target");
+        p.label("target");
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_decode(true);
+        REQUIRE(cpu.run(1000));
+
+        const std::vector<Cpu::DecodeRecord>& log = cpu.decode_log();
+        REQUIRE(log.size() == 3);
+        REQUIRE(log[1].cycle == log[0].cycle + 2);     // one bubble after the jump
+        REQUIRE(log[2].cycle == log[1].cycle + 1);     // and none after that
+    }
+}
+
+
+// --------------------------------------------- @section("execute_inorder") ---
+SECTION("execute_inorder") {
+    using namespace asmc;
+
+    // ---- Dependent ALU ops issue back to back -----------------------------
+    // Writeback runs before execute in the same cycle, so a result frees its
+    // register in time for the consumer to issue with no bubble between them.
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 0);
+        for (int i = 0; i < 200; ++i) p.addi(t0, t0, 1);
+        p.mv(a0, t0);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(2000));
+
+        REQUIRE(cpu.exit_code() == 200);
+        REQUIRE(cpu.retired() == 204);
+        REQUIRE(cpu.cycle() == cpu.retired() + 4);   // no stall anywhere
+        REQUIRE(cpu.cycle() < 260);
+    }
+
+    // ---- Load-use latency tracks mem_latency exactly ----------------------
+    {
+        auto cycles_at = [](uint32_t lat) {
+            Config cfg;
+            cfg.width       = 1;
+            cfg.mem_latency = lat;
+            Assembler p;
+            p.li(t0, 0x2000);
+            p.li(t1, 7);
+            p.sw(t1, t0, 0);
+            p.lw(a0, t0, 0);
+            p.add(a1, a0, a0);                       // consumes the loaded value
+            p.li(a7, 93);
+            p.ecall();
+            Memory m = cputest::image(p.assemble());
+            Cpu cpu(m, cfg, wl::TEXT);
+            cpu.run(1000);
+            return cpu.cycle();
+        };
+        REQUIRE(cycles_at(3) == cycles_at(2) + 1);
+        REQUIRE(cycles_at(4) == cycles_at(2) + 2);
+        REQUIRE(cycles_at(8) == cycles_at(2) + 6);
+    }
+
+    // ---- A pipelined unit overlaps its ops; a blocking one does not -------
+    {
+        const uint32_t dst[3] = {t2, t3, t4};
+        auto cycles_for = [&dst](int n, bool use_div) {
+            Config cfg;
+            cfg.width = 1;
+            Assembler p;
+            p.li(t0, 100);
+            p.li(t1, 7);
+            for (int i = 0; i < n; ++i) {            // independent, same sources
+                if (use_div) p.div_(dst[i], t0, t1);
+                else         p.mul (dst[i], t0, t1);
+            }
+            p.li(a7, 93);
+            p.ecall();
+            Memory m = cputest::image(p.assemble());
+            Cpu cpu(m, cfg, wl::TEXT);
+            cpu.run(1000);
+            return cpu.cycle();
+        };
+        const Config def;
+        REQUIRE(cycles_for(3, false) == cycles_for(1, false) + 2);
+        REQUIRE(cycles_for(3, true)  == cycles_for(1, true) + 2 * def.div_latency);
+    }
+
+    // ---- Results reach the register file in issue order -------------------
+    // The add finishes 19 cycles before the divide it sits behind, and still
+    // may not write first — the property that makes WAW safe unrenamed.
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 100);
+        p.li(t1, 7);
+        p.div_(t2, t0, t1);                          // 14, after 20 cycles
+        p.addi(t3, t1, 1);                           // 8, ready at once
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+
+        bool add_wrote_first = false;
+        while (!cpu.done() && cpu.cycle() < 200) {
+            cpu.tick();
+            if (cpu.reg(t3) != 0 && cpu.reg(t2) == 0) add_wrote_first = true;
+        }
+        REQUIRE(cpu.reg(t2) == 14);
+        REQUIRE(cpu.reg(t3) == 8);
+        REQUIRE(!add_wrote_first);
+    }
+
+    // ---- The whole corpus, against the interpreter, on every config -------
+    // Same registers, same exit code, same retired count as ref.h. A machine
+    // that is only correct at one width is not correct.
+    {
+        struct Named { const char* name; Config cfg; };
+        std::vector<Named> configs;
+        {
+            Config c; c.width = 1; c.num_alu = 1; c.num_cdb = 1;
+            configs.push_back({"1-wide", c});
+        }
+        configs.push_back({"default", Config{}});
+        {
+            Config c; c.width = 4; c.num_alu = 4; c.num_cdb = 4; c.rob_size = 64;
+            configs.push_back({"4-wide", c});
+        }
+        {
+            Config c; c.rob_size = 4; c.iq_size = 2; c.lq_size = 1; c.sq_size = 1;
+            configs.push_back({"rob=4", c});
+        }
+        {
+            Config c; c.mul_latency = 7; c.div_latency = 33; c.mem_latency = 5;
+            configs.push_back({"slow-fu", c});
+        }
+
+        diff::ScopedModel swap(&cputest::run_cpu);
+        for (const Named& n : configs) {
+            for (const wl::Workload& w : wl::corpus()) {
+                const diff::Report r = diff::diff_run(w, n.cfg);
+                REQUIRE_MSG(r.ok, std::string("    config ") + n.name + "\n" + r.detail);
+            }
+        }
+    }
+}
+
+
+// ---------------------------------------------- @section("commit_inorder") ---
+SECTION("commit_inorder") {
+    using namespace asmc;
+    Config cfg;
+    cfg.width = 1;
+
+    // ---- A store reaches memory at commit, not at execute -----------------
+    {
+        Assembler p;
+        p.li(t0, 0x400);                             // fits an addi, so one word
+        p.li(t1, 0xAB);
+        p.sw(t1, t0, 0);                             // third instruction
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+
+        uint64_t wrote_at = 0;
+        while (!cpu.done() && cpu.cycle() < 100) {
+            cpu.tick();
+            if (wrote_at == 0 && m.load_u32(0x400) != 0) wrote_at = cpu.cycle();
+        }
+        REQUIRE(m.load_u32(0x400) == 0xABu);
+        REQUIRE(wrote_at == 7);                      // its commit cycle, not its 5th
+        REQUIRE(cpu.retired() == 5);
+    }
+
+    // ---- Memory writes appear in program order ----------------------------
+    // Checked every cycle, not just at the end: the set of written words must
+    // always be a prefix of the program's stores.
+    {
+        Assembler p;
+        p.li(t0, 0x3000);
+        p.li(t1, 1);  p.sw(t1, t0, 0);
+        p.li(t2, 2);  p.sw(t2, t0, 4);
+        p.li(t3, 3);  p.sw(t3, t0, 8);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+
+        while (!cpu.done() && cpu.cycle() < 200) {
+            cpu.tick();
+            uint32_t written = 0;
+            while (written < 3 && m.load_u32(0x3000 + 4 * written) != 0) ++written;
+            for (uint32_t k = written; k < 3; ++k) {
+                REQUIRE(m.load_u32(0x3000 + 4 * k) == 0);
+            }
+        }
+        REQUIRE(m.load_u32(0x3000) == 1);
+        REQUIRE(m.load_u32(0x3004) == 2);
+        REQUIRE(m.load_u32(0x3008) == 3);
+    }
+
+    // ---- A load sees an older store -----------------------------------
+    // Stores commit late, so the load has to wait for one; reading memory
+    // early would return the stale word.
+    {
+        Assembler p;
+        p.li(t0, 0x4000);
+        p.li(t1, 0x11);
+        p.sw(t1, t0, 0);
+        p.lw(a0, t0, 0);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+        REQUIRE(cpu.halted());
+        REQUIRE(cpu.exit_code() == 0x11u);
+    }
+
+    // ---- Nothing retires out of order, and the count matches ref.h --------
+    // The store-heavy workloads are the ones where a commit-order bug would
+    // hide, so they are worth naming rather than folding into the sweep.
+    {
+        diff::ScopedModel swap(&cputest::run_cpu);
+        for (const char* name : {"store_forward", "subword", "bubble_sort", "nested_calls"}) {
+            for (const wl::Workload& w : wl::corpus()) {
+                if (w.name != name) continue;
+                const diff::Report r = diff::diff_run(w, cfg);
+                REQUIRE_MSG(r.ok, r.detail);
+
+                const diff::Outcome o = cputest::run_cpu(w, cfg);
+                const diff::Outcome ref = diff::run_reference(w, cfg);
+                REQUIRE_MSG(o.retired == ref.retired, std::string("    ") + name +
+                            ": retired " + std::to_string(o.retired) + " vs " +
+                            std::to_string(ref.retired));
+            }
         }
     }
 }
@@ -2443,12 +2833,12 @@ SECTION("rob") {
         Rob rob(8);
         for (uint32_t i = 0; i < 4; ++i) rob.allocate(entry(0x1000 + 4 * i));
 
-        rob.at(rob.nth(1)).complete = true;
-        rob.at(rob.nth(2)).complete = true;
+        rob.nth_entry(1).complete = true;
+        rob.nth_entry(2).complete = true;
         REQUIRE(!rob.pop_head_if_complete().has_value());   // head still running
         REQUIRE(rob.size() == 4);
 
-        rob.at(rob.head()).complete = true;
+        rob.nth_entry(0).complete = true;
         const std::optional<RobEntry> first = rob.pop_head_if_complete();
         REQUIRE(first.has_value());
         REQUIRE(first->seq == 0);
@@ -2535,7 +2925,7 @@ SECTION("rob") {
         REQUIRE(rob.size() == 4);
         REQUIRE(rob.head() == 5u);
         REQUIRE(rob.tail() == 1u);
-        REQUIRE(rob.at(rob.nth(3)).seq == 8);
+        REQUIRE(rob.nth_entry(3).seq == 8);
     }
 
     // ---- Truncation edge cases --------------------------------------------
@@ -2560,7 +2950,7 @@ SECTION("rob") {
         REQUIRE(killed.front().seq == 4);
         REQUIRE(killed.back().seq == 1);
         REQUIRE(rob.size() == 1);
-        REQUIRE(rob.at(rob.head()).seq == 0);
+        REQUIRE(rob.nth_entry(0).seq == 0);
     }
 
     // ---- squash_all empties the buffer, youngest first --------------------
@@ -2591,7 +2981,7 @@ SECTION("rob") {
             rob.allocate(entry(0x1000 + 4 * i));
         }
         REQUIRE(rob.full());                        // dispatch stalls here
-        rob.at(rob.head()).complete = true;
+        rob.nth_entry(0).complete = true;
         REQUIRE(rob.pop_head_if_complete().has_value());
         REQUIRE(!rob.full());                       // and unstalls on one commit
     }
