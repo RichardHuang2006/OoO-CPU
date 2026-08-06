@@ -24,6 +24,7 @@
 #include "alu.h"
 #include "memory.h"
 #include "loader.h"
+#include "cpu.h"
 #include "asm.h"
 #include "ref.h"
 
@@ -2170,6 +2171,219 @@ SECTION("diff_scaffold") {
         const diff::Report r = diff::diff_run(spinner, cfg);
         REQUIRE(!r.ok);
         REQUIRE(r.detail.find("did not halt cleanly") != std::string::npos);
+    }
+}
+
+
+// ---------------------------------------------------- @section("cpu_tick") ---
+namespace cputest {
+
+using namespace asmc;
+
+inline Memory image(const std::vector<uint32_t>& words) {
+    Memory m;
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        m.store_u32(wl::TEXT + static_cast<uint32_t>(i * 4), words[i]);
+    }
+    return m;
+}
+
+// The pipeline model dressed as a diff::Runner. Step 3.4 installs this as
+// the model under test for the whole corpus; here it drives the one workload
+// the scaffold can already execute end to end.
+inline diff::Outcome run_cpu(const wl::Workload& w, const Config& cfg) {
+    Memory m = image(w.words);
+    Cpu cpu(m, cfg, wl::TEXT);
+    cpu.run(w.budget * 8 + 1000);             // cycles, generously bounded
+
+    diff::Outcome o;
+    for (int i = 0; i < 32; ++i) o.regs[i] = cpu.reg(static_cast<ArchReg>(i));
+    o.exit_code = cpu.exit_code();
+    o.retired   = cpu.retired();
+    o.cycles    = cpu.cycle();
+    o.halted    = cpu.halted();
+    o.trapped   = cpu.trapped();
+    o.budget    = !cpu.done();
+    return o;
+}
+
+}  // namespace cputest
+
+SECTION("cpu_tick") {
+    using namespace asmc;
+    const Config cfg;
+
+    // ---- A fresh machine has nothing in flight ----------------------------
+    {
+        Memory m;
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.cycle() == 0);
+        REQUIRE(cpu.retired() == 0);
+        REQUIRE(cpu.idle());
+        REQUIRE(!cpu.done());
+        REQUIRE(cpu.fetch_pc() == wl::TEXT);
+        REQUIRE(cpu.arch_pc()  == wl::TEXT);
+        for (int i = 0; i < 32; ++i) REQUIRE(cpu.reg(static_cast<ArchReg>(i)) == 0);
+    }
+
+    // ---- One addi, cycle by cycle -----------------------------------------
+    // Five stages, one uop per latch, so the instruction fetched in cycle 1
+    // is in Decode in cycle 2, Execute in 3, Writeback in 4, Commit in 5.
+    // The register write is visible at the end of cycle 4 and the retirement
+    // at the end of cycle 5 — pipeline depth 5, with the two events one cycle
+    // apart because Writeback and Commit are separate stages here.
+    {
+        Assembler p;
+        p.addi(a0, zero, 42);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+
+        cpu.tick();                                   // cycle 1: Fetch
+        REQUIRE(!cpu.idle());
+        REQUIRE(cpu.reg(a0) == 0);
+        REQUIRE(cpu.fetch_pc() == wl::TEXT + 4);
+
+        cpu.tick();                                   // cycle 2: Decode
+        cpu.tick();                                   // cycle 3: Execute
+        REQUIRE(cpu.reg(a0) == 0);                    // nothing written yet
+        REQUIRE(cpu.retired() == 0);
+
+        cpu.tick();                                   // cycle 4: Writeback
+        REQUIRE(cpu.reg(a0) == 42);
+        REQUIRE(cpu.retired() == 0);                  // written, not yet retired
+        REQUIRE(cpu.arch_pc() == wl::TEXT);           // commit has not moved it
+
+        cpu.tick();                                   // cycle 5: Commit
+        REQUIRE(cpu.retired() == 1);
+        REQUIRE(cpu.arch_pc() == wl::TEXT + 4);
+        REQUIRE(cpu.commit_in_order());
+        REQUIRE(!cpu.done());
+    }
+
+    // ---- Steady state: one instruction per cycle --------------------------
+    // With no stalls, N instructions retire in N + 4 cycles — the pipeline
+    // fill is the only overhead. This is the baseline every later IPC number
+    // is measured against.
+    {
+        Assembler p;
+        for (int i = 0; i < 100; ++i) p.nop();
+        p.li(a0, 0);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+
+        REQUIRE(cpu.halted());
+        REQUIRE(!cpu.trapped());
+        REQUIRE(cpu.retired() == 103);
+        REQUIRE(cpu.cycle()   == cpu.retired() + 4);
+        REQUIRE(cpu.commit_in_order());
+
+        // 100 nops changed no architectural state.
+        REQUIRE(cpu.reg(a0) == 0);
+        REQUIRE(cpu.reg(a7) == 93);
+        for (int i = 0; i < 32; ++i) {
+            if (i == a7) continue;
+            REQUIRE(cpu.reg(static_cast<ArchReg>(i)) == 0);
+        }
+    }
+
+    // ---- Nothing behind a halt may retire ---------------------------------
+    // The two instructions after the ecall would both trap if they ever
+    // reached commit, so a clean halt is proof the squash worked.
+    {
+        Assembler p;
+        p.addi(a0, zero, 42);
+        p.li(a7, 93);
+        p.ecall();
+        p.sw(a0, zero, 0);                            // unimplemented → would trap
+        p.ebreak();                                   // would trap
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+
+        REQUIRE(cpu.halted());
+        REQUIRE(!cpu.trapped());
+        REQUIRE(cpu.exit_code() == 42);
+        REQUIRE(cpu.retired() == 3);
+        REQUIRE(cpu.cycle()   == 7);
+        REQUIRE(cpu.idle());                          // the squash emptied the latches
+    }
+
+    // ---- A machine with no program traps, then makes no further progress --
+    {
+        Memory m;                                     // all zeros: illegal encoding
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+
+        REQUIRE(cpu.trapped());
+        REQUIRE(!cpu.halted());
+        REQUIRE(cpu.trap_cause() == TrapCause::ILLEGAL);
+        REQUIRE(cpu.retired() == 1);
+        REQUIRE(cpu.cycle()   == 5);
+
+        // Ticking a finished machine is a no-op, however long you do it.
+        const uint64_t cycle = cpu.cycle();
+        const uint64_t retired = cpu.retired();
+        for (int i = 0; i < 1000; ++i) cpu.tick();
+        REQUIRE(cpu.cycle()   == cycle);
+        REQUIRE(cpu.retired() == retired);
+    }
+
+    // ---- Op classes this phase cannot execute are loud, not silent --------
+    {
+        struct Case { const char* what; std::vector<uint32_t> words; };
+        std::vector<Case> cases;
+        {
+            Assembler p; p.lw(a0, zero, 0);   cases.push_back({"load",   p.assemble()});
+        }
+        {
+            Assembler p; p.mul(a0, a0, a0);   cases.push_back({"mul",    p.assemble()});
+        }
+        {
+            Assembler p; p.j("self"); p.label("self"); cases.push_back({"branch", p.assemble()});
+        }
+        for (const Case& c : cases) {
+            Memory m = cputest::image(c.words);
+            Cpu cpu(m, cfg, wl::TEXT);
+            REQUIRE(cpu.run(1000));
+            REQUIRE_MSG(cpu.trapped() && cpu.trap_cause() == TrapCause::UNIMPLEMENTED,
+                        std::string("    ") + c.what + ": expected UNIMPLEMENTED trap");
+        }
+    }
+    {
+        Assembler p;
+        p.li(a7, 42);                                 // not the exit syscall
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+        REQUIRE(cpu.trapped());
+        REQUIRE(cpu.trap_cause() == TrapCause::ECALL_UNKNOWN);
+    }
+
+    // ---- First differential pass ------------------------------------------
+    // The `alu` workload is pure ALU plus the exit ecall, so the scaffold can
+    // already run it end to end. Every other workload needs Step 3.4's
+    // function units; this one pins that the stage plumbing, the x0 rule, and
+    // the ecall path agree with ref.h on all 32 registers.
+    {
+        const wl::Workload* alu_wl = nullptr;
+        for (const wl::Workload& w : wl::corpus()) {
+            if (w.name == "alu") alu_wl = &w;
+        }
+        REQUIRE(alu_wl != nullptr);
+        if (alu_wl) {
+            diff::ScopedModel swap(&cputest::run_cpu);
+            const diff::Report r = diff::diff_run(*alu_wl, cfg);
+            REQUIRE_MSG(r.ok, r.detail);
+
+            const diff::Outcome o = cputest::run_cpu(*alu_wl, cfg);
+            REQUIRE(o.cycles == o.retired + 4);
+        }
     }
 }
 
