@@ -1362,570 +1362,8 @@ SECTION("ref") {
 }
 
 
-// ================================================================ workloads ===
-// The validation corpus: thirteen programs run through both the pipeline
-// model and ref.h, covering ALU semantics, loops, arrays, store forwarding,
-// sub-word and partial-overlap accesses, nested calls, recursive Fibonacci,
-// an unpredictable branch, mul/div with divide-by-zero, a pointer chase, and
-// a WAW/WAR renaming stress.
-//
-// Every expected exit code is derived independently of the simulator: by hand
-// where the arithmetic is simple, by an equivalent C++ loop where it is not.
-// A value read off a previous run would assert nothing.
+#include "workloads.h"   // the validation corpus, shared with tools/
 
-namespace wl {
-
-inline constexpr uint32_t TEXT  = 0x1000;    // program image
-inline constexpr uint32_t DATA  = 0x4000;    // scratch the programs initialize
-inline constexpr uint32_t STACK = 0x8000;    // grows down, away from DATA
-
-struct Workload {
-    std::string             name;
-    std::vector<uint32_t>   words;
-    std::optional<uint32_t> expect_exit;   // hand-computed, not observed
-    uint64_t                budget = 200000;
-};
-
-using asmc::Assembler;
-using namespace asmc;   // register aliases: a0, t0, s0, sp, ra, zero, ...
-
-// exit(a0) — every workload leaves its result in a0 and ends here.
-inline void exit_now(Assembler& p) {
-    p.li(a7, 93);
-    p.ecall();
-}
-
-// ---- 1. ALU coverage ------------------------------------------------------
-inline Workload alu() {
-    Assembler p;
-    p.li(t0, 12);
-    p.li(t1, 5);
-    p.li(t2, -1);
-    p.add  (a1, t0, t1);          // 17
-    p.sub  (a2, t0, t1);          // 7
-    p.sll  (a3, t0, t1);          // 384
-    p.srl  (a4, t0, t1);          // 0
-    p.sra  (a5, t2, t1);          // -1, sign-filled
-    p.and_ (s2, t0, t1);          // 4
-    p.or_  (s3, t0, t1);          // 13
-    p.xor_ (s4, t0, t1);          // 9
-    p.slt  (s5, t2, t1);          // 1
-    p.sltu (s6, t2, t1);          // 0
-    p.lui  (s7, 0x12345);
-    p.auipc(s8, 0);
-    p.addi (s9,  t0, -20);        // -8
-    p.slti (s10, t2, 0);          // 1
-    p.xori (s11, t0, 0xFF);       // 243
-    p.srai (s1,  t2, 3);          // -1
-    p.slli (s0,  t1, 2);          // 20
-    p.add  (a0, a1, a2);          // 17 + 7
-    exit_now(p);
-    return {"alu", p.assemble(), 24, 200000};
-}
-
-// ---- 2. Loop --------------------------------------------------------------
-inline Workload loop() {
-    Assembler p;
-    p.li(a0, 0);
-    p.li(a1, 1);
-    p.li(a2, 101);
-    p.label("loop");
-    p.beq(a1, a2, "done");
-    p.add(a0, a0, a1);
-    p.addi(a1, a1, 1);
-    p.j("loop");
-    p.label("done");
-    exit_now(p);
-    return {"loop", p.assemble(), 5050, 200000};   // sum 1..100
-}
-
-// ---- 3. Arrays: bubble sort -----------------------------------------------
-// Sorts a permutation of 1..12, verifies the result is ordered, and exits
-// with a[0] * 100 + a[11] — 112 when sorted, 999 if any pair is out of order.
-inline Workload bubble_sort() {
-    const int32_t input[12] = {9, 4, 7, 1, 12, 3, 8, 2, 11, 5, 10, 6};
-
-    Assembler p;
-    p.li(s0, static_cast<int32_t>(DATA));
-    for (int i = 0; i < 12; ++i) {
-        p.li(t0, input[i]);
-        p.sw(t0, s0, i * 4);
-    }
-    p.li(s1, 12);
-    p.li(t0, 0);                              // i
-    p.label("outer");
-    p.addi(t1, s1, -1);
-    p.bge(t0, t1, "outer_done");
-    p.li(t2, 0);                              // j
-    p.sub(t3, t1, t0);                        // limit = n - 1 - i
-    p.label("inner");
-    p.bge(t2, t3, "inner_done");
-    p.slli(t4, t2, 2);
-    p.add(t4, s0, t4);                        // &a[j]
-    p.lw(t5, t4, 0);
-    p.lw(t6, t4, 4);
-    p.bge(t6, t5, "no_swap");
-    p.sw(t6, t4, 0);
-    p.sw(t5, t4, 4);
-    p.label("no_swap");
-    p.addi(t2, t2, 1);
-    p.j("inner");
-    p.label("inner_done");
-    p.addi(t0, t0, 1);
-    p.j("outer");
-    p.label("outer_done");
-
-    p.li(a0, 0);
-    p.li(t0, 0);
-    p.label("check");
-    p.addi(t1, s1, -1);
-    p.bge(t0, t1, "check_done");
-    p.slli(t2, t0, 2);
-    p.add(t2, s0, t2);
-    p.lw(t3, t2, 0);
-    p.lw(t4, t2, 4);
-    p.bge(t4, t3, "in_order");
-    p.li(a0, 999);
-    p.j("check_done");
-    p.label("in_order");
-    p.addi(t0, t0, 1);
-    p.j("check");
-    p.label("check_done");
-    p.bne(a0, zero, "finish");
-    p.lw(t3, s0, 0);                          // a[0]
-    p.lw(t5, s0, 44);                         // a[11]
-    p.li(t6, 100);
-    p.mul(a0, t3, t6);
-    p.add(a0, a0, t5);
-    p.label("finish");
-    exit_now(p);
-    return {"bubble_sort", p.assemble(), 112, 200000};
-}
-
-// ---- 4. Arrays: 4x4 integer matmul ----------------------------------------
-// A[i][j] = i + j, B[i][j] = 1 + (i == j), C = A·B, exit = sum of C.
-// C[i][k] = Σ_j (i+j)(1 + [j==k]) = (4i + 6) + (i + k) = 5i + k + 6, so the
-// total is Σ_i Σ_k (5i + k + 6) = 240.
-inline Workload matmul() {
-    Assembler p;
-    p.li(s0, static_cast<int32_t>(DATA));         // A
-    p.li(s1, static_cast<int32_t>(DATA + 64));    // B
-    p.li(s2, static_cast<int32_t>(DATA + 128));   // C
-    p.li(s3, 4);                                  // n
-
-    p.li(t0, 0);                                  // i
-    p.label("fill_i");
-    p.bge(t0, s3, "fill_done");
-    p.li(t1, 0);                                  // j
-    p.label("fill_j");
-    p.bge(t1, s3, "fill_i_next");
-    p.mul(t2, t0, s3);
-    p.add(t2, t2, t1);
-    p.slli(t2, t2, 2);                            // (i*n + j) * 4
-    p.add(t3, s0, t2);
-    p.add(t4, t0, t1);
-    p.sw(t4, t3, 0);                              // A[i][j] = i + j
-    p.add(t3, s1, t2);
-    p.li(t5, 1);
-    p.bne(t0, t1, "store_b");
-    p.li(t5, 2);
-    p.label("store_b");
-    p.sw(t5, t3, 0);                              // B[i][j] = 1 + (i == j)
-    p.addi(t1, t1, 1);
-    p.j("fill_j");
-    p.label("fill_i_next");
-    p.addi(t0, t0, 1);
-    p.j("fill_i");
-    p.label("fill_done");
-
-    p.li(a0, 0);
-    p.li(t0, 0);                                  // i
-    p.label("mm_i");
-    p.bge(t0, s3, "mm_done");
-    p.li(t1, 0);                                  // k
-    p.label("mm_k");
-    p.bge(t1, s3, "mm_i_next");
-    p.li(t2, 0);                                  // j
-    p.li(s4, 0);                                  // accumulator
-    p.label("mm_j");
-    p.bge(t2, s3, "mm_store");
-    p.mul(t3, t0, s3);
-    p.add(t3, t3, t2);
-    p.slli(t3, t3, 2);
-    p.add(t3, s0, t3);
-    p.lw(t4, t3, 0);                              // A[i][j]
-    p.mul(t5, t2, s3);
-    p.add(t5, t5, t1);
-    p.slli(t5, t5, 2);
-    p.add(t5, s1, t5);
-    p.lw(t6, t5, 0);                              // B[j][k]
-    p.mul(t4, t4, t6);
-    p.add(s4, s4, t4);
-    p.addi(t2, t2, 1);
-    p.j("mm_j");
-    p.label("mm_store");
-    p.mul(t3, t0, s3);
-    p.add(t3, t3, t1);
-    p.slli(t3, t3, 2);
-    p.add(t3, s2, t3);
-    p.sw(s4, t3, 0);                              // C[i][k]
-    p.add(a0, a0, s4);
-    p.addi(t1, t1, 1);
-    p.j("mm_k");
-    p.label("mm_i_next");
-    p.addi(t0, t0, 1);
-    p.j("mm_i");
-    p.label("mm_done");
-    exit_now(p);
-    return {"matmul", p.assemble(), 240, 200000};
-}
-
-// ---- 5. Arrays: sieve of Eratosthenes -------------------------------------
-inline Workload sieve() {
-    Assembler p;
-    p.li(s0, static_cast<int32_t>(DATA));
-    p.li(s1, 100);                            // n
-
-    p.li(t0, 0);
-    p.label("zero");
-    p.bge(t0, s1, "zero_done");
-    p.add(t1, s0, t0);
-    p.sb(zero, t1, 0);
-    p.addi(t0, t0, 1);
-    p.j("zero");
-    p.label("zero_done");
-
-    p.li(t0, 2);
-    p.label("sv_i");
-    p.mul(t1, t0, t0);
-    p.bge(t1, s1, "sv_done");                 // i*i >= n → every composite marked
-    p.add(t2, s0, t0);
-    p.lbu(t3, t2, 0);
-    p.bne(t3, zero, "sv_next");               // i is composite; skip
-    p.mv(t4, t1);
-    p.label("mark");
-    p.bge(t4, s1, "sv_next");
-    p.add(t5, s0, t4);
-    p.li(t6, 1);
-    p.sb(t6, t5, 0);
-    p.add(t4, t4, t0);
-    p.j("mark");
-    p.label("sv_next");
-    p.addi(t0, t0, 1);
-    p.j("sv_i");
-    p.label("sv_done");
-
-    p.li(a0, 0);
-    p.li(t0, 2);
-    p.label("count");
-    p.bge(t0, s1, "count_done");
-    p.add(t1, s0, t0);
-    p.lbu(t2, t1, 0);
-    p.bne(t2, zero, "count_next");
-    p.addi(a0, a0, 1);
-    p.label("count_next");
-    p.addi(t0, t0, 1);
-    p.j("count");
-    p.label("count_done");
-    exit_now(p);
-    return {"sieve", p.assemble(), 25, 200000};   // 25 primes below 100
-}
-
-// ---- 6. Store-to-load forwarding ------------------------------------------
-// Twenty dependent store→load pairs at one address, each feeding the next.
-// The pipeline forwards them out of the store queue; the reference just sees
-// memory, which is the disagreement worth testing for.
-inline Workload store_forward() {
-    Assembler p;
-    p.li(s0, static_cast<int32_t>(DATA));
-    p.li(s1, 20);
-    p.li(t0, 0);                              // value
-    p.li(t1, 0);                              // i
-    p.label("sf");
-    p.bge(t1, s1, "sf_done");
-    p.sw(t0, s0, 0);
-    p.lw(t2, s0, 0);                          // same address → forwards
-    p.addi(t0, t2, 3);
-    p.sw(t0, s0, 4);                          // different address
-    p.lw(t3, s0, 0);                          // must not see the +4 store
-    p.addi(t1, t1, 1);
-    p.j("sf");
-    p.label("sf_done");
-    p.mv(a0, t0);
-    exit_now(p);
-    return {"store_forward", p.assemble(), 60, 200000};   // 3 per iteration
-}
-
-// ---- 7. Sub-word and partial-overlap accesses -----------------------------
-// Each access partially overlaps an earlier store, the case a store queue
-// has to answer with a replay rather than a forward.
-inline Workload subword() {
-    Assembler p;
-    p.li(s0, static_cast<int32_t>(DATA));
-    p.li(t0, 0x12345678);
-    p.sw(t0, s0, 0);                          // bytes: 78 56 34 12
-    p.lbu(a1, s0, 1);                         // 0x56
-    p.lbu(a2, s0, 3);                         // 0x12
-    p.li(t1, 0xABCD);
-    p.sh(t1, s0, 2);                          // word becomes 0xABCD5678
-    p.lw(a3, s0, 0);
-    p.li(t2, -1);
-    p.sb(t2, s0, 0);                          // word becomes 0xABCD56FF
-    p.lw(a4, s0, 0);
-    p.lb(a5, s0, 0);                          // -1, sign-extended
-    p.lhu(a6, s0, 0);                         // 0x56FF
-    p.li(t3, 0x0F0F0F0F);
-    p.sw(t3, s0, 6);                          // misaligned, straddles the above
-    p.lw(t4, s0, 4);                          // reads across two stores
-    p.lhu(t5, s0, 6);                         // 0x0F0F
-    p.andi(t6, a4, 0xFF);                     // 0xFF
-    p.add(a0, a1, a2);
-    p.add(a0, a0, t6);
-    p.add(a0, a0, t5);
-    exit_now(p);
-    // 0x56 + 0x12 + 0xFF + 0x0F0F = 86 + 18 + 255 + 3855
-    return {"subword", p.assemble(), 4214, 200000};
-}
-
-// ---- 8. Nested calls ------------------------------------------------------
-// A four-deep call chain, ten times over: the return-address stack at
-// several depths, plus ra save/restore.
-inline Workload nested_calls() {
-    Assembler p;
-    p.li(sp, static_cast<int32_t>(STACK));
-    p.li(a0, 0);
-    p.li(s0, 10);
-    p.li(s1, 0);
-    p.label("nc_loop");
-    p.bge(s1, s0, "nc_done");
-    p.call("f1");
-    p.addi(s1, s1, 1);
-    p.j("nc_loop");
-    p.label("nc_done");
-    exit_now(p);
-
-    // f1 → f2 → f3 → f4, adding 4, 3, 2, 1 on the way back out.
-    const struct { const char* self; const char* callee; int32_t add; } frames[] = {
-        {"f1", "f2", 4},
-        {"f2", "f3", 3},
-        {"f3", "f4", 2},
-    };
-    for (const auto& f : frames) {
-        p.label(f.self);
-        p.addi(sp, sp, -8);
-        p.sw(ra, sp, 4);
-        p.call(f.callee);
-        p.addi(a0, a0, f.add);
-        p.lw(ra, sp, 4);
-        p.addi(sp, sp, 8);
-        p.ret_();
-    }
-    p.label("f4");
-    p.addi(a0, a0, 1);
-    p.ret_();
-
-    return {"nested_calls", p.assemble(), 100, 200000};   // 10 × (1+2+3+4)
-}
-
-// ---- 9. Recursive Fibonacci -----------------------------------------------
-inline Workload fib() {
-    Assembler p;
-    p.li(sp, static_cast<int32_t>(STACK));
-    p.li(a0, 12);
-    p.call("fib");
-    exit_now(p);
-
-    p.label("fib");
-    p.addi(sp, sp, -16);
-    p.sw(ra, sp, 12);
-    p.sw(s0, sp, 8);
-    p.sw(s1, sp, 4);
-    p.li(t0, 2);
-    p.blt(a0, t0, "fib_done");                // fib(0) = 0, fib(1) = 1
-    p.mv(s0, a0);
-    p.addi(a0, s0, -1);
-    p.call("fib");
-    p.mv(s1, a0);
-    p.addi(a0, s0, -2);
-    p.call("fib");
-    p.add(a0, a0, s1);
-    p.label("fib_done");
-    p.lw(ra, sp, 12);
-    p.lw(s0, sp, 8);
-    p.lw(s1, sp, 4);
-    p.addi(sp, sp, 16);
-    p.ret_();
-
-    return {"fib", p.assemble(), 144, 2000000};   // fib(12)
-}
-
-// ---- 10. Unpredictable branch ---------------------------------------------
-// A branch driven by a bit of an LCG stream, so no history pattern predicts
-// it. The expected count comes from the same recurrence in C++.
-inline Workload lcg_branch() {
-    constexpr uint32_t SEED = 12345, MUL = 1103515245, INC = 12345, ITERS = 200;
-
-    uint32_t x = SEED, taken = 0;
-    for (uint32_t i = 0; i < ITERS; ++i) {
-        x = x * MUL + INC;
-        taken += (x >> 16) & 1u;
-    }
-
-    Assembler p;
-    p.li(s0, static_cast<int32_t>(ITERS));
-    p.li(s1, 0);                              // i
-    p.li(s2, static_cast<int32_t>(SEED));     // x
-    p.li(s3, static_cast<int32_t>(MUL));
-    p.li(s4, static_cast<int32_t>(INC));
-    p.li(a0, 0);                              // count
-    p.label("lcg");
-    p.bge(s1, s0, "lcg_done");
-    p.mul(s2, s2, s3);
-    p.add(s2, s2, s4);
-    p.srli(t0, s2, 16);
-    p.andi(t0, t0, 1);
-    p.beq(t0, zero, "not_taken");
-    p.addi(a0, a0, 1);
-    p.label("not_taken");
-    p.addi(s1, s1, 1);
-    p.j("lcg");
-    p.label("lcg_done");
-    exit_now(p);
-    return {"lcg_branch", p.assemble(), taken, 200000};
-}
-
-// ---- 11. mul / div, including divide-by-zero ------------------------------
-inline Workload muldiv() {
-    uint32_t acc = 0;
-    for (uint32_t i = 1; i <= 20; ++i) acc += 1000u / i + 1000u % i;
-    acc += 0xFFFFFFFFu;                       // the divide-by-zero result, -1
-
-    Assembler p;
-    p.li(a1, -1);
-    p.li(a2, 10);
-    p.li(a3, 0);
-    p.li(a4, static_cast<int32_t>(0x80000000));
-
-    p.div_(t0, a4, a1);                       // INT_MIN / -1 → INT_MIN, no trap
-    p.rem (t1, a4, a1);                       // → 0
-    p.div_(t2, a2, a3);                       // x / 0 → -1
-    p.divu(t3, a2, a3);
-    p.rem (t4, a2, a3);                       // x % 0 → x
-    p.remu(t5, a2, a3);
-    p.mulh  (a5, a1, a1);
-    p.mulhu (a6, a1, a1);
-    p.mulhsu(a7, a1, a2);
-
-    p.li(s0, 1);                              // i
-    p.li(s1, 21);
-    p.li(s2, 0);                              // acc
-    p.li(s3, 1000);
-    p.label("md");
-    p.bge(s0, s1, "md_done");
-    p.div_(t0, s3, s0);
-    p.rem (t1, s3, s0);
-    p.add(s2, s2, t0);
-    p.add(s2, s2, t1);
-    p.addi(s0, s0, 1);
-    p.j("md");
-    p.label("md_done");
-    p.div_(t2, s3, a3);                       // divide by zero once more
-    p.add(s2, s2, t2);
-    p.mv(a0, s2);
-    exit_now(p);
-    return {"muldiv", p.assemble(), acc, 200000};
-}
-
-// ---- 12. Pointer chase ----------------------------------------------------
-// 32 two-word nodes in a stride-7 cycle (7 is coprime with 32, so the cycle
-// covers every node). The traversal is a chain of dependent loads, which no
-// amount of issue width can accelerate.
-inline Workload pointer_chase() {
-    Assembler p;
-    p.li(s0, static_cast<int32_t>(DATA));
-    p.li(s1, 32);
-
-    p.li(t0, 0);
-    p.label("build");
-    p.bge(t0, s1, "build_done");
-    p.slli(t1, t0, 3);
-    p.add(t1, s0, t1);                        // &node[i]
-    p.addi(t2, t0, 1);
-    p.sw(t2, t1, 0);                          // node[i].value = i + 1
-    p.addi(t3, t0, 7);
-    p.andi(t3, t3, 31);
-    p.slli(t3, t3, 3);
-    p.add(t3, s0, t3);
-    p.sw(t3, t1, 4);                          // node[i].next = &node[(i+7) % 32]
-    p.addi(t0, t0, 1);
-    p.j("build");
-    p.label("build_done");
-
-    p.li(a0, 0);
-    p.mv(t0, s0);                             // p = &node[0]
-    p.li(t1, 0);
-    p.label("chase");
-    p.bge(t1, s1, "chase_done");
-    p.lw(t2, t0, 0);
-    p.add(a0, a0, t2);
-    p.lw(t0, t0, 4);                          // p = p->next
-    p.addi(t1, t1, 1);
-    p.j("chase");
-    p.label("chase_done");
-    exit_now(p);
-    return {"pointer_chase", p.assemble(), 528, 200000};   // sum 1..32
-}
-
-// ---- 13. WAW / WAR renaming stress ----------------------------------------
-// t0 is written five times per iteration and read in between. Each write
-// must land in a distinct physical register or a later reader sees the
-// wrong value.
-inline Workload waw_war() {
-    Assembler p;
-    p.li(a0, 0);
-    p.li(s0, 10);
-    p.li(s1, 0);
-    p.label("w_loop");
-    p.bge(s1, s0, "w_done");
-    p.li(t0, 1);
-    p.add(a0, a0, t0);                        // +1
-    p.li(t0, 2);                              // WAW
-    p.add(a0, a0, t0);                        // +2
-    p.li(t0, 3);                              // WAW
-    p.add(a0, a0, t0);                        // +3
-    p.mv(t1, t0);                             // read t0 ...
-    p.li(t0, 4);                              // ... then WAR over it
-    p.add(a0, a0, t1);                        // +3 (the pre-WAR value)
-    p.add(a0, a0, t0);                        // +4
-    p.addi(s1, s1, 1);
-    p.j("w_loop");
-    p.label("w_done");
-    exit_now(p);
-    return {"waw_war", p.assemble(), 130, 200000};   // 10 × 13
-}
-
-inline const std::vector<Workload>& corpus() {
-    static const std::vector<Workload> c = [] {
-        std::vector<Workload> v;
-        v.push_back(alu());
-        v.push_back(loop());
-        v.push_back(bubble_sort());
-        v.push_back(matmul());
-        v.push_back(sieve());
-        v.push_back(store_forward());
-        v.push_back(subword());
-        v.push_back(nested_calls());
-        v.push_back(fib());
-        v.push_back(lcg_branch());
-        v.push_back(muldiv());
-        v.push_back(pointer_chase());
-        v.push_back(waw_war());
-        return v;
-    }();
-    return c;
-}
-
-}  // namespace wl
 
 // ========================================================= differential run ===
 // `diff_run` runs a workload on the reference and on the model under test,
@@ -2051,8 +1489,8 @@ SECTION("diff_scaffold") {
     const Config cfg;
     const auto&  corpus = wl::corpus();
 
-    // ---- The corpus is thirteen distinctly named programs ------------------
-    REQUIRE(corpus.size() == 13);
+    // ---- The corpus is fourteen distinctly named programs ------------------
+    REQUIRE(corpus.size() == 14);
     for (std::size_t i = 0; i < corpus.size(); ++i) {
         for (std::size_t j = i + 1; j < corpus.size(); ++j) {
             REQUIRE(corpus[i].name != corpus[j].name);
@@ -4217,6 +3655,490 @@ SECTION("recover") {
                         "    " + w.name + ": retired " + std::to_string(model.retired) +
                         " vs " + std::to_string(ref.retired));
         }
+    }
+}
+
+
+// ------------------------------------------------------- @section("stats") ---
+namespace stattest {
+
+// Slots the issue stage could have used and did not. Each cycle offers
+// `width` of them, so this is what the issue-side breakdown must fit inside.
+inline const Stall ISSUE_STALLS[] = {
+    Stall::ALU_PORT, Stall::BRANCH_PORT, Stall::MUL_PORT, Stall::DIV_PORT,
+    Stall::MEM_PORT, Stall::CDB, Stall::STORE_ORDER, Stall::OPERANDS,
+};
+inline const Stall RENAME_STALLS[]   = {Stall::ROB_FULL, Stall::PHYSREG, Stall::CHECKPOINT};
+inline const Stall DISPATCH_STALLS[] = {Stall::IQ_FULL, Stall::LQ_FULL, Stall::SQ_FULL};
+
+inline Stats run(const wl::Workload& w, const Config& cfg) {
+    Memory m = cputest::image(w.words);
+    Cpu cpu(m, cfg, wl::TEXT);
+    cpu.run(w.budget * 40 + 10000);
+    REQUIRE_MSG(cpu.done(), "    " + w.name + " did not finish");
+    return cpu.stats();
+}
+
+inline const wl::Workload& named(const std::string& name) {
+    for (const wl::Workload& w : wl::corpus()) {
+        if (w.name == name) return w;
+    }
+    static const wl::Workload none;
+    REQUIRE_MSG(false, "    no workload named " + name);
+    return none;
+}
+
+}  // namespace stattest
+
+SECTION("stats") {
+    using namespace stattest;
+
+    // ---- Every renamed uop either retires or is squashed ------------------
+    // The stage counters are a funnel, and the two ends have to agree: a uop
+    // that reached rename took a ROB entry, and a ROB entry leaves exactly one
+    // way.
+    {
+        const Config cfg;
+        for (const wl::Workload& w : wl::corpus()) {
+            const Stats s = run(w, cfg);
+            REQUIRE_MSG(s.renamed == s.retired + s.squashed,
+                        "    " + w.name + ": renamed " + std::to_string(s.renamed) +
+                        " != retired " + std::to_string(s.retired) +
+                        " + squashed " + std::to_string(s.squashed));
+            REQUIRE(s.fetched    >= s.decoded);
+            REQUIRE(s.decoded    >= s.renamed);
+            REQUIRE(s.renamed    >= s.dispatched);
+            REQUIRE(s.dispatched >= s.issued);
+            REQUIRE(s.issued     >= s.wrote_back);
+            REQUIRE(s.retired    >= 1);
+        }
+    }
+
+    // ---- A load is served from exactly one place --------------------------
+    {
+        const Config cfg;
+        for (const wl::Workload& w : wl::corpus()) {
+            const Stats s = run(w, cfg);
+            REQUIRE_MSG(s.loads == s.load_forwards + s.load_memory,
+                        "    " + w.name + ": loads " + std::to_string(s.loads) +
+                        " != forwards " + std::to_string(s.load_forwards) +
+                        " + memory " + std::to_string(s.load_memory));
+        }
+        REQUIRE(run(named("store_forward"), cfg).load_forwards > 0);
+        REQUIRE(run(named("pointer_chase"), cfg).load_forwards == 0);
+    }
+
+    // ---- The rates are the counters, divided ------------------------------
+    {
+        const Stats s = run(named("crc32"), Config{});
+        REQUIRE(std::abs(s.ipc() * s.cpi() - 1.0) < 1e-9);
+        REQUIRE(std::abs(s.ipc() - double(s.retired) / double(s.cycles)) < 1e-9);
+        REQUIRE(std::abs(s.mpki() - 1000.0 * s.mispredict_rate() * s.branches / s.retired) < 1e-6);
+        REQUIRE(s.btb_hit_rate() <= 1.0);
+        REQUIRE(s.ras_accuracy() <= 1.0);
+
+        const Stats empty;
+        REQUIRE(empty.ipc() == 0.0);            // no cycles, no division
+        REQUIRE(empty.cpi() == 0.0);
+        REQUIRE(empty.mispredict_rate() == 0.0);
+        REQUIRE(empty.dominant_stall() == Stall::COUNT);
+    }
+
+    // ---- The breakdown fits in the slots the machine actually had ---------
+    // Lost issue slots are bounded by width per cycle, and each front-end
+    // stage can only lose one bundle per cycle. A breakdown that overflows
+    // those bounds is double-counting and cannot be read as a fraction.
+    {
+        for (const uint32_t width : {1u, 2u, 4u}) {
+            Config cfg;
+            cfg.width = width;
+            for (const wl::Workload& w : wl::corpus()) {
+                const Stats s = run(w, cfg);
+                uint64_t issue_side = 0, rename_side = 0, dispatch_side = 0;
+                for (const Stall st : ISSUE_STALLS)    issue_side    += s.stall_count(st);
+                for (const Stall st : RENAME_STALLS)   rename_side   += s.stall_count(st);
+                for (const Stall st : DISPATCH_STALLS) dispatch_side += s.stall_count(st);
+                REQUIRE_MSG(issue_side <= s.cycles * width,
+                            "    " + w.name + ": issue-side stalls exceed the slots");
+                REQUIRE_MSG(rename_side <= s.cycles, "    " + w.name + ": rename stalls exceed cycles");
+                REQUIRE_MSG(dispatch_side <= s.cycles, "    " + w.name + ": dispatch stalls exceed cycles");
+            }
+        }
+    }
+
+    // ---- An unstressed run blames nothing ---------------------------------
+    {
+        const Stats s = run(named("alu"), Config{});
+        REQUIRE(s.dominant_stall() == Stall::COUNT);
+        REQUIRE(std::string(stall_name(Stall::COUNT)) == "none");
+    }
+
+    // ---- Starve one resource and the breakdown names that resource --------
+    // This is the whole point of the stall accounting. Each row takes the
+    // default machine, removes exactly one thing, and asks what hurt.
+    {
+        struct Case {
+            const char* workload;
+            Stall       expect;
+            void      (*starve)(Config&);
+        };
+        static const Case cases[] = {
+            {"matmul",        Stall::ROB_FULL,    [](Config& c) { c.rob_size = 4; c.prf_size = 40; }},
+            {"sieve",         Stall::ROB_FULL,    [](Config& c) { c.rob_size = 4; c.prf_size = 40; }},
+            {"matmul",        Stall::IQ_FULL,     [](Config& c) { c.iq_size = 2; }},
+            {"sieve",         Stall::CHECKPOINT,  [](Config& c) { c.num_checkpoints = 1; }},
+            {"crc32",         Stall::CHECKPOINT,  [](Config& c) { c.num_checkpoints = 1; }},
+            {"matmul",        Stall::PHYSREG,     [](Config& c) { c.prf_size = 36; }},
+            {"waw_war",       Stall::PHYSREG,     [](Config& c) { c.prf_size = 36; }},
+            {"pointer_chase", Stall::LQ_FULL,     [](Config& c) { c.lq_size = 1; }},
+            {"bubble_sort",   Stall::SQ_FULL,     [](Config& c) { c.sq_size = 1; }},
+            {"matmul",        Stall::CDB,         [](Config& c) { c.num_cdb = 1; }},
+            {"matmul",        Stall::ALU_PORT,    [](Config& c) { c.num_alu = 1; c.width = 4; }},
+            {"muldiv",        Stall::DIV_PORT,    [](Config&)   {}},
+        };
+        for (const Case& c : cases) {
+            Config cfg;
+            c.starve(cfg);
+            const Stats s = run(named(c.workload), cfg);
+            REQUIRE_MSG(s.dominant_stall() == c.expect,
+                        std::string("    ") + c.workload + ": blamed " +
+                        stall_name(s.dominant_stall()) + ", expected " + stall_name(c.expect));
+        }
+    }
+
+    // ---- Giving the resource back is what proves the diagnosis ------------
+    // A cause that does not go away when the resource does was a symptom.
+    {
+        const wl::Workload& w = named("matmul");
+        Config tight;
+        tight.rob_size = 4;
+        tight.prf_size = 40;
+        const Stats starved = run(w, tight);
+
+        Config roomy = tight;
+        roomy.rob_size = 32;
+        roomy.prf_size = 64;
+        const Stats relieved = run(w, roomy);
+
+        REQUIRE(relieved.stall_count(Stall::ROB_FULL) * 4 < starved.stall_count(Stall::ROB_FULL));
+        REQUIRE(relieved.cycles < starved.cycles);
+        REQUIRE(relieved.retired == starved.retired);   // same program, either way
+    }
+
+    // ---- crc32 is not short of a resource; it is short of a prediction ----
+    // Its inner branch turns on one bit of a CRC, which nothing can predict,
+    // so the breakdown correctly refuses to blame any structure and the cost
+    // shows up as work thrown away instead.
+    {
+        const Config cfg;
+        const Stats crc = run(named("crc32"), cfg);
+        REQUIRE(crc.dominant_stall() == Stall::COUNT);
+        REQUIRE(crc.mispredict_rate() > 0.15);
+        REQUIRE(double(crc.squashed) / crc.retired > 0.15);
+
+        // No other program in the corpus throws away as much.
+        for (const wl::Workload& w : wl::corpus()) {
+            if (w.name == "crc32") continue;
+            REQUIRE(run(w, cfg).squashed < crc.squashed);
+        }
+    }
+}
+
+
+// ------------------------------------------------ @section("config_sweep") ---
+namespace sweep {
+
+struct Machine {
+    const char* name;
+    Config      cfg;
+};
+
+// Six machines that stress different parts of the same design. Correctness is
+// supposed to be identical on all of them; a renaming, wakeup or recovery bug
+// usually is not, which is what makes running the corpus six times worth more
+// than running it once.
+inline const std::vector<Machine>& machines() {
+    static const std::vector<Machine> m = [] {
+        std::vector<Machine> v;
+
+        v.push_back({"default", Config{}});
+
+        Config narrow;                        // nothing overlaps; latency is exposed
+        narrow.width   = 1;
+        narrow.num_cdb = 1;
+        narrow.num_alu = 1;
+        v.push_back({"1-wide/1-CDB", narrow});
+
+        Config wide;                          // deep window, plenty of ports
+        wide.width    = 4;
+        wide.rob_size = 128;
+        wide.prf_size = 160;
+        wide.iq_size  = 32;
+        wide.num_alu  = 4;
+        wide.num_cdb  = 4;
+        v.push_back({"4-wide/ROB=128", wide});
+
+        Config starved;                       // every structure is a bottleneck
+        starved.rob_size        = 4;
+        starved.prf_size        = 40;
+        starved.iq_size         = 2;
+        starved.lq_size         = 1;
+        starved.sq_size         = 1;
+        starved.num_checkpoints = 1;
+        v.push_back({"starved", starved});
+
+        Config slow;                          // wakeup has to track real latencies
+        slow.alu_latency = 3;
+        slow.mem_latency = 8;
+        slow.mul_latency = 8;
+        slow.div_latency = 40;
+        v.push_back({"long-latency", slow});
+
+        Config blind;                         // recovery on almost every branch
+        blind.ghr_bits = 0;
+        blind.pht_size = 1;
+        blind.btb_sets = 1;
+        blind.btb_ways = 1;
+        blind.ras_size = 1;
+        v.push_back({"1-entry predictors", blind});
+
+        return v;
+    }();
+    return m;
+}
+
+}  // namespace sweep
+
+SECTION("config_sweep") {
+    diff::ScopedModel swap(&cputest::run_cpu);
+
+    // ---- Every program, on every machine, gets the same answer ------------
+    for (const sweep::Machine& m : sweep::machines()) {
+        for (const wl::Workload& w : wl::corpus()) {
+            const diff::Report r = diff::diff_run(w, m.cfg);
+            REQUIRE_MSG(r.ok, std::string("  [") + m.name + "]\n" + r.detail);
+        }
+    }
+
+    // ---- And leaves no resource behind on any of them ---------------------
+    for (const sweep::Machine& m : sweep::machines()) {
+        for (const wl::Workload& w : wl::corpus()) {
+            Memory mem = cputest::image(w.words);
+            Cpu cpu(mem, m.cfg, wl::TEXT);
+            REQUIRE(cpu.run(w.budget * 40 + 10000));
+            REQUIRE_MSG(cpu.free_list().num_free() == m.cfg.prf_size - 32,
+                        std::string("    ") + w.name + " on " + m.name + ": leaked a physreg");
+            REQUIRE(cpu.rat().num_free_checkpoints() == cpu.rat().num_checkpoints());
+            REQUIRE(cpu.lsq().loads().empty());
+            REQUIRE(cpu.lsq().stores().empty());
+            REQUIRE(cpu.commit_in_order());
+        }
+    }
+
+    // ---- The six machines really are six machines -------------------------
+    // A sweep whose configurations all behave alike would pass whatever it was
+    // pointed at, so the timings have to actually diverge.
+    {
+        const wl::Workload& w = stattest::named("matmul");
+        std::vector<uint64_t> cycles;
+        for (const sweep::Machine& m : sweep::machines()) {
+            cycles.push_back(stattest::run(w, m.cfg).cycles);
+        }
+        for (std::size_t i = 0; i < cycles.size(); ++i) {
+            for (std::size_t j = i + 1; j < cycles.size(); ++j) {
+                REQUIRE(cycles[i] != cycles[j]);
+            }
+        }
+        REQUIRE(cycles[2] < cycles[0]);     // wide is faster than default
+        REQUIRE(cycles[1] > cycles[0]);     // narrow is slower
+        REQUIRE(cycles[3] > cycles[1]);     // starved is worse than merely narrow
+    }
+}
+
+
+// -------------------------------------------------- @section("properties") ---
+namespace props {
+
+// Table-driven CRC-32, written a different way from the bitwise loop the
+// workload runs, so agreeing with it means something.
+inline uint32_t crc32_table_driven(const std::vector<uint8_t>& bytes) {
+    static const std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (~(c & 1u) + 1u));
+            t[i] = c;
+        }
+        return t;
+    }();
+
+    uint32_t crc = 0xFFFFFFFFu;
+    for (const uint8_t b : bytes) crc = table[(crc ^ b) & 0xFFu] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+inline uint64_t cycles_of(const std::vector<uint32_t>& words, const Config& cfg) {
+    Memory m = cputest::image(words);
+    Cpu cpu(m, cfg, wl::TEXT);
+    REQUIRE(cpu.run(200000));
+    return cpu.cycle();
+}
+
+}  // namespace props
+
+SECTION("properties") {
+    using namespace asmc;
+
+    // ---- Dependent single-cycle ops issue back to back --------------------
+    // Two hundred addis that each need the one before it, on a machine that
+    // can only start one op per cycle. Anything above ~1.3 cycles apiece means
+    // wakeup is not reaching select in the same cycle the value lands.
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(a0, 0);
+        for (int i = 0; i < 200; ++i) p.addi(a0, a0, 1);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+        REQUIRE(cpu.exit_code() == 200);
+        REQUIRE(cpu.cycle() < 260);
+    }
+
+    // ---- Load-use latency is the configured number, exactly ---------------
+    {
+        Assembler p;
+        p.li(t0, 0x400);
+        p.lw(t1, t0, 0);                      // nothing wrote it, so memory answers
+        p.addi(a0, t1, 7);
+        p.li(a7, 93);
+        p.ecall();
+        const std::vector<uint32_t> code = p.assemble();
+
+        Config base;
+        const uint64_t at2 = props::cycles_of(code, base);
+        for (const uint32_t lat : {3u, 5u, 9u, 20u}) {
+            Config cfg;
+            cfg.mem_latency = lat;
+            REQUIRE(props::cycles_of(code, cfg) == at2 + (lat - base.mem_latency));
+        }
+    }
+
+    // ---- A forwarded load pays none of it ---------------------------------
+    {
+        Assembler p;
+        p.li(t0, 0x400);
+        p.li(t1, 77);
+        p.sw(t1, t0, 0);
+        p.lw(a0, t0, 0);                      // served by the store queue
+        p.li(a7, 93);
+        p.ecall();
+        const std::vector<uint32_t> code = p.assemble();
+
+        const uint64_t at2 = props::cycles_of(code, Config{});
+        for (const uint32_t lat : {8u, 20u}) {
+            Config cfg;
+            cfg.mem_latency = lat;
+            REQUIRE(props::cycles_of(code, cfg) == at2);
+        }
+
+        Memory m = cputest::image(code);
+        Cpu cpu(m, Config{}, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+        REQUIRE(cpu.exit_code() == 77);
+        REQUIRE(cpu.stats().load_forwards == 1);
+        REQUIRE(cpu.stats().load_memory == 0);
+    }
+
+    // ---- A load behind an unresolved store waits instead of guessing ------
+    {
+        Assembler p;
+        p.li(t0, 0x400);
+        p.li(t1, 5);
+        p.li(t2, 41);
+        p.div_(t3, t1, t1);                   // slow, and the store needs it
+        p.slli(t3, t3, 10);                   // address = 0x400 only once it lands
+        p.sw(t2, t3, 0);
+        p.lw(a0, t0, 0);                      // may not pass the store
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, Config{}, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+
+        REQUIRE(cpu.exit_code() == 41);       // it waited, and then forwarded
+        REQUIRE(cpu.stats().load_replays > 0);
+        REQUIRE(cpu.stats().stall_count(Stall::STORE_ORDER) > 0);
+    }
+
+    // ---- A starved machine blames one of the things it was starved of -----
+    {
+        Config cfg;
+        cfg.rob_size        = 4;
+        cfg.prf_size        = 40;
+        cfg.iq_size         = 2;
+        cfg.lq_size         = 1;
+        cfg.sq_size         = 1;
+        cfg.num_checkpoints = 1;
+
+        for (const wl::Workload& w : wl::corpus()) {
+            const Stall dominant = stattest::run(w, cfg).dominant_stall();
+            const bool starved_resource =
+                dominant == Stall::ROB_FULL   || dominant == Stall::IQ_FULL    ||
+                dominant == Stall::LQ_FULL    || dominant == Stall::SQ_FULL    ||
+                dominant == Stall::PHYSREG    || dominant == Stall::CHECKPOINT ||
+                dominant == Stall::DIV_PORT;   // muldiv is slower than any queue
+            REQUIRE_MSG(starved_resource,
+                        "    " + w.name + ": blamed " + stall_name(dominant));
+        }
+    }
+
+    // ---- The predictor learns, and then the loop is free ------------------
+    // The honest statement of "it learned" is not a rate — it is that ten
+    // times the iterations cost the same number of mispredicts. What the
+    // machine pays for is filling the history once; a coin flip would pay
+    // half of every trip forever.
+    {
+        auto spin = [](int32_t trips) {
+            Assembler p;
+            p.li(t0, 0);
+            p.li(t1, trips);
+            p.label("spin");
+            p.addi(t0, t0, 1);
+            p.blt(t0, t1, "spin");
+            p.mv(a0, t0);
+            p.li(a7, 93);
+            p.ecall();
+            Memory m = cputest::image(p.assemble());
+            Cpu cpu(m, Config{}, wl::TEXT);
+            REQUIRE(cpu.run(50000));
+            REQUIRE(cpu.exit_code() == static_cast<uint32_t>(trips));
+            return cpu.stats();
+        };
+        const Stats few  = spin(300);
+        const Stats many = spin(3000);
+
+        REQUIRE(many.mispredicts == few.mispredicts);
+        REQUIRE(few.mispredicts <= Config{}.ghr_bits + 4);   // history fill, and no more
+        REQUIRE(many.mispredict_rate() < 0.01);
+    }
+
+    // ---- crc32 agrees with zlib, byte for byte ----------------------------
+    // The only check in the suite that does not appeal to ref.h: an outside
+    // authority fixed this number long before this simulator existed.
+    {
+        std::vector<uint8_t> bytes(256);
+        for (int i = 0; i < 256; ++i) bytes[i] = static_cast<uint8_t>(i);
+        REQUIRE(props::crc32_table_driven(bytes) == 0x29058C73u);   // zlib's answer
+
+        Memory m = cputest::image(stattest::named("crc32").words);
+        Cpu cpu(m, Config{}, wl::TEXT);
+        REQUIRE(cpu.run(200000));
+        REQUIRE(cpu.halted());
+        REQUIRE(cpu.exit_code() == props::crc32_table_driven(bytes));
     }
 }
 

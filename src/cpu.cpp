@@ -349,11 +349,17 @@ bool Cpu::reserve_cdb(uint64_t at_cycle) {
 // Oldest ready first, but a uop blocked on a unit or a writeback port only
 // blocks itself — the next candidate still gets a look. That is the point of
 // the whole machine: program order stopped constraining execution at rename.
+//
+// A cycle offers exactly `width` issue slots, so the reasons candidates were
+// turned away are charged against the slots that actually went unused, oldest
+// first. Counting every turned-away candidate instead would let one cycle
+// report more lost slots than the machine has.
 void Cpu::issue() {
     const std::vector<IssueQueue::Entry> ready = iq_.select(iq_.size());
     uint32_t issued = 0;
     bool     redirect = false;
     Uop      offender;
+    std::vector<Stall> blocked;
 
     for (const IssueQueue::Entry& e : ready) {
         if (issued >= cfg_.width) break;
@@ -362,7 +368,7 @@ void Cpu::issue() {
 
         const Fu  f    = unit_of(u.dec);
         const int unit = free_unit(f);
-        if (unit < 0) { stats_.stall(port_stall(f)); continue; }
+        if (unit < 0) { blocked.push_back(port_stall(f)); continue; }
 
         uint32_t lat = e.latency;
         u.val1 = prf_.read(u.src1);
@@ -378,7 +384,7 @@ void Cpu::issue() {
                 fu_free_at_[static_cast<int>(Fu::MEM)][static_cast<std::size_t>(unit)] =
                     cycle_ + 1;
                 ++stats_.load_replays;
-                stats_.stall(Stall::STORE_ORDER);
+                blocked.push_back(Stall::STORE_ORDER);
                 continue;
             }
         } else {
@@ -386,7 +392,7 @@ void Cpu::issue() {
             // writeback port for the cycle the value lands and does not go
             // without one.
             if (u.dec.writes_rd && !reserve_cdb(cycle_ + lat)) {
-                stats_.stall(Stall::CDB);
+                blocked.push_back(Stall::CDB);
                 continue;
             }
             if (u.trap == TrapCause::NONE) execute_uop(u);
@@ -430,10 +436,16 @@ void Cpu::issue() {
         if (record_issue_) issue_log_.push_back({cycle_, u.seq, u.pc, u.dest, u.wb_cycle});
     }
 
-    // Slots lost with work waiting are lost to a producer, not to a resource.
-    if (issued < cfg_.width && ready.size() == issued && !iq_.empty()) {
-        stats_.stall(Stall::OPERANDS);
+    uint32_t lost = cfg_.width - issued;
+    for (const Stall s : blocked) {
+        if (lost == 0) break;
+        stats_.stall(s);
+        --lost;
     }
+    // A slot nothing was even turned away from was lost to a producer, not to
+    // a resource — unless the queue is empty, in which case the front end is
+    // behind and has already accounted for it.
+    for (; lost > 0 && !iq_.empty(); --lost) stats_.stall(Stall::OPERANDS);
 
     if (redirect) recover(offender);
 }
