@@ -4,7 +4,8 @@
 // parse_args / print_help directly. Everything else is inline or file-static,
 // so including it twice does not violate ODR.
 //
-// Execution is delegated to the in-order interpreter in ref.h.
+// Programs run on the out-of-order model by default; --ref runs the in-order
+// interpreter the model is validated against.
 
 #include <cstddef>
 #include <cstdint>
@@ -17,9 +18,11 @@
 #include <vector>
 
 #include "config.h"
+#include "cpu.h"
 #include "loader.h"
 #include "memory.h"
 #include "ref.h"
+#include "stats.h"
 
 // ============================================================================
 // CLI surface
@@ -34,7 +37,11 @@ struct CliOpts {
     bool        print_regs = false;
     bool        trace = false;
     bool        show_help = false;
+    bool        use_ref = false;      // interpreter instead of the pipeline
+    bool        show_stats = false;
+    bool        ipc_table = false;    // same program, four machines
     uint64_t    max_insts = 100'000'000;
+    uint64_t    max_cycles = 1'000'000'000;
     Config      cfg;
 };
 
@@ -118,8 +125,11 @@ inline int parse_args(int argc, char** argv, CliOpts& opts) {
         };
 
         if (flag == "--help" || flag == "-h") { opts.show_help = true; return 0; }
-        if (flag == "--regs")  { opts.print_regs = true; continue; }
-        if (flag == "--trace") { opts.trace = true; continue; }
+        if (flag == "--regs")      { opts.print_regs = true; continue; }
+        if (flag == "--trace")     { opts.trace = true; continue; }
+        if (flag == "--ref")       { opts.use_ref = true; continue; }
+        if (flag == "--stats")     { opts.show_stats = true; continue; }
+        if (flag == "--ipc-table") { opts.ipc_table = true; continue; }
 
         if (flag == "--hex") { if (!take_value(opts.hex_path)) return 1; continue; }
         if (flag == "--raw") { if (!take_value(opts.raw_path)) return 1; continue; }
@@ -137,6 +147,14 @@ inline int parse_args(int argc, char** argv, CliOpts& opts) {
             if (!take_value(v))                     return 1;
             if (!parse_u64(v, opts.max_insts)) {
                 std::fprintf(stderr, "oooc: bad --max-insts '%s'\n", v.c_str()); return 1;
+            }
+            continue;
+        }
+        if (flag == "--max-cycles") {
+            std::string v;
+            if (!take_value(v))                      return 1;
+            if (!parse_u64(v, opts.max_cycles)) {
+                std::fprintf(stderr, "oooc: bad --max-cycles '%s'\n", v.c_str()); return 1;
             }
             continue;
         }
@@ -183,12 +201,100 @@ inline void print_help() {
     std::printf("\nGeneral:\n");
     std::printf("  --base ADDR       load address for --hex / --raw (accepts 0x prefix)\n");
     std::printf("  --regs            print architectural registers on exit\n");
-    std::printf("  --trace           print each retired instruction to stderr\n");
+    std::printf("  --stats           print cycles, IPC, prediction and the stall breakdown\n");
+    std::printf("  --ipc-table       run the program 1-, 2-, 4-wide and starved, and compare\n");
+    std::printf("  --ref             run the in-order reference interpreter instead\n");
+    std::printf("  --trace           print each retired instruction to stderr (--ref only)\n");
     std::printf("  --max-insts N     abort after N retired instructions (default 1e8)\n");
+    std::printf("  --max-cycles N    abort after N cycles (default 1e9)\n");
     std::printf("  --help, -h        this message\n");
     std::printf("\nMicroarchitectural knobs:\n");
     for (const auto& k : KNOBS) {
         std::printf("  %-14s  %s\n", k.flag, k.desc);
+    }
+}
+
+// ============================================================================
+// Reporting
+// ============================================================================
+
+// Everything the run measured, in the order it happens: the funnel from fetch
+// to commit, then what the front end guessed, then memory, then the reasons
+// issue slots went unused.
+inline void print_stats(const Stats& s) {
+    std::printf("\ncycles %llu  retired %llu  IPC %.3f  CPI %.3f\n",
+                static_cast<unsigned long long>(s.cycles),
+                static_cast<unsigned long long>(s.retired), s.ipc(), s.cpi());
+
+    std::printf("  stages   fetch %llu  decode %llu  rename %llu  dispatch %llu"
+                "  issue %llu  writeback %llu  squashed %llu\n",
+                static_cast<unsigned long long>(s.fetched),
+                static_cast<unsigned long long>(s.decoded),
+                static_cast<unsigned long long>(s.renamed),
+                static_cast<unsigned long long>(s.dispatched),
+                static_cast<unsigned long long>(s.issued),
+                static_cast<unsigned long long>(s.wrote_back),
+                static_cast<unsigned long long>(s.squashed));
+
+    std::printf("  branch   %llu  mispredicted %llu (%.1f%%, %.1f MPKI)"
+                "  BTB %.1f%%  RAS %.1f%%\n",
+                static_cast<unsigned long long>(s.branches),
+                static_cast<unsigned long long>(s.mispredicts),
+                100.0 * s.mispredict_rate(), s.mpki(),
+                100.0 * s.btb_hit_rate(), 100.0 * s.ras_accuracy());
+
+    std::printf("  memory   loads %llu (forwarded %llu, from memory %llu, replayed %llu)"
+                "  stores %llu\n",
+                static_cast<unsigned long long>(s.loads),
+                static_cast<unsigned long long>(s.load_forwards),
+                static_cast<unsigned long long>(s.load_memory),
+                static_cast<unsigned long long>(s.load_replays),
+                static_cast<unsigned long long>(s.stores));
+
+    uint64_t total = 0;
+    for (const uint64_t n : s.stalls) total += n;
+    std::printf("  stalls   %llu lost slots\n", static_cast<unsigned long long>(total));
+    if (total == 0) return;
+    for (std::size_t i = 0; i < s.stalls.size(); ++i) {
+        if (s.stalls[i] == 0) continue;
+        std::printf("    %-20s %10llu  %5.1f%%\n", stall_name(static_cast<Stall>(i)),
+                    static_cast<unsigned long long>(s.stalls[i]),
+                    100.0 * static_cast<double>(s.stalls[i]) / static_cast<double>(total));
+    }
+    const Stall worst = s.dominant_stall();
+    std::printf("  limited by: %s\n", worst == Stall::COUNT ? "no structure" : stall_name(worst));
+}
+
+// Same program, four machines. The point is the shape of the column: what a
+// program gains from width says more about the program than about the machine.
+inline void print_ipc_table(const Memory& image, uint32_t entry, uint64_t max_cycles) {
+    struct Row { const char* name; Config cfg; };
+
+    Config w1;  w1.width = 1;
+    Config w2;                                    // the default is 2-wide
+    Config w4;  w4.width = 4; w4.rob_size = 128; w4.prf_size = 160; w4.iq_size = 32;
+    w4.num_alu = 4; w4.num_cdb = 4;
+    Config tiny; tiny.rob_size = 4; tiny.prf_size = 40; tiny.iq_size = 2;
+
+    const Row rows[] = {
+        {"1-wide",      w1},
+        {"2-wide",      w2},
+        {"4-wide",      w4},
+        {"ROB=4, IQ=2", tiny},
+    };
+
+    std::printf("\n%-14s %10s %10s %8s %8s\n", "machine", "cycles", "retired", "IPC", "vs 1-wide");
+    double base = 0.0;
+    for (const Row& r : rows) {
+        Memory mem = image;                       // every run starts from the image
+        Cpu cpu(mem, r.cfg, entry);
+        cpu.run(max_cycles);
+        const double ipc = cpu.stats().ipc();
+        if (base == 0.0) base = ipc;
+        std::printf("%-14s %10llu %10llu %8.2f %8.2fx\n", r.name,
+                    static_cast<unsigned long long>(cpu.stats().cycles),
+                    static_cast<unsigned long long>(cpu.stats().retired),
+                    ipc, base > 0.0 ? ipc / base : 0.0);
     }
 }
 
@@ -235,19 +341,48 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    ref::Options ropts;
-    ropts.max_insts = opts.max_insts;
-    ropts.trace     = opts.trace;
-    const ref::Result r = ref::run(mem, loaded.entry, ropts);
+    if (opts.ipc_table) {
+        print_ipc_table(mem, loaded.entry, opts.max_cycles);
+        return 0;
+    }
+
+    std::array<uint32_t, 32> regs{};
+    bool     halted = false, trapped = false, budget = false;
+    uint64_t retired = 0;
+    uint32_t exit_code = 0;
+
+    if (opts.use_ref) {
+        ref::Options ropts;
+        ropts.max_insts = opts.max_insts;
+        ropts.trace     = opts.trace;
+        const ref::Result r = ref::run(mem, loaded.entry, ropts);
+        for (int i = 0; i < 32; ++i) regs[i] = r.regs[i];
+        halted = r.halted; trapped = r.trapped; budget = r.budget;
+        retired = r.retired; exit_code = r.exit_code;
+    } else {
+        if (opts.trace) {
+            std::fprintf(stderr, "oooc: --trace needs --ref\n");
+            return 2;
+        }
+        Cpu cpu(mem, opts.cfg, loaded.entry);
+        cpu.run(opts.max_cycles);
+        regs      = cpu.regs();
+        halted    = cpu.halted();
+        trapped   = cpu.trapped();
+        budget    = !cpu.done();
+        retired   = cpu.retired();
+        exit_code = cpu.exit_code();
+        if (opts.show_stats) print_stats(cpu.stats());
+    }
 
     if (opts.print_regs) {
         for (int i = 0; i < 32; ++i) {
-            std::printf("x%-2d = 0x%08X%s", i, r.regs[i], (i % 4 == 3) ? "\n" : "  ");
+            std::printf("x%-2d = 0x%08X%s", i, regs[i], (i % 4 == 3) ? "\n" : "  ");
         }
     }
     std::printf("halted=%d trapped=%d budget=%d retired=%llu exit=%u\n",
-                r.halted ? 1 : 0, r.trapped ? 1 : 0, r.budget ? 1 : 0,
-                static_cast<unsigned long long>(r.retired), r.exit_code);
-    return r.trapped ? 1 : static_cast<int>(r.exit_code);
+                halted ? 1 : 0, trapped ? 1 : 0, budget ? 1 : 0,
+                static_cast<unsigned long long>(retired), exit_code);
+    return trapped ? 1 : static_cast<int>(exit_code);
 }
 #endif

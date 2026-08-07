@@ -283,7 +283,7 @@ sequenceDiagram
 
 ### 8.1 Differential correctness
 
-The 13 hand-written programs cover: ALU coverage, loops, arrays, store forwarding, sub-word and partial-overlap accesses, nested calls, recursive Fibonacci, an LCG-driven unpredictable branch, `mul` / `div` including divide-by-zero, a pointer chase, and a WAW/WAR renaming stress.
+The 14 hand-written programs cover: ALU coverage, loops, arrays, store forwarding, sub-word and partial-overlap accesses, nested calls, recursive Fibonacci, an LCG-driven unpredictable branch, `mul` / `div` including divide-by-zero, a pointer chase, a WAW/WAR renaming stress, and a bitwise CRC-32.
 
 Each is run against an **in-order reference interpreter**, comparing:
 
@@ -300,11 +300,11 @@ Each program runs on **six machine configurations**:
 | Configuration | Purpose |
 |---|---|
 | Default | Baseline |
-| 1-wide / 1-CDB | Serialization stress |
-| 4-wide, ROB=128 | Wide-machine correctness |
-| `ROB=4 IQ=2 LQ=SQ=1 chkpt=1` | Structural-hazard starvation |
-| Long FU latencies | Latency tracking |
-| 1-entry predictors | Recovery-heavy workload |
+| 1-wide / 1-CDB / 1 ALU | Serialization stress |
+| 4-wide, ROB=128, PRF=160, IQ=32 | Wide-machine correctness |
+| `ROB=4 PRF=40 IQ=2 LQ=SQ=1 chkpt=1` | Structural-hazard starvation |
+| ALU 3c, load-use 8c, mul 8c, div 40c | Latency tracking |
+| 1-entry PHT / BTB / RAS, no history | Recovery-heavy workload |
 
 Any renaming, wakeup, or recovery bug shows up as a **configuration-dependent** result — an important property, since ISA correctness alone would pass on a config that never actually stresses the OoO machinery.
 
@@ -333,7 +333,7 @@ Beyond ISA correctness, targeted tests assert:
 | Issue queue | 16 entries |
 | LQ / SQ | 8 / 8 |
 | CDBs | 2 writeback ports |
-| Function units | 2 ALU, 1 branch, 1 mul, 1 mem |
+| Function units | 2 ALU, 1 branch, 1 mul, 1 div, 1 mem |
 | Latencies | ALU 1c, load-use 2c, mul 3c (pipelined), div 20c (blocking) |
 | gshare | 12-bit GHR, 4096-entry PHT of 2-bit counters |
 | BTB | 512 entries, 4-way, PC-tagged, LRU |
@@ -342,25 +342,29 @@ Beyond ISA correctness, targeted tests assert:
 
 ### 9.2 IPC by width
 
+Measured with `make examples && build/oooc --hex examples/NAME.hex --base 0x1000 --ipc-table`. The 4-wide column is 4-wide with ROB=128, PRF=160, IQ=32, 4 ALUs and 4 CDBs; the last column is the default machine with ROB=4 and IQ=2.
+
 | Workload | 1-wide | 2-wide | 4-wide | ROB=4, IQ=2 |
 |---|---|---|---|---|
-| sieve | 0.88 | 1.43 | 2.03 | 0.86 |
-| matmul | 0.90 | 1.77 | 3.49 | 0.70 |
-| bubble_sort | 0.87 | 1.44 | 1.86 | 0.83 |
-| fib (recursive) | 0.97 | 1.65 | 2.54 | 0.90 |
-| crc32 | 0.66 | 0.88 | 0.98 | 0.69 |
+| sieve | 0.87 | 1.37 | 1.78 | 0.87 |
+| matmul | 0.86 | 1.50 | 2.59 | 0.70 |
+| bubble_sort | 0.73 | 1.04 | 1.18 | 0.72 |
+| fib (recursive) | 0.95 | 1.70 | 1.68 | 0.82 |
+| crc32 | 0.81 | 1.25 | 1.43 | 0.86 |
 
-`matmul` has the ILP to use a 4-wide machine; `crc32` is a dependent bit-serial loop with a ~38% mispredict rate and barely moves. A 4-entry ROB erases the benefit of width entirely.
+`matmul` has the ILP to use a 4-wide machine and is the only workload that keeps scaling; everything else runs into a single-ported resource first. `fib` stops at 2-wide because it is memory-port bound — its stack traffic wants one memory unit per cycle and there is one. `bubble_sort` and `crc32` are dependent loops whose critical path width cannot shorten. A 4-entry ROB erases the benefit of width entirely, and on `crc32` it is *faster* than the 1-wide machine, because a window that small cannot run far enough down a wrong path to waste much.
 
-### 9.3 History-length sensitivity (`fib`)
+### 9.3 History-length sensitivity
 
-Strongly correlated call/return branches, MPKI:
+MPKI at the default machine with `--ghr N`:
 
 | GHR bits | 0 | 4 | 8 | 12 |
 |---|---|---|---|---|
-| MPKI | 52.7 | 20.2 | 8.9 | 5.1 |
+| fib | 33.0 | 14.7 | 9.8 | 10.0 |
+| sieve | 23.3 | 30.5 | 27.2 | 34.4 |
+| crc32 | 66.8 | 73.0 | 71.2 | 71.6 |
 
-The short benchmarks (`sieve`, `crc32`) go the opposite way — a 12-bit history spreads a few thousand dynamic branches across 4096 PHT entries that never warm up.
+`fib`'s call/return branches are strongly correlated, and eight bits of history capture almost all of it. The short benchmarks go the opposite way — history spreads a few hundred dynamic branches across 4096 PHT entries that never warm up, so `sieve` is best served by no history at all. `crc32` is indifferent for a different reason: its inner branch tests one bit of a CRC, and no amount of context predicts that.
 
 ### 9.4 Reported statistics
 

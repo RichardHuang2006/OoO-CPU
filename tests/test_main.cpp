@@ -698,6 +698,19 @@ SECTION("cli") {
     { CliOpts o; REQUIRE(parse({"oooc", "--regs"},  o) == 0); REQUIRE(o.print_regs); }
     { CliOpts o; REQUIRE(parse({"oooc", "--trace"}, o) == 0); REQUIRE(o.trace); }
     { CliOpts o; REQUIRE(parse({"oooc", "--help"},  o) == 0); REQUIRE(o.show_help); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--ref"},   o) == 0); REQUIRE(o.use_ref); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--stats"}, o) == 0); REQUIRE(o.show_stats); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--ipc-table"}, o) == 0); REQUIRE(o.ipc_table); }
+
+    // The pipeline is what runs unless the interpreter is asked for by name.
+    { CliOpts o; REQUIRE(parse({"oooc", "prog.elf"}, o) == 0); REQUIRE(!o.use_ref); }
+
+    // Budgets, in both units.
+    { CliOpts o; REQUIRE(parse({"oooc", "--max-insts", "500"}, o) == 0);
+      REQUIRE(o.max_insts == 500); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--max-cycles=900"}, o) == 0);
+      REQUIRE(o.max_cycles == 900); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--max-cycles", "nope"}, o) != 0); }
 
     // Base with hex-prefixed and decimal values.
     { CliOpts o; REQUIRE(parse({"oooc", "--base", "0x1000"}, o) == 0);
@@ -4139,6 +4152,102 @@ SECTION("properties") {
         REQUIRE(cpu.run(200000));
         REQUIRE(cpu.halted());
         REQUIRE(cpu.exit_code() == props::crc32_table_driven(bytes));
+    }
+}
+
+
+// ---------------------------------------------------- @section("examples") ---
+namespace extest {
+
+// The four machines the CLI's --ipc-table prints, so the numbers in the
+// documentation and the numbers asserted here come from the same place.
+inline Config narrow()  { Config c; c.width = 1; return c; }
+inline Config wide() {
+    Config c;
+    c.width = 4; c.rob_size = 128; c.prf_size = 160; c.iq_size = 32;
+    c.num_alu = 4; c.num_cdb = 4;
+    return c;
+}
+inline Config tiny() {
+    Config c;
+    c.rob_size = 4; c.prf_size = 40; c.iq_size = 2;
+    return c;
+}
+
+// Loads a generated example the way the CLI would, and hands back exactly the
+// words the file held — the loader places them in memory, and the file's own
+// data lines say how many there are.
+inline std::optional<std::vector<uint32_t>> read_hex(const std::string& path) {
+    std::ifstream count_pass(path);
+    if (!count_pass) return std::nullopt;
+    std::size_t n = 0;
+    for (std::string line; std::getline(count_pass, line); ) {
+        if (line.find_first_of("#/") == 0) continue;
+        if (line.find_first_not_of(" \t\r") != std::string::npos) ++n;
+    }
+
+    std::ifstream in(path);
+    Memory m;
+    const LoadResult r = load_hex(m, in, wl::TEXT);
+    std::vector<uint32_t> words;
+    for (std::size_t i = 0; i < n; ++i) {
+        words.push_back(m.load_u32(r.entry + static_cast<uint32_t>(i * 4)));
+    }
+    return words;
+}
+
+inline double ipc_of(const std::vector<uint32_t>& words, const Config& cfg) {
+    Memory m = cputest::image(words);
+    Cpu cpu(m, cfg, wl::TEXT);
+    REQUIRE(cpu.run(2'000'000));
+    return cpu.stats().ipc();
+}
+
+}  // namespace extest
+
+SECTION("examples") {
+    using namespace extest;
+
+    // ---- What the generator wrote is what the corpus assembled ------------
+    // The examples are the shipped copy of programs the rest of the suite
+    // validates; if they can drift, running them proves nothing.
+    for (const char* name : {"sieve", "matmul", "bubble_sort", "fib", "crc32"}) {
+        const std::string path = std::string("examples/") + name + ".hex";
+        const std::optional<std::vector<uint32_t>> loaded = read_hex(path);
+        REQUIRE_MSG(loaded.has_value(), "    missing " + path + " (run: make examples)");
+
+        const wl::Workload& w = stattest::named(name);
+        REQUIRE(loaded->size() == w.words.size());
+        for (std::size_t i = 0; i < w.words.size(); ++i) {
+            REQUIRE_MSG((*loaded)[i] == w.words[i],
+                        std::string("    ") + name + ".hex differs from the corpus");
+        }
+
+        Memory m = cputest::image(*loaded);
+        Cpu cpu(m, Config{}, wl::TEXT);
+        REQUIRE(cpu.run(2'000'000));
+        REQUIRE(cpu.halted());
+        REQUIRE(cpu.exit_code() == *w.expect_exit);
+    }
+
+    // ---- The IPC table says what the documentation says --------------------
+    {
+        const std::vector<uint32_t>& matmul = stattest::named("matmul").words;
+        const std::vector<uint32_t>& fib    = stattest::named("fib").words;
+        const std::vector<uint32_t>& crc    = stattest::named("crc32").words;
+
+        // matmul has independent work to find, so width pays twice over.
+        REQUIRE(ipc_of(matmul, Config{}) > 1.6 * ipc_of(matmul, narrow()));
+        REQUIRE(ipc_of(matmul, wide())   > 1.5 * ipc_of(matmul, Config{}));
+
+        // fib runs out of memory ports long before it runs out of width.
+        REQUIRE(ipc_of(fib, wide()) < 1.1 * ipc_of(fib, Config{}));
+
+        // crc32 is a dependent bit-serial loop; width barely helps it.
+        REQUIRE(ipc_of(crc, wide()) < 1.3 * ipc_of(crc, Config{}));
+
+        // A four-entry window erases the benefit of width entirely.
+        REQUIRE(ipc_of(matmul, tiny()) < ipc_of(matmul, narrow()));
     }
 }
 
