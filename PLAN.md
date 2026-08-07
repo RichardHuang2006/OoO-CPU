@@ -138,6 +138,7 @@ Mini-CPU/
 ├── tests/
 │   ├── asm.h                   2.1
 │   ├── ref.h                   2.2
+│   ├── workloads.h             2.3, shared with tools/
 │   └── test_main.cpp           2.3 + one @section per later step
 └── tools/
     └── gen_examples.cpp        8.4
