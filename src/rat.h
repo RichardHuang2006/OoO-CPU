@@ -38,6 +38,10 @@ public:
     // The whole array, for tests and for anything that walks all 32 slots.
     const std::array<PhysReg, ARCH_REGS>& mapping() const { return rat_; }
 
+    // Adopt a mapping wholesale. Squashing everything in flight restores the
+    // committed one this way, without going through a checkpoint.
+    void adopt(const std::array<PhysReg, ARCH_REGS>& m) { rat_ = m; }
+
     uint32_t num_checkpoints()      const { return num_checkpoints_; }
     uint32_t num_free_checkpoints() const {
         return static_cast<uint32_t>(free_slots_.size());

@@ -2216,9 +2216,10 @@ SECTION("cpu_tick") {
     }
 
     // ---- One addi, cycle by cycle -----------------------------------------
-    // Fetched in cycle 1, decoded in 2, executed in 3, written back in 4,
-    // retired in 5. Writeback and commit are separate stages, so the register
-    // write lands one cycle before the retirement.
+    // Fetch, decode, rename, dispatch, issue, writeback, commit — one cycle
+    // each. The value exists in the physical register file after writeback,
+    // but reading a0 only follows the committed mapping, so it appears at
+    // commit and not a cycle earlier.
     {
         Assembler p;
         p.addi(a0, zero, 42);
@@ -2226,6 +2227,7 @@ SECTION("cpu_tick") {
         p.ecall();
         Memory m = cputest::image(p.assemble());
         Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_rename(true);
 
         cpu.tick();                                   // cycle 1: Fetch
         REQUIRE(!cpu.idle());
@@ -2233,16 +2235,32 @@ SECTION("cpu_tick") {
         REQUIRE(cpu.fetch_pc() == wl::TEXT + 4);
 
         cpu.tick();                                   // cycle 2: Decode
-        cpu.tick();                                   // cycle 3: Execute
-        REQUIRE(cpu.reg(a0) == 0);                    // nothing written yet
-        REQUIRE(cpu.retired() == 0);
+        REQUIRE(cpu.rename_log().empty());
 
-        cpu.tick();                                   // cycle 4: Writeback
-        REQUIRE(cpu.reg(a0) == 42);
-        REQUIRE(cpu.retired() == 0);                  // written, not yet retired
+        cpu.tick();                                   // cycle 3: Rename
+        REQUIRE(cpu.rename_log().size() == 1);
+        const PhysReg dest = cpu.rename_log()[0].dest;
+        REQUIRE(dest >= 32);                          // off the free list
+        REQUIRE(!cpu.prf().is_ready(dest));           // owes a value
+
+        cpu.tick();                                   // cycle 4: Dispatch
+        REQUIRE(cpu.iq().size() == 1);
+
+        cpu.tick();                                   // cycle 5: Issue
+        REQUIRE(cpu.iq().size() == 1);                // the addi left, li took its place
+        REQUIRE(cpu.iq().entries()[0].seq == 1);
+        REQUIRE(!cpu.prf().is_ready(dest));           // still in the unit
+
+        cpu.tick();                                   // cycle 6: Writeback
+        REQUIRE(cpu.prf().is_ready(dest));
+        REQUIRE(cpu.prf().read(dest) == 42);
+        REQUIRE(cpu.reg(a0) == 0);                    // not architectural yet
+        REQUIRE(cpu.retired() == 0);
         REQUIRE(cpu.arch_pc() == wl::TEXT);           // commit has not moved it
 
-        cpu.tick();                                   // cycle 5: Commit
+        cpu.tick();                                   // cycle 7: Commit
+        REQUIRE(cpu.reg(a0) == 42);
+        REQUIRE(cpu.committed_map(a0) == dest);
         REQUIRE(cpu.retired() == 1);
         REQUIRE(cpu.arch_pc() == wl::TEXT + 4);
         REQUIRE(cpu.commit_in_order());
@@ -2250,7 +2268,7 @@ SECTION("cpu_tick") {
     }
 
     // ---- Steady state: one instruction per cycle --------------------------
-    // With no stalls, N instructions retire in N + 4 cycles; the pipeline
+    // With no stalls, N instructions retire in N + 6 cycles; the pipeline
     // fill is the only overhead.
     {
         Assembler p;
@@ -2265,7 +2283,7 @@ SECTION("cpu_tick") {
         REQUIRE(cpu.halted());
         REQUIRE(!cpu.trapped());
         REQUIRE(cpu.retired() == 103);
-        REQUIRE(cpu.cycle()   == cpu.retired() + 4);
+        REQUIRE(cpu.cycle()   == cpu.retired() + 6);
         REQUIRE(cpu.commit_in_order());
 
         // 100 nops changed no architectural state.
@@ -2295,7 +2313,7 @@ SECTION("cpu_tick") {
         REQUIRE(!cpu.trapped());
         REQUIRE(cpu.exit_code() == 42);
         REQUIRE(cpu.retired() == 3);
-        REQUIRE(cpu.cycle()   == 7);
+        REQUIRE(cpu.cycle()   == 9);
         REQUIRE(cpu.idle());                          // the squash emptied the latches
     }
 
@@ -2309,7 +2327,7 @@ SECTION("cpu_tick") {
         REQUIRE(!cpu.halted());
         REQUIRE(cpu.trap_cause() == TrapCause::ILLEGAL);
         REQUIRE(cpu.retired() == 1);
-        REQUIRE(cpu.cycle()   == 5);
+        REQUIRE(cpu.cycle()   == 7);
 
         // Ticking a finished machine is a no-op.
         const uint64_t cycle = cpu.cycle();
@@ -2373,7 +2391,7 @@ SECTION("cpu_tick") {
             REQUIRE_MSG(r.ok, r.detail);
 
             const diff::Outcome o = cputest::run_cpu(*alu_wl, cfg);
-            REQUIRE(o.cycles == o.retired + 4);
+            REQUIRE(o.cycles == o.retired + 6);
         }
     }
 }
@@ -2415,7 +2433,6 @@ SECTION("frontend") {
         // Program order, no gaps, no repeats: 20 addis plus li + ecall.
         REQUIRE_MSG(log.size() == 22, tag + "decoded " + std::to_string(log.size()));
         for (std::size_t i = 0; i < log.size(); ++i) {
-            REQUIRE_MSG(log[i].seq == i, tag + "seq out of order at " + std::to_string(i));
             REQUIRE_MSG(log[i].pc == wl::TEXT + 4 * static_cast<uint32_t>(i),
                         tag + "pc out of order at " + std::to_string(i));
         }
@@ -2438,10 +2455,11 @@ SECTION("frontend") {
                     tag + "decode took " + std::to_string(span) + " cycles");
     }
 
-    // ---- Fetch runs ahead of decode, then back-pressures ------------------
-    // A 20-cycle divide jams issue, so the dispatch queue fills, then decode
-    // stops, then the fetch queue fills, and only then does fetch stop. Every
-    // stage stalls because its consumer did, not on a timer.
+    // ---- Back-pressure travels up one stage at a time ---------------------
+    // Twenty addis all waiting on one 20-cycle divide cannot leave the issue
+    // queue, so it fills, then dispatch stops and the rename queue fills, then
+    // the decode queue, then the fetch queue, and only then does fetch stop.
+    // Every stage stalls because its consumer did, not on a timer.
     {
         Config cfg;
         cfg.width = 1;
@@ -2449,33 +2467,35 @@ SECTION("frontend") {
         p.li(t0, 1000);
         p.li(t1, 3);
         p.div_(t2, t0, t1);            // 20 cycles, blocking
-        p.add(t3, t2, t2);             // waits on the divide
-        for (int i = 0; i < 10; ++i) p.nop();
+        for (int i = 0; i < 20; ++i) p.addi(t3, t2, 1);   // every one waits on it
         p.li(a7, 93);
         p.ecall();
         Memory m = cputest::image(p.assemble());
         Cpu cpu(m, cfg, wl::TEXT);
 
-        bool saw_full_dispatch = false;
-        bool saw_full_fetch    = false;
+        bool saw_full_iq = false, saw_full_rename = false;
+        bool saw_full_decode = false, saw_full_fetch = false;
         for (int i = 0; i < 40 && !cpu.done(); ++i) {
             cpu.tick();
-            REQUIRE(cpu.dispatch_queue() <= cpu.dispatch_queue_capacity());
-            REQUIRE(cpu.fetch_queue()    <= cpu.fetch_queue_capacity());
-            if (cpu.dispatch_queue() == cpu.dispatch_queue_capacity()) {
-                saw_full_dispatch = true;
-                // Decode cannot have drained into a full queue, so the fetch
-                // queue is what absorbs the next bundles.
-                if (cpu.fetch_queue() == cpu.fetch_queue_capacity()) saw_full_fetch = true;
-            }
+            REQUIRE(cpu.iq().size()      <= cpu.iq().capacity());
+            REQUIRE(cpu.rename_queue()   <= cpu.queue_capacity());
+            REQUIRE(cpu.decode_queue()   <= cpu.queue_capacity());
+            REQUIRE(cpu.fetch_queue()    <= cpu.queue_capacity());
+            if (cpu.iq().full())                              saw_full_iq = true;
+            if (cpu.rename_queue() == cpu.queue_capacity())   saw_full_rename = true;
+            if (cpu.decode_queue() == cpu.queue_capacity())   saw_full_decode = true;
+            if (cpu.fetch_queue()  == cpu.queue_capacity())   saw_full_fetch = true;
         }
-        REQUIRE(saw_full_dispatch);
+        REQUIRE(saw_full_iq);
+        REQUIRE(saw_full_rename);
+        REQUIRE(saw_full_decode);
         REQUIRE(saw_full_fetch);
+        REQUIRE(cpu.stats().stall_count(Stall::IQ_FULL) > 0);
 
         // Back-pressure only stalls; it never drops or duplicates work.
         REQUIRE(cpu.run(2000));
         REQUIRE(cpu.halted());
-        REQUIRE(cpu.retired() == 16);
+        REQUIRE(cpu.retired() == 25);
         REQUIRE(cpu.commit_in_order());
     }
 
@@ -2503,10 +2523,11 @@ SECTION("frontend") {
         REQUIRE(cpu.decode_log().size() == 4);         // jal, li, li, ecall
     }
 
-    // ---- A taken branch costs one fetch bubble ----------------------------
-    // Decode stalls the front end in the cycle it sees the jump; execute
-    // redirects the PC and, running earlier in the same cycle than fetch,
-    // lets fetch resume from the target immediately.
+    // ---- A taken branch costs the whole front end ------------------------
+    // Decode stalls fetch in the cycle it sees the jump and the target is not
+    // known until the jump issues three stages later. Issue runs before fetch
+    // in the same cycle, so fetch resumes the moment the target exists — and
+    // still loses three cycles. Removing them is what the predictor is for.
     {
         Config cfg;
         cfg.width = 1;
@@ -2522,37 +2543,15 @@ SECTION("frontend") {
 
         const std::vector<Cpu::DecodeRecord>& log = cpu.decode_log();
         REQUIRE(log.size() == 3);
-        REQUIRE(log[1].cycle == log[0].cycle + 2);     // one bubble after the jump
+        REQUIRE(log[1].cycle == log[0].cycle + 4);     // decode, rename, dispatch, issue
         REQUIRE(log[2].cycle == log[1].cycle + 1);     // and none after that
     }
 }
 
 
-// --------------------------------------------- @section("execute_inorder") ---
-SECTION("execute_inorder") {
+// ------------------------------------------------- @section("execute_fu") ---
+SECTION("execute_fu") {
     using namespace asmc;
-
-    // ---- Dependent ALU ops issue back to back -----------------------------
-    // Writeback runs before execute in the same cycle, so a result frees its
-    // register in time for the consumer to issue with no bubble between them.
-    {
-        Config cfg;
-        cfg.width = 1;
-        Assembler p;
-        p.li(t0, 0);
-        for (int i = 0; i < 200; ++i) p.addi(t0, t0, 1);
-        p.mv(a0, t0);
-        p.li(a7, 93);
-        p.ecall();
-        Memory m = cputest::image(p.assemble());
-        Cpu cpu(m, cfg, wl::TEXT);
-        REQUIRE(cpu.run(2000));
-
-        REQUIRE(cpu.exit_code() == 200);
-        REQUIRE(cpu.retired() == 204);
-        REQUIRE(cpu.cycle() == cpu.retired() + 4);   // no stall anywhere
-        REQUIRE(cpu.cycle() < 260);
-    }
 
     // ---- Load-use latency tracks mem_latency exactly ----------------------
     {
@@ -2603,9 +2602,10 @@ SECTION("execute_inorder") {
         REQUIRE(cycles_for(3, true)  == cycles_for(1, true) + 2 * def.div_latency);
     }
 
-    // ---- Results reach the register file in issue order -------------------
-    // The add finishes 19 cycles before the divide it sits behind, and still
-    // may not write first — the property that makes WAW safe unrenamed.
+    // ---- A younger op overtakes a divide, and commit still does not -------
+    // The add is nineteen cycles quicker than the divide it sits behind and
+    // writes its physical register first. Renaming is what makes that safe;
+    // in-order commit is what keeps it invisible from the outside.
     {
         Config cfg;
         cfg.width = 1;
@@ -2618,15 +2618,28 @@ SECTION("execute_inorder") {
         p.ecall();
         Memory m = cputest::image(p.assemble());
         Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_issue(true);
 
-        bool add_wrote_first = false;
+        bool add_visible_first = false;
         while (!cpu.done() && cpu.cycle() < 200) {
             cpu.tick();
-            if (cpu.reg(t3) != 0 && cpu.reg(t2) == 0) add_wrote_first = true;
+            if (cpu.reg(t3) != 0 && cpu.reg(t2) == 0) add_visible_first = true;
         }
         REQUIRE(cpu.reg(t2) == 14);
         REQUIRE(cpu.reg(t3) == 8);
-        REQUIRE(!add_wrote_first);
+        REQUIRE(!add_visible_first);                 // commit is still in order
+        REQUIRE(cpu.commit_in_order());
+
+        // The divide is seq 2 and the add seq 3, and the younger one finishes
+        // eighteen cycles earlier.
+        uint64_t div_wb = 0, add_wb = 0;
+        for (const Cpu::IssueRecord& r : cpu.issue_log()) {
+            if (r.seq == 2) div_wb = r.wb_cycle;
+            if (r.seq == 3) add_wb = r.wb_cycle;
+        }
+        REQUIRE(div_wb > 0);
+        REQUIRE(add_wb > 0);
+        REQUIRE(add_wb < div_wb);
     }
 
     // ---- The whole corpus, against the interpreter, on every config -------
@@ -2664,8 +2677,8 @@ SECTION("execute_inorder") {
 }
 
 
-// ---------------------------------------------- @section("commit_inorder") ---
-SECTION("commit_inorder") {
+// -------------------------------------------------- @section("commit_ooo") ---
+SECTION("commit_ooo") {
     using namespace asmc;
     Config cfg;
     cfg.width = 1;
@@ -2687,7 +2700,7 @@ SECTION("commit_inorder") {
             if (wrote_at == 0 && m.load_u32(0x400) != 0) wrote_at = cpu.cycle();
         }
         REQUIRE(m.load_u32(0x400) == 0xABu);
-        REQUIRE(wrote_at == 7);                      // its commit cycle, not its 5th
+        REQUIRE(wrote_at == 9);                      // its commit cycle, not its 7th
         REQUIRE(cpu.retired() == 5);
     }
 
@@ -2754,6 +2767,644 @@ SECTION("commit_inorder") {
                             std::to_string(ref.retired));
             }
         }
+    }
+}
+
+
+// ------------------------------------------------------ @section("rename") ---
+SECTION("rename") {
+    using namespace asmc;
+
+    // ---- Reusing an architectural register allocates a new physical one ---
+    // Three writes to t0 with nothing in between: unrenamed they would be a
+    // WAW chain, renamed they are three unrelated registers.
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.addi(t0, zero, 1);
+        p.addi(t0, zero, 2);
+        p.addi(t0, zero, 3);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_rename(true);
+        REQUIRE(cpu.run(1000));
+
+        const std::vector<Cpu::RenameRecord>& log = cpu.rename_log();
+        REQUIRE(log.size() == 5);
+
+        std::vector<PhysReg> dests;
+        for (std::size_t i = 0; i < 3; ++i) {
+            REQUIRE(log[i].rd == t0);
+            REQUIRE(log[i].dest != INVALID_PHYSREG);
+            dests.push_back(log[i].dest);
+        }
+        std::sort(dests.begin(), dests.end());
+        REQUIRE(std::adjacent_find(dests.begin(), dests.end()) == dests.end());
+
+        // Each one displaces the previous mapping, which is what its ROB entry
+        // carries to commit.
+        REQUIRE(log[1].stale == log[0].dest);
+        REQUIRE(log[2].stale == log[1].dest);
+        REQUIRE(cpu.reg(t0) == 3);
+    }
+
+    // ---- A source reads the physical register its producer allocated ------
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.addi(t0, zero, 1);
+        p.addi(t1, t0, 1);
+        p.addi(t2, t1, 1);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_rename(true);
+        REQUIRE(cpu.run(1000));
+
+        const std::vector<Cpu::RenameRecord>& log = cpu.rename_log();
+        REQUIRE(log[1].src1 == log[0].dest);
+        REQUIRE(log[2].src1 == log[1].dest);
+        REQUIRE(cpu.reg(t2) == 3);
+    }
+
+    // ---- Writing x0 allocates nothing -------------------------------------
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        for (int i = 0; i < 8; ++i) p.addi(zero, zero, 1);   // discarded writes
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_rename(true);
+
+        const uint32_t before = cpu.free_list().num_free();
+        REQUIRE(cpu.run(1000));
+
+        uint32_t allocated = 0;
+        for (const Cpu::RenameRecord& r : cpu.rename_log()) {
+            if (r.rd == static_cast<ArchReg>(zero) || r.rd == INVALID_ARCHREG) {
+                REQUIRE(r.dest == INVALID_PHYSREG);
+            } else {
+                ++allocated;
+            }
+        }
+        REQUIRE(allocated == 1);                    // only li a7
+        REQUIRE(cpu.free_list().num_free() == before);
+        REQUIRE(cpu.reg(zero) == 0);
+        REQUIRE(cpu.rat().map(0) == 0);
+    }
+
+    // ---- Rename stalls on an empty free list, and still finishes ----------
+    {
+        Config cfg;
+        cfg.width    = 1;
+        cfg.rob_size = 32;
+        cfg.prf_size = 34;                          // two spare registers
+        REQUIRE(cfg.prf_can_starve());
+        Memory m = cputest::image(fetest::addi_chain(40));
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(5000));
+
+        REQUIRE(cpu.halted());
+        REQUIRE(cpu.retired() == 42);
+        REQUIRE(cpu.stats().stall_count(Stall::PHYSREG) > 0);
+    }
+
+    // ---- Rename stalls on a full ROB --------------------------------------
+    {
+        Config cfg;
+        cfg.width    = 1;
+        cfg.rob_size = 2;   // shallower than the rename-to-commit distance
+        cfg.prf_size = 64;
+        Memory m = cputest::image(fetest::addi_chain(40));
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(5000));
+
+        REQUIRE(cpu.halted());
+        REQUIRE(cpu.retired() == 42);
+        REQUIRE(cpu.stats().stall_count(Stall::ROB_FULL) > 0);
+    }
+}
+
+
+// ----------------------------------------------------- @section("reclaim") ---
+namespace rectest {
+
+// Every physical register is in exactly one of three places: the free list,
+// the current RAT, or an in-flight ROB entry as the mapping it displaced.
+// Nothing may be lost and nothing may be counted twice.
+inline bool conserved(const Cpu& cpu) {
+    const uint32_t size = cpu.config().prf_size;
+    std::vector<bool> seen(size, false);
+    uint32_t total = 0;
+
+    auto take = [&](PhysReg p) {
+        if (p == INVALID_PHYSREG || p >= size) return true;
+        if (seen[p]) return false;                  // two owners is a leak
+        seen[p] = true;
+        ++total;
+        return true;
+    };
+
+    for (PhysReg p = 0; p < size; ++p) {
+        if (cpu.free_list().contains(p) && !take(p)) return false;
+    }
+    for (PhysReg p : cpu.rat().mapping()) {
+        if (!take(p)) return false;
+    }
+    for (uint32_t k = 0; k < cpu.rob().size(); ++k) {
+        if (!take(cpu.rob().nth_entry(k).stale_phys)) return false;
+    }
+    return total == size;
+}
+
+}  // namespace rectest
+
+SECTION("reclaim") {
+    using namespace asmc;
+
+    // ---- The count is conserved every single cycle ------------------------
+    {
+        Config cfg;
+        Assembler p;
+        p.li(t0, 0);
+        for (int i = 0; i < 30; ++i) {              // heavy destination reuse
+            p.addi(t0, t0, 1);
+            p.addi(t1, t0, 2);
+            p.addi(t0, t1, 3);
+        }
+        p.mv(a0, t0);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+
+        REQUIRE(rectest::conserved(cpu));
+        while (!cpu.done() && cpu.cycle() < 2000) {
+            cpu.tick();
+            REQUIRE(rectest::conserved(cpu));
+        }
+        REQUIRE(cpu.halted());
+        REQUIRE(cpu.exit_code() == 180);
+    }
+
+    // ---- The pool is whole again at exit, on every workload ---------------
+    // A register leaked on a squash or freed twice on commit shows up here as
+    // a count that no longer matches the empty machine.
+    {
+        Config cfg;
+        for (const wl::Workload& w : wl::corpus()) {
+            Memory m = cputest::image(w.words);
+            Cpu cpu(m, cfg, wl::TEXT);
+            REQUIRE_MSG(cpu.run(w.budget * 8 + 1000),
+                        std::string("    ") + w.name + " did not finish");
+            REQUIRE_MSG(cpu.free_list().num_free() == cfg.prf_size - 32,
+                        std::string("    ") + w.name + ": free list holds " +
+                        std::to_string(cpu.free_list().num_free()));
+            REQUIRE_MSG(rectest::conserved(cpu), std::string("    ") + w.name + " leaked");
+        }
+    }
+
+    // ---- WAR and WAW disappear: the reordered run matches the oracle ------
+    {
+        Config cfg;
+        diff::ScopedModel swap(&cputest::run_cpu);
+        for (const char* name : {"alu", "shift_edge", "mul_div", "sieve"}) {
+            for (const wl::Workload& w : wl::corpus()) {
+                if (w.name != name) continue;
+                const diff::Report r = diff::diff_run(w, cfg);
+                REQUIRE_MSG(r.ok, r.detail);
+            }
+        }
+    }
+}
+
+
+// ---------------------------------------------------------- @section("iq") ---
+namespace iqtest {
+
+inline IssueQueue::Entry entry(SeqNum seq, PhysReg dest, PhysReg s1, PhysReg s2,
+                               bool s1_ready = true, bool s2_ready = true,
+                               OpKind kind = OpKind::ALU) {
+    IssueQueue::Entry e;
+    e.seq        = seq;
+    e.rob        = seq;
+    e.kind       = kind;
+    e.dest       = dest;
+    e.src1       = s1;
+    e.src2       = s2;
+    e.src1_ready = s1_ready;
+    e.src2_ready = s2_ready;
+    return e;
+}
+
+}  // namespace iqtest
+
+SECTION("iq") {
+    using iqtest::entry;
+
+    // ---- A waiter joins the ready set the moment its tag is broadcast -----
+    {
+        IssueQueue iq(8);
+        REQUIRE(iq.empty());
+        REQUIRE(iq.capacity() == 8);
+
+        iq.insert(entry(0, 5, 1, 2));                     // produces p5
+        iq.insert(entry(1, 6, 5, 2, /*s1_ready=*/false)); // waits on p5
+        REQUIRE(iq.size() == 2);
+
+        std::vector<IssueQueue::Entry> ready = iq.select(8);
+        REQUIRE(ready.size() == 1);
+        REQUIRE(ready[0].seq == 0);
+
+        iq.wakeup(5);
+        ready = iq.select(8);
+        REQUIRE(ready.size() == 2);
+        REQUIRE(ready[1].seq == 1);
+
+        // A broadcast nobody is waiting on changes nothing.
+        iq.wakeup(99);
+        REQUIRE(iq.select(8).size() == 2);
+    }
+
+    // ---- Both operands have to arrive -------------------------------------
+    {
+        IssueQueue iq(8);
+        iq.insert(entry(0, 7, 5, 6, false, false));
+        REQUIRE(iq.select(8).empty());
+        iq.wakeup(5);
+        REQUIRE(iq.select(8).empty());
+        iq.wakeup(6);
+        REQUIRE(iq.select(8).size() == 1);
+    }
+
+    // ---- Select is oldest first and bounded by the limit ------------------
+    {
+        IssueQueue iq(8);
+        iq.insert(entry(10, 40, 1, 2));
+        iq.insert(entry(11, 41, 1, 2, false));            // not ready
+        iq.insert(entry(12, 42, 1, 2));
+        iq.insert(entry(13, 43, 1, 2));
+
+        const std::vector<IssueQueue::Entry> ready = iq.select(2);
+        REQUIRE(ready.size() == 2);
+        REQUIRE(ready[0].seq == 10);
+        REQUIRE(ready[1].seq == 12);                      // 11 was skipped, not blocking
+
+        const std::vector<IssueQueue::Entry> all = iq.select(8);
+        REQUIRE(all.size() == 3);
+        REQUIRE(all[2].seq == 13);
+    }
+
+    // ---- Erase removes exactly one entry, and full() is honest ------------
+    {
+        IssueQueue iq(3);
+        iq.insert(entry(0, 40, 1, 2));
+        iq.insert(entry(1, 41, 1, 2));
+        iq.insert(entry(2, 42, 1, 2));
+        REQUIRE(iq.full());
+
+        iq.erase(1);
+        REQUIRE(iq.size() == 2);
+        REQUIRE(!iq.full());
+        REQUIRE(iq.select(8)[0].seq == 0);
+        REQUIRE(iq.select(8)[1].seq == 2);
+
+        iq.erase(99);                                     // absent: no-op
+        REQUIRE(iq.size() == 2);
+    }
+
+    // ---- Recovery drops everything younger than the surviving branch ------
+    {
+        IssueQueue iq(8);
+        for (SeqNum s = 0; s < 6; ++s) iq.insert(entry(s, 40 + s, 1, 2));
+        iq.squash_after(2);
+        REQUIRE(iq.size() == 3);
+        for (const IssueQueue::Entry& e : iq.entries()) REQUIRE(e.seq <= 2);
+
+        iq.clear();
+        REQUIRE(iq.empty());
+    }
+}
+
+
+// ---------------------------------------------------- @section("dispatch") ---
+SECTION("dispatch") {
+    using namespace asmc;
+
+    // ---- Occupancy follows the trace one cycle at a time ------------------
+    // Four dependent addis behind a divide: dispatch fills the queue at one
+    // per cycle, and nothing leaves until the divide delivers.
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 100);
+        p.li(t1, 7);
+        p.div_(t2, t0, t1);
+        for (int i = 0; i < 4; ++i) p.addi(t3, t2, 1);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+
+        // Cycle 4 is when the first uop reaches the queue, and the two li's
+        // issue straight back out, so occupancy only starts climbing once the
+        // divide has taken its seat and the dependents pile up behind it.
+        uint32_t peak = 0;
+        for (int i = 0; i < 12; ++i) {
+            cpu.tick();
+            peak = std::max(peak, cpu.iq().size());
+        }
+        REQUIRE(peak >= 4);
+        REQUIRE(cpu.iq().size() <= cpu.iq().capacity());
+
+        REQUIRE(cpu.run(1000));
+        REQUIRE(cpu.halted());
+        REQUIRE(cpu.reg(t3) == 15);
+    }
+
+    // ---- A full queue stalls dispatch and is reported as such -------------
+    {
+        Config cfg;
+        cfg.width   = 1;
+        cfg.iq_size = 2;
+        Assembler p;
+        p.li(t0, 100);
+        p.li(t1, 7);
+        p.div_(t2, t0, t1);
+        for (int i = 0; i < 8; ++i) p.addi(t3, t2, 1);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(2000));
+
+        REQUIRE(cpu.halted());
+        REQUIRE(cpu.stats().stall_count(Stall::IQ_FULL) > 0);
+        REQUIRE(cpu.stats().dominant_stall() == Stall::IQ_FULL);
+        REQUIRE(cpu.reg(t3) == 15);
+    }
+
+    // ---- Ready bits are sampled from the register file on the way in ------
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 5);
+        p.li(t1, 6);
+        p.add(t2, t0, t1);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+
+        // The add dispatches in cycle 6, by which point li t0 has written back
+        // but li t1 has not, so it arrives with one operand outstanding.
+        for (int i = 0; i < 6; ++i) cpu.tick();
+        REQUIRE(cpu.iq().size() == 1);
+        const IssueQueue::Entry& e = cpu.iq().entries()[0];
+        REQUIRE(e.src1_ready);
+        REQUIRE(!e.src2_ready);
+
+        REQUIRE(cpu.run(1000));
+        REQUIRE(cpu.reg(t2) == 11);
+    }
+}
+
+
+// ------------------------------------------------------- @section("issue") ---
+SECTION("issue") {
+    using namespace asmc;
+
+    // ---- Independent work issues together -------------------------------
+    {
+        Config cfg;
+        cfg.width   = 2;
+        cfg.num_alu = 2;
+        cfg.num_cdb = 2;
+        Assembler p;
+        p.addi(t0, zero, 1);
+        p.addi(t1, zero, 2);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_issue(true);
+        REQUIRE(cpu.run(1000));
+
+        const std::vector<Cpu::IssueRecord>& log = cpu.issue_log();
+        REQUIRE(log.size() >= 2);
+        REQUIRE(log[0].seq == 0);
+        REQUIRE(log[1].seq == 1);
+        REQUIRE(log[0].cycle == log[1].cycle);       // same cycle, two units
+    }
+
+    // ---- One too many for the units, and the oldest go first --------------
+    // Three independent ALU ops with two units: two issue, the third waits a
+    // cycle, and the reason is recorded rather than lost.
+    {
+        Config cfg;
+        cfg.width   = 4;
+        cfg.num_alu = 2;
+        cfg.num_cdb = 4;
+        Assembler p;
+        p.addi(t0, zero, 1);
+        p.addi(t1, zero, 2);
+        p.addi(t2, zero, 3);
+        p.fence();                                   // needs no unit, so it is
+        p.li(a7, 93);                                // not a fourth contender
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_issue(true);
+        REQUIRE(cpu.run(1000));
+
+        // Looked up by sequence number, because the order they issued in is
+        // exactly what is under test.
+        std::vector<uint64_t> at(3, 0);
+        for (const Cpu::IssueRecord& r : cpu.issue_log()) {
+            if (r.seq < 3) at[r.seq] = r.cycle;
+        }
+        REQUIRE(at[0] > 0);
+        REQUIRE(at[1] == at[0]);
+        REQUIRE(at[2] == at[0] + 1);                 // deferred exactly one cycle
+        REQUIRE(cpu.stats().stall_count(Stall::ALU_PORT) == 1);
+    }
+
+    // ---- A blocked op only blocks itself ----------------------------------
+    // The multiply cannot go while its operand is missing; the independent
+    // addi behind it does not have to wait for it.
+    {
+        Config cfg;
+        cfg.width   = 2;
+        cfg.num_alu = 2;
+        Assembler p;
+        p.li(t0, 4);
+        p.li(t1, 100);
+        p.div_(t2, t1, t0);          // 20 cycles
+        p.mul(t3, t2, t2);           // waits on the divide
+        p.addi(t4, zero, 9);         // independent, younger
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_issue(true);
+        REQUIRE(cpu.run(1000));
+
+        uint64_t mul_cycle = 0, addi_cycle = 0;
+        for (const Cpu::IssueRecord& r : cpu.issue_log()) {
+            if (r.seq == 3) mul_cycle  = r.cycle;
+            if (r.seq == 4) addi_cycle = r.cycle;
+        }
+        REQUIRE(addi_cycle > 0);
+        REQUIRE(mul_cycle > addi_cycle);             // program order did not apply
+        REQUIRE(cpu.reg(t4) == 9);
+        REQUIRE(cpu.reg(t3) == 625);
+        REQUIRE(cpu.commit_in_order());
+    }
+}
+
+
+// ------------------------------------------------- @section("execute_ooo") ---
+SECTION("execute_ooo") {
+    using namespace asmc;
+
+    // ---- A result with nowhere to land does not issue ---------------------
+    // Two independent addis on a single writeback port would both finish next
+    // cycle. One books the port at issue; the other has to wait a cycle for
+    // its own, rather than piling up at writeback.
+    {
+        Config cfg;
+        cfg.width   = 2;
+        cfg.num_alu = 2;
+        cfg.num_cdb = 1;
+        Assembler p;
+        p.addi(t0, zero, 1);
+        p.addi(t1, zero, 2);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_issue(true);
+        REQUIRE(cpu.run(1000));
+
+        const std::vector<Cpu::IssueRecord>& log = cpu.issue_log();
+        REQUIRE(log.size() >= 2);
+        REQUIRE(log[1].cycle == log[0].cycle + 1);
+        REQUIRE(log[1].wb_cycle == log[0].wb_cycle + 1);
+        REQUIRE(cpu.stats().stall_count(Stall::CDB) >= 1);
+
+        // Two ports and the same program: no delay at all.
+        Config wide = cfg;
+        wide.num_cdb = 2;
+        Memory m2 = cputest::image(p.assemble());
+        Cpu cpu2(m2, wide, wl::TEXT);
+        cpu2.record_issue(true);
+        REQUIRE(cpu2.run(1000));
+        REQUIRE(cpu2.issue_log()[1].cycle == cpu2.issue_log()[0].cycle);
+        REQUIRE(cpu2.stats().stall_count(Stall::CDB) == 0);
+    }
+
+    // ---- Ops route to their own class of unit -----------------------------
+    // Saturating the multiplier does not slow the adds down, because they
+    // never contended for it.
+    {
+        Config cfg;
+        cfg.width   = 2;
+        cfg.num_alu = 2;
+        cfg.num_mul = 1;
+        cfg.num_cdb = 4;
+        Assembler p;
+        p.li(t0, 3);
+        p.li(t1, 4);
+        p.mul(t2, t0, t1);
+        p.addi(t3, t0, 1);
+        p.addi(t4, t1, 1);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_issue(true);
+        REQUIRE(cpu.run(1000));
+
+        uint64_t mul_cycle = 0, add_cycle = 0;
+        for (const Cpu::IssueRecord& r : cpu.issue_log()) {
+            if (r.seq == 2) mul_cycle = r.cycle;
+            if (r.seq == 3) add_cycle = r.cycle;
+        }
+        REQUIRE(mul_cycle == add_cycle);             // different units, one cycle
+        REQUIRE(cpu.reg(t2) == 12);
+        REQUIRE(cpu.reg(t3) == 4);
+        REQUIRE(cpu.reg(t4) == 5);
+    }
+}
+
+
+// -------------------------------------------------- @section("wakeup_fast") ---
+SECTION("wakeup_fast") {
+    using namespace asmc;
+
+    // ---- Dependent single-cycle ops issue back to back --------------------
+    // Writeback broadcasts the tag before select runs in the same cycle, so a
+    // 200-long dependence chain costs one cycle per link and not two. Without
+    // that path the same program takes about twice as long, which is what the
+    // bound is drawn to separate.
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 0);
+        for (int i = 0; i < 200; ++i) p.addi(t0, t0, 1);
+        p.mv(a0, t0);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        cpu.record_issue(true);
+        REQUIRE(cpu.run(2000));
+
+        REQUIRE(cpu.exit_code() == 200);
+        REQUIRE(cpu.retired() == 204);
+        REQUIRE(cpu.cycle() == cpu.retired() + 6);   // no stall anywhere
+        REQUIRE(cpu.cycle() < 260);
+
+        // Link by link: every consumer issues the cycle after its producer.
+        const std::vector<Cpu::IssueRecord>& log = cpu.issue_log();
+        for (std::size_t i = 2; i < 200; ++i) {
+            REQUIRE(log[i].cycle == log[i - 1].cycle + 1);
+        }
+    }
+
+    // ---- The chain is one cycle per link at every latency -----------------
+    // Slowing the ALU down moves the whole chain in lockstep, which is the
+    // shape a real dependence chain has and a bubble-per-link does not.
+    {
+        auto cycles_at = [](uint32_t alu_latency) {
+            Config cfg;
+            cfg.width       = 1;
+            cfg.alu_latency = alu_latency;
+            Assembler p;
+            p.li(t0, 0);
+            for (int i = 0; i < 20; ++i) p.addi(t0, t0, 1);
+            p.li(a7, 93);
+            p.ecall();
+            Memory m = cputest::image(p.assemble());
+            Cpu cpu(m, cfg, wl::TEXT);
+            cpu.run(2000);
+            return cpu.cycle();
+        };
+        // Twenty-one ops in the chain counting the li that starts it, so each
+        // extra cycle of latency costs twenty-one.
+        REQUIRE(cycles_at(2) == cycles_at(1) + 21);
+        REQUIRE(cycles_at(3) == cycles_at(1) + 42);
     }
 }
 

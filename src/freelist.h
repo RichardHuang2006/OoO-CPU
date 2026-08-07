@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -39,6 +40,11 @@ public:
     void free(PhysReg r) {
         if (r == 0 || r >= capacity_ || r == INVALID_PHYSREG) return;
         free_.push_back(r);
+    }
+
+    // Linear, but only tests ask — the pipeline never needs to look.
+    bool contains(PhysReg r) const {
+        return std::find(free_.begin(), free_.end(), r) != free_.end();
     }
 
     void reset() {
