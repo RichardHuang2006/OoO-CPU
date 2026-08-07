@@ -20,6 +20,7 @@ struct RobEntry {
     bool     is_store     = false;             // its store queue entry drains at commit
     bool     complete     = false;             // set by writeback; commit waits on it
     bool     mispredicted = false;
+    CheckpointId ckpt     = INVALID_CHECKPOINT;   // snapshot a branch recovers from
 };
 
 // Circular buffer of in-flight instructions, oldest at the head. Entries are

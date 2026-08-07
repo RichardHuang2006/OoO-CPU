@@ -35,6 +35,21 @@ uint32_t extend_load(Op op, uint32_t v) {
     }
 }
 
+// x1 and x5 are the link registers, which is how the ISA tells the predictor
+// a jump is really a call or a return.
+bool is_link(ArchReg r) { return r == 1 || r == 5; }
+
+BranchKind kind_of(const Decoded& d) {
+    if (!d.is_branch) return BranchKind::NONE;
+    if (d.op == Op::JAL)  return is_link(d.rd) ? BranchKind::CALL : BranchKind::JUMP;
+    if (d.op == Op::JALR) {
+        if (is_link(d.rd))  return BranchKind::CALL;
+        if (is_link(d.rs1)) return BranchKind::RETURN;
+        return BranchKind::JUMP;
+    }
+    return BranchKind::CONDITIONAL;
+}
+
 }  // namespace
 
 Cpu::Cpu(Memory& mem, const Config& cfg, uint32_t entry_pc)
@@ -46,6 +61,8 @@ Cpu::Cpu(Memory& mem, const Config& cfg, uint32_t entry_pc)
       rat_(cfg),
       iq_(cfg),
       lsq_(cfg),
+      bpred_(cfg),
+      ckpt_fe_(cfg.num_checkpoints),
       inflight_(cfg.rob_size),
       pc_(entry_pc),
       arch_pc_(entry_pc),
@@ -97,6 +114,15 @@ bool Cpu::run(uint64_t max_cycles) {
 }
 
 // ---------------------------------------------------------------- fetch ---
+// Every PC is offered to the predictor, which answers from the target cache
+// alone — a PC it has never committed a taken branch for falls through, which
+// is exactly what hardware does and the reason a cold branch always costs a
+// recovery.
+//
+// The history and return stack move here, speculatively, because the very next
+// prediction depends on them. What the checkpoint keeps is the history from
+// before this branch's own shift and the return stack from after its own push
+// or pop, which is precisely the state recovery has to get back to.
 void Cpu::fetch() {
     if (fetch_stalled_) return;
 
@@ -104,9 +130,22 @@ void Cpu::fetch() {
         Uop u;
         u.pc  = pc_;
         u.raw = mem_.load_u32(pc_);
-        pc_ += 4;
+
+        const uint32_t ghr_before = bpred_.ghr();
+        const BranchPredictor::Prediction pr = bpred_.predict(pc_);
+        u.pred_taken  = pr.taken;
+        u.pred_target = pr.target;
+        u.btb_hit     = pr.btb_hit;
+        u.from_ras    = pr.from_ras;
+        u.pht_index   = pr.pht_index;
+        u.fe_snap     = {ghr_before, bpred_.ras()};
+
+        pc_ = pr.taken ? pr.target : pc_ + 4;
         fetch_q_.push_back(u);
         ++stats_.fetched;
+
+        // One redirect per cycle: the rest of this bundle lives somewhere else.
+        if (pr.taken) break;
     }
 }
 
@@ -120,16 +159,16 @@ void Cpu::decode_stage() {
         fetch_q_.pop_front();
         u.dec     = decode(u.raw);
         u.next_pc = u.pc + 4;
+        u.bkind   = kind_of(u.dec);
         if (u.dec.op == Op::INVALID) u.trap = TrapCause::ILLEGAL;
 
         decode_q_.push_back(u);
         ++stats_.decoded;
         if (record_decode_) decode_log_.push_back({cycle_, u.pc, u.raw});
 
-        // Nothing younger than a control transfer or a trap may be fetched:
-        // the branch target is unknown until it executes, and letting a younger
-        // write land before an ecall reads a7 would corrupt the syscall.
-        if (u.dec.is_branch || u.dec.kind == OpKind::TRAP) {
+        // Nothing past a trap is worth fetching: it either never runs or is
+        // squashed when the trap commits.
+        if (u.dec.kind == OpKind::TRAP) {
             fetch_q_.clear();
             fetch_stalled_ = true;
             break;
@@ -152,6 +191,13 @@ void Cpu::rename() {
         Uop u = decode_q_.front();
         const bool needs_reg = u.dec.writes_rd;   // already false for rd == x0
 
+        // A branch that cannot be checkpointed cannot be recovered from, so it
+        // waits for a slot rather than going unprotected.
+        if (u.dec.is_branch && rat_.num_free_checkpoints() == 0) {
+            stats_.stall(Stall::CHECKPOINT);
+            break;
+        }
+
         PhysReg dest = INVALID_PHYSREG;
         if (needs_reg) {
             const std::optional<PhysReg> got = free_list_.alloc();
@@ -169,6 +215,13 @@ void Cpu::rename() {
             prf_.mark_pending(dest);
         }
 
+        // Snapshotted after its own destination is mapped, because the branch
+        // itself survives recovery and its result must survive with it.
+        if (u.dec.is_branch) {
+            u.ckpt = *rat_.alloc_checkpoint();
+            ckpt_fe_[u.ckpt] = u.fe_snap;
+        }
+
         RobEntry e;
         e.pc         = u.pc;
         e.next_pc    = u.next_pc;
@@ -177,6 +230,7 @@ void Cpu::rename() {
         e.stale_phys = u.stale;
         e.is_branch  = u.dec.is_branch;
         e.is_store   = u.dec.is_store;
+        e.ckpt       = u.ckpt;
         u.rob = rob_.allocate(e);
         u.seq = rob_.at(u.rob).seq;
         inflight_[u.rob] = u;
@@ -298,6 +352,8 @@ bool Cpu::reserve_cdb(uint64_t at_cycle) {
 void Cpu::issue() {
     const std::vector<IssueQueue::Entry> ready = iq_.select(iq_.size());
     uint32_t issued = 0;
+    bool     redirect = false;
+    Uop      offender;
 
     for (const IssueQueue::Entry& e : ready) {
         if (issued >= cfg_.width) break;
@@ -346,11 +402,16 @@ void Cpu::issue() {
         }
         u.wb_cycle = cycle_ + lat;
 
-        // A control transfer resolves here, and fetch — which runs later this
-        // cycle — picks up from the target with no wrong path to undo.
-        if (u.dec.is_branch) {
-            pc_ = u.next_pc;
-            fetch_stalled_ = false;
+        // The guess is settled here. If it was wrong, the oldest offender in
+        // the cycle is the one that recovers: anything younger is on a path
+        // that never existed, including a younger branch that also "resolved".
+        const uint32_t predicted = u.pred_taken ? u.pred_target : u.pc + 4;
+        if (u.next_pc != predicted) {
+            rob_.at(u.rob).mispredicted = true;
+            if (!redirect || u.seq < offender.seq) {
+                redirect = true;
+                offender = u;
+            }
         }
 
         inflight_[u.rob] = u;
@@ -358,7 +419,7 @@ void Cpu::issue() {
 
         // A single-cycle unit has its answer in the cycle it started, so it
         // goes straight to the writeback queue rather than through execute.
-        if (lat > 1)               executing_.push_back({u, cycle_ + lat - 1});
+        if (lat > 1)               executing_.push_back(u);
         else if (u.dec.is_load)    wb_slow_.push_back(u);
         else                       wb_fast_.push_back(u);
 
@@ -373,19 +434,67 @@ void Cpu::issue() {
     if (issued < cfg_.width && ready.size() == issued && !iq_.empty()) {
         stats_.stall(Stall::OPERANDS);
     }
+
+    if (redirect) recover(offender);
+}
+
+void Cpu::release_cdb(const Uop& u) {
+    if (!u.dec.writes_rd || u.dec.is_load) return;    // never booked one
+    if (u.wb_cycle <= cycle_) return;                 // already spent or cleared
+    uint32_t& booked = cdb_booked_[static_cast<std::size_t>(u.wb_cycle % cdb_window_)];
+    if (booked > 0) --booked;
+}
+
+// Everything younger than the branch is undone in one cycle, and fetch — which
+// runs later in this same cycle — restarts on the real path.
+//
+// Registers go back youngest first, and each entry returns the register it
+// allocated rather than the stale one it displaced: that stale mapping still
+// belongs to an older entry, which will hand it back at its own commit.
+// Getting that direction backwards is the classic recovery bug, and it does
+// not show up until some unrelated register is quietly wrong much later.
+void Cpu::recover(const Uop& br) {
+    const std::vector<RobEntry> killed = rob_.truncate_to(br.rob);
+    for (const RobEntry& e : killed) {
+        free_list_.free(e.dest_phys);
+        rat_.free_checkpoint(e.ckpt);
+        ++stats_.squashed;
+    }
+
+    iq_.squash_after(br.seq);
+    lsq_.squash_after(br.seq);
+    squash_queue(executing_, br.seq);
+    squash_queue(wb_fast_, br.seq);
+    squash_queue(wb_slow_, br.seq);
+
+    rat_.restore_checkpoint(br.ckpt);
+    bpred_.restore(ckpt_fe_[br.ckpt]);
+    // The history the branch shifted in was a guess; replace it with the fact.
+    if (br.btb_hit && br.bkind == BranchKind::CONDITIONAL) {
+        bpred_.shift_history(br.next_pc != br.pc + 4);
+    }
+    // The branch survives, so its slot stays reserved and is released once,
+    // when it commits, like every other branch's.
+
+    fetch_q_.clear();
+    decode_q_.clear();
+    rename_q_.clear();
+    fetch_stalled_ = false;
+    pc_ = br.next_pc;
+    ++stats_.mispredicts;
 }
 
 // -------------------------------------------------------------- execute ---
 // Multi-cycle units hand their result over on the cycle it appears; single
 // cycle ops never get here.
 void Cpu::execute() {
-    std::vector<FuOp> still_running;
+    std::vector<Uop> still_running;
     still_running.reserve(executing_.size());
 
-    for (const FuOp& op : executing_) {
-        if (op.finish > cycle_)        still_running.push_back(op);
-        else if (op.uop.dec.is_load)   wb_slow_.push_back(op.uop);
-        else                           wb_fast_.push_back(op.uop);
+    for (const Uop& u : executing_) {
+        if (u.wb_cycle > cycle_ + 1) still_running.push_back(u);
+        else if (u.dec.is_load)      wb_slow_.push_back(u);
+        else                         wb_fast_.push_back(u);
     }
     executing_.swap(still_running);
 }
@@ -545,12 +654,31 @@ void Cpu::commit() {
         rob_.pop_head_if_complete();
 
         const Uop u = inflight_[idx];
-        if (u.seq != stats_.retired) commit_in_order_ = false;
+        // Sequence numbers skip over squashed uops, so program order means
+        // strictly increasing rather than consecutive.
+        if (stats_.retired > 0 && u.seq <= last_committed_seq_) commit_in_order_ = false;
+        last_committed_seq_ = u.seq;
 
         // Every architectural effect that is not a register write happens here
         // and nowhere else, memory included.
         // The queue seats are given up in the same order they were taken.
         if (u.dec.is_load) lsq_.loads().pop_head();
+
+        // The predictor only learns from instructions that really ran, so a
+        // wrong path can never train it.
+        if (u.dec.is_branch) {
+            const bool taken = u.next_pc != u.pc + 4;
+            bpred_.commit(u.pc, u.pht_index, u.bkind, taken, u.next_pc);
+            rat_.free_checkpoint(u.ckpt);
+
+            ++stats_.branches;
+            ++stats_.btb_lookups;
+            if (u.btb_hit) ++stats_.btb_hits;
+            if (u.from_ras) {
+                ++stats_.ras_pops;
+                if (u.pred_target == u.next_pc) ++stats_.ras_hits;
+            }
+        }
 
         TrapCause cause = u.trap;
         if (cause == TrapCause::NONE) {
@@ -614,12 +742,11 @@ void Cpu::commit() {
 // Youngest first, so each entry hands back the register it allocated — not the
 // stale one it displaced, which an older entry still owns.
 void Cpu::squash_in_flight() {
-    for (uint32_t k = rob_.size(); k > 0; --k) {
-        const RobEntry& e = rob_.nth_entry(k - 1);
+    for (const RobEntry& e : rob_.squash_all()) {
         free_list_.free(e.dest_phys);
+        rat_.free_checkpoint(e.ckpt);
         ++stats_.squashed;
     }
-    rob_.squash_all();
 
     rat_.adopt(arch_rat_);
     lsq_.clear();

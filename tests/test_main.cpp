@@ -2499,13 +2499,17 @@ SECTION("frontend") {
         REQUIRE(cpu.commit_in_order());
     }
 
-    // ---- No wrong-path fetch: decode stops at a control transfer ----------
+    // ---- The wrong path is fetched, and none of it retires ----------------
+    // A jump the target cache has never seen falls through, so the ebreaks
+    // behind it really are decoded. Every one of them is thrown away when the
+    // jump resolves, which is the difference between speculating and being
+    // wrong about the answer.
     {
         Config cfg;
         cfg.width = 2;
         Assembler p;
         p.j("target");
-        for (int i = 0; i < 8; ++i) p.ebreak();        // never fetched
+        for (int i = 0; i < 8; ++i) p.ebreak();        // fetched, never retired
         p.label("target");
         p.li(a0, 5);
         p.li(a7, 93);
@@ -2516,35 +2520,43 @@ SECTION("frontend") {
         REQUIRE(cpu.run(1000));
 
         REQUIRE(cpu.halted());
+        REQUIRE(!cpu.trapped());                       // no ebreak reached commit
         REQUIRE(cpu.exit_code() == 5);
+        REQUIRE(cpu.retired() == 4);                   // jal, li, li, ecall
+        REQUIRE(cpu.stats().mispredicts == 1);
+        REQUIRE(cpu.stats().squashed > 0);
+
+        bool decoded_wrong_path = false;
         for (const Cpu::DecodeRecord& r : cpu.decode_log()) {
-            REQUIRE(r.raw != 0x00100073u);             // no ebreak ever decoded
+            if (r.raw == 0x00100073u) decoded_wrong_path = true;
         }
-        REQUIRE(cpu.decode_log().size() == 4);         // jal, li, li, ecall
+        REQUIRE(decoded_wrong_path);
     }
 
-    // ---- A taken branch costs the whole front end ------------------------
-    // Decode stalls fetch in the cycle it sees the jump and the target is not
-    // known until the jump issues three stages later. Issue runs before fetch
-    // in the same cycle, so fetch resumes the moment the target exists — and
-    // still loses three cycles. Removing them is what the predictor is for.
+    // ---- A branch costs a redirect once, and then stops costing ----------
+    // The first pass through the loop has nothing in the target cache, so it
+    // pays. Once the branch has committed taken, fetch follows it, and a
+    // hundred iterations cost far fewer than a hundred redirects.
     {
         Config cfg;
         cfg.width = 1;
         Assembler p;
-        p.j("target");
-        p.label("target");
+        p.li(t0, 0);
+        p.li(t1, 100);
+        p.label("loop");
+        p.addi(t0, t0, 1);
+        p.blt(t0, t1, "loop");
+        p.mv(a0, t0);
         p.li(a7, 93);
         p.ecall();
         Memory m = cputest::image(p.assemble());
         Cpu cpu(m, cfg, wl::TEXT);
-        cpu.record_decode(true);
-        REQUIRE(cpu.run(1000));
+        REQUIRE(cpu.run(5000));
 
-        const std::vector<Cpu::DecodeRecord>& log = cpu.decode_log();
-        REQUIRE(log.size() == 3);
-        REQUIRE(log[1].cycle == log[0].cycle + 4);     // decode, rename, dispatch, issue
-        REQUIRE(log[2].cycle == log[1].cycle + 1);     // and none after that
+        REQUIRE(cpu.exit_code() == 100);
+        REQUIRE(cpu.stats().branches == 100);
+        REQUIRE(cpu.stats().mispredicts < 20);
+        REQUIRE(cpu.stats().btb_hits > 90);
     }
 }
 
@@ -3797,6 +3809,413 @@ SECTION("store_commit") {
             Cpu cpu(m, cfg, wl::TEXT);
             REQUIRE(cpu.run(w.budget * 8 + 1000));
             REQUIRE(cpu.stats().load_forwards > 0);
+        }
+    }
+}
+
+
+// ------------------------------------------------------ @section("gshare") ---
+SECTION("gshare") {
+    using namespace asmc;
+
+    // ---- Counters saturate, and the top bit is the prediction -------------
+    {
+        Gshare g(4, 16);
+        const uint32_t i = g.index(0x1000);
+        REQUIRE(g.counter(i) == 1);                  // weakly not taken
+        REQUIRE(!g.predict_at(i));
+
+        g.update(i, true);
+        REQUIRE(g.predict_at(i));                    // 1 -> 2 flips it
+        g.update(i, true);
+        g.update(i, true);
+        REQUIRE(g.counter(i) == 3);                  // and stops there
+        REQUIRE(g.predict_at(i));
+
+        g.update(i, false);
+        REQUIRE(g.predict_at(i));                    // one wrong outcome is absorbed
+        g.update(i, false);
+        REQUIRE(!g.predict_at(i));
+        for (int k = 0; k < 5; ++k) g.update(i, false);
+        REQUIRE(g.counter(i) == 0);
+    }
+
+    // ---- History and PC both pick the counter -----------------------------
+    {
+        Gshare g(4, 16);
+        REQUIRE(g.index(0x1000) == ((0x1000u >> 2) & 15u));
+        REQUIRE(g.index(0x1000) != g.index(0x1004));  // different branches differ
+
+        const uint32_t before = g.index(0x1000);
+        g.shift(true);
+        REQUIRE(g.ghr() == 1);
+        REQUIRE(g.index(0x1000) == (before ^ 1u));    // same branch, new context
+
+        for (int k = 0; k < 8; ++k) g.shift(true);
+        REQUIRE(g.ghr() == 15);                       // four bits, and no more
+    }
+
+    // ---- A regular loop converges, and stays converged --------------------
+    // Five hundred iterations of a branch that is taken every time but the
+    // last: the history fills, the counter saturates, and the rest are free.
+    {
+        Config cfg;
+        Assembler p;
+        p.li(t0, 0);
+        p.li(t1, 500);
+        p.label("loop");
+        p.addi(t0, t0, 1);
+        p.blt(t0, t1, "loop");
+        p.mv(a0, t0);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(20000));
+
+        REQUIRE(cpu.exit_code() == 500);
+        REQUIRE(cpu.stats().branches == 500);
+        REQUIRE(cpu.stats().mispredict_rate() < 0.05);
+        REQUIRE(cpu.stats().mpki() < 40.0);
+    }
+
+    // ---- History is what makes the hard case predictable ------------------
+    // A branch alternating taken and not taken is a coin flip to anything
+    // without context and perfectly predictable with it. A single-counter
+    // table has no context, so it does measurably worse.
+    {
+        auto mispredicts = [](uint32_t pht_size) {
+            Config cfg;
+            cfg.pht_size = pht_size;
+            Assembler p;
+            p.li(t0, 0);
+            p.li(t1, 200);
+            p.li(t2, 0);
+            p.label("loop");
+            p.andi(t3, t0, 1);                       // alternates every iteration
+            p.beq(t3, zero, "even");
+            p.addi(t2, t2, 1);
+            p.label("even");
+            p.addi(t0, t0, 1);
+            p.blt(t0, t1, "loop");
+            p.mv(a0, t2);
+            p.li(a7, 93);
+            p.ecall();
+            Memory m = cputest::image(p.assemble());
+            Cpu cpu(m, cfg, wl::TEXT);
+            cpu.run(50000);
+            REQUIRE(cpu.exit_code() == 100);
+            return cpu.stats().mispredicts;
+        };
+        const uint64_t with_history = mispredicts(4096);
+        const uint64_t one_counter  = mispredicts(1);
+        REQUIRE(with_history * 2 < one_counter);
+    }
+}
+
+
+// --------------------------------------------------------- @section("btb") ---
+SECTION("btb") {
+    using namespace asmc;
+
+    // ---- A cold entry misses, and a PC-tagged one does not collide --------
+    {
+        Btb btb(4, 2);
+        REQUIRE(!btb.lookup(0x1000).valid);
+
+        btb.update(0x1000, 0x2000, BranchKind::JUMP);
+        const Btb::Hit h = btb.lookup(0x1000);
+        REQUIRE(h.valid);
+        REQUIRE(h.target == 0x2000u);
+        REQUIRE(h.kind == BranchKind::JUMP);
+
+        // Same set, different PC: the tag keeps them apart.
+        REQUIRE(!btb.lookup(0x1010).valid);
+        btb.update(0x1010, 0x3000, BranchKind::CONDITIONAL);
+        REQUIRE(btb.lookup(0x1000).target == 0x2000u);
+        REQUIRE(btb.lookup(0x1010).target == 0x3000u);
+
+        // Retargeting an existing entry updates it in place.
+        btb.update(0x1000, 0x4000, BranchKind::JUMP);
+        REQUIRE(btb.lookup(0x1000).target == 0x4000u);
+    }
+
+    // ---- A full set evicts the least recently used ------------------------
+    {
+        Btb btb(1, 2);                                // one set, two ways
+        btb.update(0x1000, 0xA, BranchKind::JUMP);
+        btb.update(0x1004, 0xB, BranchKind::JUMP);
+        REQUIRE(btb.lookup(0x1000).valid);
+        REQUIRE(btb.lookup(0x1004).valid);
+
+        btb.update(0x1008, 0xC, BranchKind::JUMP);    // evicts the oldest
+        REQUIRE(!btb.lookup(0x1000).valid);
+        REQUIRE(btb.lookup(0x1004).valid);
+        REQUIRE(btb.lookup(0x1008).valid);
+    }
+
+    // ---- A branch is predicted only after it has committed taken ----------
+    // The first pass has nothing cached, so fetch falls through and the jump
+    // is corrected when it executes. The second pass is free.
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 0);
+        p.li(t1, 2);
+        p.label("loop");
+        p.addi(t0, t0, 1);
+        p.j("bottom");                                // an unconditional hop
+        p.ebreak();                                   // only on the wrong path
+        p.label("bottom");
+        p.blt(t0, t1, "loop");
+        p.mv(a0, t0);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+
+        REQUIRE(cpu.halted());
+        REQUIRE(!cpu.trapped());
+        REQUIRE(cpu.exit_code() == 2);
+        // Two passes over the jump: the first misses the cache, the second hits.
+        REQUIRE(cpu.stats().btb_lookups == 4);        // two jumps, two branches
+        REQUIRE(cpu.stats().btb_hits == 2);
+    }
+
+    // ---- An indirect jump is corrected the first time, cached after -------
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 0);
+        p.li(t1, 3);
+        p.label("loop");
+        p.auipc(t2, 0);
+        p.addi(t2, t2, 16);                           // four instructions ahead
+        p.jalr(zero, t2, 0);                          // indirect, same target
+        p.ebreak();
+        p.label("landing");
+        p.addi(t0, t0, 1);
+        p.blt(t0, t1, "loop");
+        p.mv(a0, t0);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(2000));
+
+        REQUIRE(cpu.halted());
+        REQUIRE(!cpu.trapped());
+        REQUIRE(cpu.exit_code() == 3);
+        REQUIRE(cpu.stats().mispredicts >= 1);        // the cold indirect jump
+        REQUIRE(cpu.stats().btb_hits >= 2);           // and it is cached after
+    }
+}
+
+
+// --------------------------------------------------------- @section("ras") ---
+SECTION("ras") {
+    using namespace asmc;
+
+    // ---- Last in, first out, and an empty stack is a legal state ----------
+    {
+        Ras ras(4);
+        REQUIRE(ras.empty());
+        REQUIRE(ras.pop() == 0);                      // falls back, does not fault
+
+        ras.push(0x100);
+        ras.push(0x200);
+        REQUIRE(ras.depth() == 2);
+        REQUIRE(ras.peek() == 0x200u);
+        REQUIRE(ras.pop() == 0x200u);
+        REQUIRE(ras.pop() == 0x100u);
+        REQUIRE(ras.empty());
+    }
+
+    // ---- Overflowing costs the outermost frames and nothing else ----------
+    {
+        Ras ras(2);
+        ras.push(0x100);
+        ras.push(0x200);
+        ras.push(0x300);                              // 0x100 is gone
+        REQUIRE(ras.depth() == 2);
+        REQUIRE(ras.pop() == 0x300u);
+        REQUIRE(ras.pop() == 0x200u);
+    }
+
+    // ---- Returns from a nested call chain are predicted -------------------
+    {
+        Config cfg;
+        for (const wl::Workload& w : wl::corpus()) {
+            if (w.name != "nested_calls") continue;
+            Memory m = cputest::image(w.words);
+            Cpu cpu(m, cfg, wl::TEXT);
+            REQUIRE(cpu.run(w.budget * 8 + 1000));
+            REQUIRE(cpu.halted());
+            REQUIRE(cpu.stats().ras_pops > 0);
+            REQUIRE(cpu.stats().ras_accuracy() > 0.8);
+        }
+    }
+
+    // ---- Recursion is where the stack earns its keep ----------------------
+    // A one-deep stack cannot hold a recursive call chain, so its returns go
+    // to the target cache instead — which always names the last caller.
+    {
+        auto mispredicts_with = [](uint32_t ras_size) {
+            Config cfg;
+            cfg.ras_size = ras_size;
+            for (const wl::Workload& w : wl::corpus()) {
+                if (w.name != "fib") continue;
+                Memory m = cputest::image(w.words);
+                Cpu cpu(m, cfg, wl::TEXT);
+                cpu.run(w.budget * 8 + 1000);
+                REQUIRE(cpu.halted());
+                REQUIRE(cpu.exit_code() == 144);
+                return cpu.stats().mispredicts;
+            }
+            return uint64_t{0};
+        };
+        REQUIRE(mispredicts_with(16) * 2 < mispredicts_with(1));
+    }
+}
+
+
+// -------------------------------------------------- @section("checkpoint") ---
+SECTION("checkpoint") {
+    using namespace asmc;
+
+    // ---- Every branch takes a slot, and gives it back -------------------
+    {
+        Config cfg;
+        Memory m = cputest::image(fetest::addi_chain(20));
+        Cpu cpu(m, cfg, wl::TEXT);
+        const uint32_t all = cpu.rat().num_checkpoints();
+        REQUIRE(cpu.rat().num_free_checkpoints() == all);
+
+        while (!cpu.done() && cpu.cycle() < 2000) {
+            cpu.tick();
+            REQUIRE(cpu.rat().num_free_checkpoints() <= all);
+        }
+        REQUIRE(cpu.rat().num_free_checkpoints() == all);
+    }
+
+    // ---- Running out stalls rename instead of overwriting a snapshot ------
+    {
+        Config cfg;
+        cfg.num_checkpoints = 1;                     // one branch in flight
+        Assembler p;
+        p.li(t0, 0);
+        p.li(t1, 30);
+        p.label("loop");
+        p.addi(t0, t0, 1);
+        p.blt(t0, t1, "loop");
+        p.mv(a0, t0);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(5000));
+
+        REQUIRE(cpu.exit_code() == 30);              // still correct, just slower
+        REQUIRE(cpu.stats().stall_count(Stall::CHECKPOINT) > 0);
+        REQUIRE(cpu.rat().num_free_checkpoints() == 1);
+    }
+
+    // ---- A branch-dense workload never loses a slot -----------------------
+    {
+        Config cfg;
+        cfg.num_checkpoints = 2;
+        diff::ScopedModel swap(&cputest::run_cpu);
+        for (const char* name : {"lcg_branch", "fib", "sieve"}) {
+            for (const wl::Workload& w : wl::corpus()) {
+                if (w.name != name) continue;
+                const diff::Report r = diff::diff_run(w, cfg);
+                REQUIRE_MSG(r.ok, r.detail);
+
+                Memory m = cputest::image(w.words);
+                Cpu cpu(m, cfg, wl::TEXT);
+                REQUIRE(cpu.run(w.budget * 20 + 1000));
+                REQUIRE(cpu.rat().num_free_checkpoints() == 2);
+            }
+        }
+    }
+}
+
+
+// ----------------------------------------------------- @section("recover") ---
+SECTION("recover") {
+    using namespace asmc;
+
+    // ---- A mispredicted branch leaves no trace ----------------------------
+    // Everything on the wrong path allocated registers, queue seats and
+    // checkpoints. After recovery the machine is indistinguishable from one
+    // that never guessed.
+    {
+        Config cfg;
+        Assembler p;
+        p.li(t0, 0);
+        p.li(t1, 50);
+        p.li(t2, 0x400);
+        p.label("loop");
+        p.addi(t0, t0, 1);
+        p.andi(t3, t0, 3);
+        p.bne(t3, zero, "skip");                     // taken three times in four
+        p.sw(t0, t2, 0);
+        p.label("skip");
+        p.blt(t0, t1, "loop");
+        p.mv(a0, t0);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+
+        while (!cpu.done() && cpu.cycle() < 5000) {
+            cpu.tick();
+            REQUIRE(rectest::conserved(cpu));        // no register lost, ever
+        }
+        REQUIRE(cpu.halted());
+        REQUIRE(cpu.exit_code() == 50);
+        REQUIRE(m.load_u32(0x400) == 48);            // the last multiple of four
+        REQUIRE(cpu.stats().mispredicts > 0);
+        REQUIRE(cpu.stats().squashed > 0);
+        REQUIRE(cpu.free_list().num_free() == cfg.prf_size - 32);
+        REQUIRE(cpu.rat().num_free_checkpoints() == cpu.rat().num_checkpoints());
+        REQUIRE(cpu.commit_in_order());
+    }
+
+    // ---- An unpredictable branch mispredicts constantly and leaks nothing --
+    {
+        Config cfg;
+        for (const wl::Workload& w : wl::corpus()) {
+            if (w.name != "lcg_branch") continue;
+            Memory m = cputest::image(w.words);
+            Cpu cpu(m, cfg, wl::TEXT);
+            REQUIRE(cpu.run(w.budget * 8 + 1000));
+
+            REQUIRE(cpu.halted());
+            REQUIRE(cpu.stats().mispredicts > 50);   // genuinely unpredictable
+            REQUIRE(cpu.free_list().num_free() == cfg.prf_size - 32);
+            REQUIRE(cpu.rat().num_free_checkpoints() == cpu.rat().num_checkpoints());
+            REQUIRE(rectest::conserved(cpu));
+            REQUIRE(cpu.lsq().loads().empty());
+            REQUIRE(cpu.lsq().stores().empty());
+        }
+    }
+
+    // ---- The retired count matches the oracle exactly ---------------------
+    // One wrong-path instruction reaching commit would show up here and
+    // nowhere else, since its architectural effect might well be invisible.
+    {
+        Config cfg;
+        diff::ScopedModel swap(&cputest::run_cpu);
+        for (const wl::Workload& w : wl::corpus()) {
+            const diff::Outcome model = cputest::run_cpu(w, cfg);
+            const diff::Outcome ref   = diff::run_reference(w, cfg);
+            REQUIRE_MSG(model.retired == ref.retired,
+                        "    " + w.name + ": retired " + std::to_string(model.retired) +
+                        " vs " + std::to_string(ref.retired));
         }
     }
 }

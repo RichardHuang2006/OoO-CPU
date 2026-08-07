@@ -5,6 +5,7 @@
 #include <deque>
 #include <vector>
 
+#include "bpred.h"
 #include "config.h"
 #include "decoder.h"
 #include "freelist.h"
@@ -34,10 +35,15 @@
 // Issue then picks the oldest ready ops the function units and writeback ports
 // can accept, in whatever order that turns out to be.
 //
-// Two things are still simpler than hardware. A load waits for every older
-// store to commit, because there is no store queue to forward from yet, and the
-// front end has no predictor: decode stops fetching at a control transfer and
-// issue redirects the PC, so no wrong-path instruction is ever fetched.
+// Loads go through the store queue rather than waiting for older stores to
+// commit, so a load can read a store that only exists in the queue so far.
+//
+// The front end predicts and is therefore sometimes wrong. Every branch takes
+// a checkpoint of the register mapping, the history and the return stack at
+// rename; when one resolves against its prediction, recovery hands back every
+// younger register, erases every younger entry in every structure, restores
+// the checkpoint and redirects fetch — all before fetch runs in the same
+// cycle, so the correct path starts immediately.
 
 enum class TrapCause : uint8_t {
     NONE,
@@ -72,6 +78,16 @@ struct Uop {
     uint32_t  lsq_idx    = 0;    // load- or store-queue seat, taken at dispatch
     uint64_t  wb_cycle   = 0;    // writeback port booked at issue
     TrapCause trap       = TrapCause::NONE;
+
+    // ---- what the front end guessed, and what it will need to undo --------
+    bool       pred_taken  = false;
+    uint32_t   pred_target = 0;
+    bool       btb_hit     = false;
+    bool       from_ras    = false;
+    uint32_t   pht_index   = 0;
+    BranchKind bkind       = BranchKind::NONE;
+    CheckpointId ckpt      = INVALID_CHECKPOINT;
+    BranchPredictor::Snapshot fe_snap{};   // history and return stack at fetch
 };
 
 class Cpu {
@@ -123,6 +139,7 @@ public:
     const FreeList&   free_list() const { return free_list_; }
     const IssueQueue& iq()        const { return iq_; }
     const Lsq&        lsq()       const { return lsq_; }
+    const BranchPredictor& bpred() const { return bpred_; }
 
     uint32_t fetch_queue()   const { return static_cast<uint32_t>(fetch_q_.size()); }
     uint32_t decode_queue()  const { return static_cast<uint32_t>(decode_q_.size()); }
@@ -206,6 +223,25 @@ private:
     // halting instruction can reach commit or leak a physical register.
     void squash_in_flight();
 
+    // Unwind to just after `br`, which mispredicted. Every younger uop hands
+    // back the register it allocated — its own, never the stale one it
+    // displaced, which an older entry still owns and will return itself.
+    void recover(const Uop& br);
+
+    // Give back a writeback port booked by a uop that is being squashed.
+    void release_cdb(const Uop& u);
+
+    // Drop the uops younger than `seq` from a queue of in-flight work.
+    template <typename Q>
+    void squash_queue(Q& q, SeqNum seq) {
+        Q kept;
+        for (const Uop& u : q) {
+            if (u.seq <= seq) kept.push_back(u);
+            else              release_cdb(u);
+        }
+        q.swap(kept);
+    }
+
     Memory&     mem_;
     Config      cfg_;
     Rob         rob_;
@@ -214,6 +250,11 @@ private:
     Rat         rat_;
     IssueQueue  iq_;
     Lsq         lsq_;
+    BranchPredictor bpred_;
+
+    // History and return stack as of each checkpointed branch's fetch, indexed
+    // by the id the RAT's pool handed out.
+    std::vector<BranchPredictor::Snapshot> ckpt_fe_;
 
     // Per-instruction payload, indexed by ROB slot, read back at commit.
     std::vector<Uop> inflight_;
@@ -230,12 +271,9 @@ private:
     std::deque<Uop> decode_q_;    // decode -> rename
     std::deque<Uop> rename_q_;    // rename -> dispatch
 
-    // Ops holding a function unit. `finish` is the cycle their result appears.
-    struct FuOp {
-        Uop      uop;
-        uint64_t finish;
-    };
-    std::vector<FuOp> executing_;
+    // Ops holding a function unit. Their `wb_cycle` says when the result is
+    // due, so the unit needs no separate bookkeeping.
+    std::vector<Uop> executing_;
 
     // Writeback candidates. Fast ops booked their port at issue and always
     // land; loads did not and take whatever bandwidth is left over.
@@ -259,6 +297,7 @@ private:
     uint32_t  exit_code_  = 0;
     TrapCause trap_cause_ = TrapCause::NONE;
     bool      commit_in_order_ = true;
+    SeqNum    last_committed_seq_ = INVALID_SEQNUM;
     Stats     stats_{};
 
     bool record_decode_ = false;
