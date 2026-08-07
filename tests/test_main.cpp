@@ -2554,6 +2554,8 @@ SECTION("execute_fu") {
     using namespace asmc;
 
     // ---- Load-use latency tracks mem_latency exactly ----------------------
+    // Nothing stored to this address, so the load has to go to memory and
+    // pays the full latency.
     {
         auto cycles_at = [](uint32_t lat) {
             Config cfg;
@@ -2561,8 +2563,6 @@ SECTION("execute_fu") {
             cfg.mem_latency = lat;
             Assembler p;
             p.li(t0, 0x2000);
-            p.li(t1, 7);
-            p.sw(t1, t0, 0);
             p.lw(a0, t0, 0);
             p.add(a1, a0, a0);                       // consumes the loaded value
             p.li(a7, 93);
@@ -3405,6 +3405,399 @@ SECTION("wakeup_fast") {
         // extra cycle of latency costs twenty-one.
         REQUIRE(cycles_at(2) == cycles_at(1) + 21);
         REQUIRE(cycles_at(3) == cycles_at(1) + 42);
+    }
+}
+
+
+// --------------------------------------------------------- @section("lsq") ---
+SECTION("lsq") {
+    // ---- Seats are handed out in order, and given back in order -----------
+    {
+        Lsq lsq(2, 2);
+        REQUIRE(lsq.loads().empty());
+        REQUIRE(lsq.stores().capacity() == 2);
+
+        const std::optional<uint32_t> a = lsq.alloc_store(0, 4);
+        const std::optional<uint32_t> b = lsq.alloc_store(1, 4);
+        REQUIRE(a.has_value());
+        REQUIRE(b.has_value());
+        REQUIRE(lsq.stores().full());
+        REQUIRE(!lsq.alloc_store(2, 4).has_value());   // dispatch stalls here
+
+        lsq.stores().pop_head();
+        REQUIRE(lsq.stores().size() == 1);
+        REQUIRE(lsq.stores().nth(0).seq == 1);
+        REQUIRE(lsq.alloc_store(2, 4).has_value());
+    }
+
+    // ---- A resolved store that covers the load forwards it ----------------
+    {
+        Lsq lsq(4, 4);
+        const uint32_t s = *lsq.alloc_store(0, 4);
+        lsq.resolve_addr(s, 0x100);
+        lsq.resolve_data(s, 0xDEADBEEF);
+
+        const uint32_t l = *lsq.alloc_load(1, 4);
+        lsq.resolve_load_addr(l, 0x100);
+
+        const ForwardResult r = lsq.search_older_stores(l);
+        REQUIRE(r.kind == Forward::FORWARD);
+        REQUIRE(r.data == 0xDEADBEEFu);
+    }
+
+    // ---- An unresolved older store forces a replay ------------------------
+    // The address is unknown, so it might be this one. Guessing is the bug
+    // this rule exists to prevent.
+    {
+        Lsq lsq(4, 4);
+        const uint32_t s = *lsq.alloc_store(0, 4);     // address never resolved
+        const uint32_t l = *lsq.alloc_load(1, 4);
+        lsq.resolve_load_addr(l, 0x200);
+        REQUIRE(lsq.search_older_stores(l).kind == Forward::REPLAY);
+
+        // Resolving it somewhere else clears the ambiguity.
+        lsq.resolve_addr(s, 0x300);
+        lsq.resolve_data(s, 1);
+        REQUIRE(lsq.search_older_stores(l).kind == Forward::NO_MATCH);
+    }
+
+    // ---- A store with a known address but no data yet also replays --------
+    {
+        Lsq lsq(4, 4);
+        const uint32_t s = *lsq.alloc_store(0, 4);
+        lsq.resolve_addr(s, 0x100);
+        const uint32_t l = *lsq.alloc_load(1, 4);
+        lsq.resolve_load_addr(l, 0x100);
+        REQUIRE(lsq.search_older_stores(l).kind == Forward::REPLAY);
+
+        lsq.resolve_data(s, 77);
+        const ForwardResult r = lsq.search_older_stores(l);
+        REQUIRE(r.kind == Forward::FORWARD);
+        REQUIRE(r.data == 77u);
+    }
+
+    // ---- No older store aliases the address -------------------------------
+    {
+        Lsq lsq(4, 4);
+        const uint32_t s = *lsq.alloc_store(0, 4);
+        lsq.resolve_addr(s, 0x100);
+        lsq.resolve_data(s, 5);
+        const uint32_t l = *lsq.alloc_load(1, 4);
+        lsq.resolve_load_addr(l, 0x104);               // adjacent, not overlapping
+        REQUIRE(lsq.search_older_stores(l).kind == Forward::NO_MATCH);
+    }
+
+    // ---- A younger store is not this load's problem -----------------------
+    {
+        Lsq lsq(4, 4);
+        const uint32_t l = *lsq.alloc_load(0, 4);
+        lsq.resolve_load_addr(l, 0x100);
+        const uint32_t s = *lsq.alloc_store(1, 4);     // younger
+        lsq.resolve_addr(s, 0x100);
+        lsq.resolve_data(s, 9);
+        REQUIRE(lsq.search_older_stores(l).kind == Forward::NO_MATCH);
+    }
+
+    // ---- Sub-word: a covered byte forwards, a straddling half replays -----
+    {
+        Lsq lsq(4, 4);
+        const uint32_t s = *lsq.alloc_store(0, 4);     // sw 0x100 = 0x44332211
+        lsq.resolve_addr(s, 0x100);
+        lsq.resolve_data(s, 0x44332211);
+
+        const uint32_t b0 = *lsq.alloc_load(1, 1);     // lb 0x100
+        lsq.resolve_load_addr(b0, 0x100);
+        REQUIRE(lsq.search_older_stores(b0).data == 0x11u);
+
+        const uint32_t b2 = *lsq.alloc_load(2, 1);     // lb 0x102
+        lsq.resolve_load_addr(b2, 0x102);
+        const ForwardResult r2 = lsq.search_older_stores(b2);
+        REQUIRE(r2.kind == Forward::FORWARD);
+        REQUIRE(r2.data == 0x33u);
+
+        const uint32_t h = *lsq.alloc_load(3, 2);      // lh 0x102, still covered
+        lsq.resolve_load_addr(h, 0x102);
+        REQUIRE(lsq.search_older_stores(h).data == 0x4433u);
+    }
+
+    // ---- Partial overlap is never stitched together -----------------------
+    // A one-byte store under a four-byte load covers some of it, so the load
+    // waits for the store to commit rather than guessing at the rest.
+    {
+        Lsq lsq(4, 4);
+        const uint32_t s = *lsq.alloc_store(0, 1);
+        lsq.resolve_addr(s, 0x102);
+        lsq.resolve_data(s, 0xFF);
+
+        const uint32_t l = *lsq.alloc_load(1, 4);
+        lsq.resolve_load_addr(l, 0x100);
+        REQUIRE(lsq.search_older_stores(l).kind == Forward::REPLAY);
+    }
+
+    // ---- The youngest covering store wins, and shadows older ambiguity ----
+    {
+        Lsq lsq(4, 4);
+        const uint32_t s0 = *lsq.alloc_store(0, 4);    // address unknown
+        const uint32_t s1 = *lsq.alloc_store(1, 4);
+        lsq.resolve_addr(s1, 0x100);
+        lsq.resolve_data(s1, 0xAAAA);
+
+        const uint32_t l = *lsq.alloc_load(2, 4);
+        lsq.resolve_load_addr(l, 0x100);
+
+        // s1 defines every byte the load wants, whatever s0 turns out to be.
+        const ForwardResult r = lsq.search_older_stores(l);
+        REQUIRE(r.kind == Forward::FORWARD);
+        REQUIRE(r.data == 0xAAAAu);
+
+        // Reversed: the unknown one is younger, so it could still land on top.
+        Lsq other(4, 4);
+        const uint32_t t0 = *other.alloc_store(0, 4);
+        other.resolve_addr(t0, 0x100);
+        other.resolve_data(t0, 0xBBBB);
+        other.alloc_store(1, 4);                       // unresolved, younger
+        const uint32_t l2 = *other.alloc_load(2, 4);
+        other.resolve_load_addr(l2, 0x100);
+        REQUIRE(other.search_older_stores(l2).kind == Forward::REPLAY);
+        (void)s0;
+    }
+
+    // ---- Recovery drops the entries that never happened -------------------
+    {
+        Lsq lsq(8, 8);
+        for (SeqNum s = 0; s < 5; ++s) lsq.alloc_load(s, 4);
+        for (SeqNum s = 0; s < 5; ++s) lsq.alloc_store(s + 10, 4);
+        lsq.squash_after(2);
+        REQUIRE(lsq.loads().size() == 3);
+        REQUIRE(lsq.stores().empty());                 // every store was younger
+
+        lsq.clear();
+        REQUIRE(lsq.loads().empty());
+    }
+}
+
+
+// ------------------------------------------------ @section("load_forward") ---
+SECTION("load_forward") {
+    using namespace asmc;
+
+    // ---- A load reads a store that has not committed yet ------------------
+    // Memory still holds zero when the load produces its value, so the only
+    // place the answer could have come from is the store queue.
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 0x400);
+        p.li(t1, 0x123);
+        p.sw(t1, t0, 0);
+        p.lw(a0, t0, 0);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+
+        REQUIRE(cpu.exit_code() == 0x123u);
+        REQUIRE(cpu.stats().load_forwards == 1);
+        REQUIRE(cpu.stats().load_memory == 0);         // memory never consulted
+    }
+
+    // ---- Forwarding does not pay memory latency ---------------------------
+    // The same program at four different memory latencies takes exactly as
+    // long, because the load never goes there.
+    {
+        auto cycles_at = [](uint32_t lat) {
+            Config cfg;
+            cfg.width       = 1;
+            cfg.mem_latency = lat;
+            Assembler p;
+            p.li(t0, 0x400);
+            p.li(t1, 7);
+            p.sw(t1, t0, 0);
+            p.lw(a0, t0, 0);
+            p.add(a1, a0, a0);
+            p.li(a7, 93);
+            p.ecall();
+            Memory m = cputest::image(p.assemble());
+            Cpu cpu(m, cfg, wl::TEXT);
+            cpu.run(1000);
+            return cpu.cycle();
+        };
+        REQUIRE(cycles_at(2) == cycles_at(8));
+    }
+
+    // ---- An unresolved older store makes the load wait, then finish -------
+    // The store's address depends on a 20-cycle divide, so the load has to
+    // replay until the ambiguity clears — and then reads the right bytes.
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 0x400);
+        p.li(t1, 8);
+        p.li(t2, 2);
+        p.div_(t3, t1, t2);          // 4, after 20 cycles
+        p.add(t4, t0, t3);           // address 0x404, unknown until then
+        p.li(t5, 0x99);
+        p.sw(t5, t4, 0);             // store to it
+        p.lw(a0, t0, 4);             // same address, younger
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+
+        REQUIRE(cpu.exit_code() == 0x99u);
+        REQUIRE(cpu.stats().load_replays > 0);
+        REQUIRE(cpu.stats().load_forwards == 1);
+    }
+
+    // ---- A load that no store covers goes to memory -----------------------
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 0x400);
+        p.li(t1, 0x55);
+        p.sw(t1, t0, 0);
+        p.lw(a0, t0, 16);            // a different word entirely
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+
+        REQUIRE(cpu.exit_code() == 0);
+        REQUIRE(cpu.stats().load_memory == 1);
+        REQUIRE(cpu.stats().load_forwards == 0);
+    }
+
+    // ---- Sub-word forwarding through the pipeline -------------------------
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 0x400);
+        p.li(t1, 0x44332211);
+        p.sw(t1, t0, 0);
+        p.lbu(a0, t0, 2);            // the third byte of the pending store
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+
+        REQUIRE(cpu.exit_code() == 0x33u);
+        REQUIRE(cpu.stats().load_forwards == 1);
+    }
+
+    // ---- A full load queue stalls dispatch --------------------------------
+    {
+        Config cfg;
+        cfg.width       = 1;
+        cfg.lq_size     = 1;
+        cfg.mem_latency = 6;
+        Assembler p;
+        p.li(t0, 0x400);
+        for (int i = 0; i < 8; ++i) p.lw(t1, t0, 4 * i);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(2000));
+
+        REQUIRE(cpu.halted());
+        REQUIRE(cpu.stats().stall_count(Stall::LQ_FULL) > 0);
+    }
+}
+
+
+// ------------------------------------------------- @section("store_commit") ---
+SECTION("store_commit") {
+    using namespace asmc;
+
+    // ---- Nothing reaches memory before its store commits ------------------
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 0x400);
+        p.li(t1, 1);  p.sw(t1, t0, 0);
+        p.li(t2, 2);  p.sw(t2, t0, 4);
+        p.li(t3, 3);  p.sw(t3, t0, 8);
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+
+        // The set of written words is a prefix of the program's stores at
+        // every point, never just at the end.
+        while (!cpu.done() && cpu.cycle() < 200) {
+            cpu.tick();
+            uint32_t written = 0;
+            while (written < 3 && m.load_u32(0x400 + 4 * written) != 0) ++written;
+            for (uint32_t k = written; k < 3; ++k) {
+                REQUIRE(m.load_u32(0x400 + 4 * k) == 0);
+            }
+            // A store is either still queued or already in memory, never both.
+            REQUIRE(written + cpu.lsq().stores().size() <= 3);
+        }
+        REQUIRE(m.load_u32(0x400) == 1);
+        REQUIRE(m.load_u32(0x404) == 2);
+        REQUIRE(m.load_u32(0x408) == 3);
+        REQUIRE(cpu.lsq().stores().empty());
+    }
+
+    // ---- A store under a branch that is never taken leaves memory alone ---
+    {
+        Config cfg;
+        cfg.width = 1;
+        Assembler p;
+        p.li(t0, 0x400);
+        p.li(t1, 0xFF);
+        p.li(t2, 1);
+        p.beq(t2, zero, "skip");     // not taken
+        p.j("done");
+        p.label("skip");
+        p.sw(t1, t0, 0);             // only on the untaken path
+        p.label("done");
+        p.li(a7, 93);
+        p.ecall();
+        Memory m = cputest::image(p.assemble());
+        Cpu cpu(m, cfg, wl::TEXT);
+        REQUIRE(cpu.run(1000));
+
+        REQUIRE(cpu.halted());
+        REQUIRE(m.load_u32(0x400) == 0);
+        REQUIRE(cpu.stats().stores == 0);
+    }
+
+    // ---- Store-heavy workloads still match the interpreter ----------------
+    {
+        Config cfg;
+        diff::ScopedModel swap(&cputest::run_cpu);
+        for (const char* name : {"store_forward", "subword", "bubble_sort",
+                                 "pointer_chase", "matmul"}) {
+            for (const wl::Workload& w : wl::corpus()) {
+                if (w.name != name) continue;
+                const diff::Report r = diff::diff_run(w, cfg);
+                REQUIRE_MSG(r.ok, r.detail);
+            }
+        }
+    }
+
+    // ---- Forwarding is doing real work on the corpus ----------------------
+    // If the count were zero the whole path would be untested by the sweep.
+    {
+        Config cfg;
+        for (const wl::Workload& w : wl::corpus()) {
+            if (w.name != "store_forward") continue;
+            Memory m = cputest::image(w.words);
+            Cpu cpu(m, cfg, wl::TEXT);
+            REQUIRE(cpu.run(w.budget * 8 + 1000));
+            REQUIRE(cpu.stats().load_forwards > 0);
+        }
     }
 }
 

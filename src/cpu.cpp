@@ -16,6 +16,25 @@ constexpr uint32_t SYS_EXIT = 93;
 constexpr ArchReg  REG_A0   = 10;
 constexpr ArchReg  REG_A7   = 17;
 
+// Bytes touched by a memory op, which is what decides overlap in the queues.
+uint8_t access_size(Op op) {
+    switch (op) {
+    case Op::LB: case Op::LBU: case Op::SB: return 1;
+    case Op::LH: case Op::LHU: case Op::SH: return 2;
+    default:                                return 4;
+    }
+}
+
+// Widen loaded bytes the way the opcode asks. Forwarded and fetched data go
+// through the same widening, so the two paths cannot disagree.
+uint32_t extend_load(Op op, uint32_t v) {
+    switch (op) {
+    case Op::LB: return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t> (v)));
+    case Op::LH: return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(v)));
+    default:     return v;
+    }
+}
+
 }  // namespace
 
 Cpu::Cpu(Memory& mem, const Config& cfg, uint32_t entry_pc)
@@ -26,6 +45,7 @@ Cpu::Cpu(Memory& mem, const Config& cfg, uint32_t entry_pc)
       free_list_(cfg),
       rat_(cfg),
       iq_(cfg),
+      lsq_(cfg),
       inflight_(cfg.rob_size),
       pc_(entry_pc),
       arch_pc_(entry_pc),
@@ -171,15 +191,31 @@ void Cpu::rename() {
 }
 
 // ------------------------------------------------------------- dispatch ---
-// The uop takes its issue-queue seat here. Ready bits are sampled from the PRF
-// once, on the way in; after that the entry only learns from tag broadcasts.
+// The uop takes its issue-queue seat here, and a memory op also takes its
+// place in line in the load or store queue. Those seats are handed out in
+// program order, which is what makes "older than me" answerable later without
+// searching. Ready bits are sampled from the PRF once, on the way in; after
+// that the entry only learns from tag broadcasts.
 void Cpu::dispatch() {
     for (uint32_t n = 0; n < cfg_.width; ++n) {
         if (rename_q_.empty()) break;
         if (iq_.full()) { stats_.stall(Stall::IQ_FULL); break; }
 
-        const Uop u = rename_q_.front();
+        Uop u = rename_q_.front();
+
+        if (u.dec.is_load) {
+            const std::optional<uint32_t> slot =
+                lsq_.alloc_load(u.seq, access_size(u.dec.op));
+            if (!slot) { stats_.stall(Stall::LQ_FULL); break; }
+            u.lsq_idx = *slot;
+        } else if (u.dec.is_store) {
+            const std::optional<uint32_t> slot =
+                lsq_.alloc_store(u.seq, access_size(u.dec.op));
+            if (!slot) { stats_.stall(Stall::SQ_FULL); break; }
+            u.lsq_idx = *slot;
+        }
         rename_q_.pop_front();
+        inflight_[u.rob] = u;
 
         IssueQueue::Entry e;
         e.seq        = u.seq;
@@ -256,15 +292,6 @@ bool Cpu::reserve_cdb(uint64_t at_cycle) {
     return true;
 }
 
-bool Cpu::older_store_pending(SeqNum seq) const {
-    for (uint32_t k = 0; k < rob_.size(); ++k) {
-        const RobEntry& e = rob_.nth_entry(k);
-        if (e.seq >= seq) break;              // the ROB is in program order
-        if (e.is_store) return true;
-    }
-    return false;
-}
-
 // Oldest ready first, but a uop blocked on a unit or a writeback port only
 // blocks itself — the next candidate still gets a look. That is the point of
 // the whole machine: program order stopped constraining execution at rename.
@@ -277,31 +304,46 @@ void Cpu::issue() {
 
         Uop u = inflight_[e.rob];
 
-        if (u.dec.is_load && older_store_pending(u.seq)) {
-            stats_.stall(Stall::STORE_ORDER);
-            continue;
-        }
-
         const Fu  f    = unit_of(u.dec);
         const int unit = free_unit(f);
         if (unit < 0) { stats_.stall(port_stall(f)); continue; }
 
-        // A result-producing op books its writeback port now, at the cycle the
-        // value will actually land, and does not go without one.
-        const uint32_t lat = e.latency;
-        if (u.dec.writes_rd && !reserve_cdb(cycle_ + lat)) {
-            stats_.stall(Stall::CDB);
-            continue;
+        uint32_t lat = e.latency;
+        u.val1 = prf_.read(u.src1);
+        u.val2 = prf_.read(u.src2);
+
+        if (u.dec.is_load) {
+            // A load cannot book a writeback port at issue: whether it takes
+            // one cycle or all of memory latency depends on what the store
+            // queue says, which is only known now.
+            if (!execute_load(u, lat)) {
+                // Address generation happened, so the unit is spent either
+                // way; the load keeps its seat and asks again next cycle.
+                fu_free_at_[static_cast<int>(Fu::MEM)][static_cast<std::size_t>(unit)] =
+                    cycle_ + 1;
+                ++stats_.load_replays;
+                stats_.stall(Stall::STORE_ORDER);
+                continue;
+            }
+        } else {
+            // Everything else knows its latency at issue, so it books the
+            // writeback port for the cycle the value lands and does not go
+            // without one.
+            if (u.dec.writes_rd && !reserve_cdb(cycle_ + lat)) {
+                stats_.stall(Stall::CDB);
+                continue;
+            }
+            if (u.trap == TrapCause::NONE) execute_uop(u);
+            if (u.dec.is_store) {
+                lsq_.resolve_addr(u.lsq_idx, u.mem_addr);
+                lsq_.resolve_data(u.lsq_idx, u.store_data);
+            }
         }
 
         if (f != Fu::NONE) {
             fu_free_at_[static_cast<int>(f)][static_cast<std::size_t>(unit)] =
                 cycle_ + (pipelined(f) ? 1 : lat);
         }
-
-        u.val1 = prf_.read(u.src1);
-        u.val2 = prf_.read(u.src2);
-        if (u.trap == TrapCause::NONE) execute_uop(u);
         u.wb_cycle = cycle_ + lat;
 
         // A control transfer resolves here, and fetch — which runs later this
@@ -316,8 +358,9 @@ void Cpu::issue() {
 
         // A single-cycle unit has its answer in the cycle it started, so it
         // goes straight to the writeback queue rather than through execute.
-        if (lat <= 1) wb_fast_.push_back(u);
-        else          executing_.push_back({u, cycle_ + lat - 1});
+        if (lat > 1)               executing_.push_back({u, cycle_ + lat - 1});
+        else if (u.dec.is_load)    wb_slow_.push_back(u);
+        else                       wb_fast_.push_back(u);
 
         ++issued;
         ++stats_.issued;
@@ -340,10 +383,41 @@ void Cpu::execute() {
     still_running.reserve(executing_.size());
 
     for (const FuOp& op : executing_) {
-        if (op.finish <= cycle_) wb_fast_.push_back(op.uop);
-        else                     still_running.push_back(op);
+        if (op.finish > cycle_)        still_running.push_back(op);
+        else if (op.uop.dec.is_load)   wb_slow_.push_back(op.uop);
+        else                           wb_fast_.push_back(op.uop);
     }
     executing_.swap(still_running);
+}
+
+// Three answers, and only one of them touches memory. Forwarding is what lets
+// a load see a store that has not committed yet; replaying is what keeps it
+// from guessing when an older address is still unknown.
+bool Cpu::execute_load(Uop& u, uint32_t& latency) {
+    const uint32_t addr = u.val1 + static_cast<uint32_t>(u.dec.imm);
+    lsq_.resolve_load_addr(u.lsq_idx, addr);
+
+    const ForwardResult f = lsq_.search_older_stores(u.lsq_idx);
+    if (f.kind == Forward::REPLAY) return false;
+
+    u.mem_addr   = addr;
+    u.has_result = true;
+    if (f.kind == Forward::FORWARD) {
+        u.result = extend_load(u.dec.op, f.data);
+        latency  = 1;                       // never left the store queue
+        ++stats_.load_forwards;
+        return true;
+    }
+
+    switch (u.dec.op) {
+    case Op::LB:  u.result = extend_load(Op::LB, mem_.load_u8 (addr)); break;
+    case Op::LH:  u.result = extend_load(Op::LH, mem_.load_u16(addr)); break;
+    case Op::LBU: u.result = mem_.load_u8 (addr); break;
+    case Op::LHU: u.result = mem_.load_u16(addr); break;
+    default:      u.result = mem_.load_u32(addr); break;
+    }
+    ++stats_.load_memory;
+    return true;
 }
 
 void Cpu::execute_uop(Uop& u) {
@@ -397,22 +471,13 @@ void Cpu::execute_uop(Uop& u) {
         u.next_pc = (rs1 + imm) & ~1u;
         break;
 
-    // ---- Loads ------------------------------------------------------------
-    case Op::LB: {
-        const auto b = static_cast<int8_t>(mem_.load_u8(rs1 + imm));
-        u.result = static_cast<uint32_t>(static_cast<int32_t>(b));
-        u.has_result = true;
+    // ---- Loads: handled by execute_load, which has to ask the queue -------
+    case Op::LB:
+    case Op::LH:
+    case Op::LW:
+    case Op::LBU:
+    case Op::LHU:
         break;
-    }
-    case Op::LH: {
-        const auto h = static_cast<int16_t>(mem_.load_u16(rs1 + imm));
-        u.result = static_cast<uint32_t>(static_cast<int32_t>(h));
-        u.has_result = true;
-        break;
-    }
-    case Op::LW:  u.result = mem_.load_u32(rs1 + imm); u.has_result = true; break;
-    case Op::LBU: u.result = mem_.load_u8 (rs1 + imm); u.has_result = true; break;
-    case Op::LHU: u.result = mem_.load_u16(rs1 + imm); u.has_result = true; break;
 
     // ---- Stores: address and data now, memory at commit -------------------
     case Op::SB:
@@ -484,12 +549,25 @@ void Cpu::commit() {
 
         // Every architectural effect that is not a register write happens here
         // and nowhere else, memory included.
+        // The queue seats are given up in the same order they were taken.
+        if (u.dec.is_load) lsq_.loads().pop_head();
+
         TrapCause cause = u.trap;
         if (cause == TrapCause::NONE) {
             switch (u.dec.op) {
-            case Op::SB: mem_.store_u8 (u.mem_addr, static_cast<uint8_t> (u.store_data)); break;
-            case Op::SH: mem_.store_u16(u.mem_addr, static_cast<uint16_t>(u.store_data)); break;
-            case Op::SW: mem_.store_u32(u.mem_addr, u.store_data); break;
+            // A store leaves the queue and becomes visible to the world in
+            // the same instant, which is what makes a squash able to erase it
+            // by doing nothing at all.
+            case Op::SB:
+            case Op::SH:
+            case Op::SW: {
+                const LsqEntry& st = lsq_.stores().nth(0);
+                if      (u.dec.op == Op::SB) mem_.store_u8 (st.addr, static_cast<uint8_t> (st.data));
+                else if (u.dec.op == Op::SH) mem_.store_u16(st.addr, static_cast<uint16_t>(st.data));
+                else                         mem_.store_u32(st.addr, st.data);
+                lsq_.stores().pop_head();
+                break;
+            }
 
             case Op::ECALL:
                 if (reg(REG_A7) == SYS_EXIT) {
@@ -544,6 +622,7 @@ void Cpu::squash_in_flight() {
     rob_.squash_all();
 
     rat_.adopt(arch_rat_);
+    lsq_.clear();
     fetch_q_.clear();
     decode_q_.clear();
     rename_q_.clear();

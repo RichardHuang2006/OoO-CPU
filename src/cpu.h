@@ -9,6 +9,7 @@
 #include "decoder.h"
 #include "freelist.h"
 #include "issue_queue.h"
+#include "lsq.h"
 #include "memory.h"
 #include "prf.h"
 #include "rat.h"
@@ -66,8 +67,9 @@ struct Uop {
     uint32_t  result     = 0;
     bool      has_result = false;
     uint32_t  next_pc    = 0;
-    uint32_t  mem_addr   = 0;    // store address, computed at issue
+    uint32_t  mem_addr   = 0;    // access address, computed at issue
     uint32_t  store_data = 0;    // store data, written to memory at commit
+    uint32_t  lsq_idx    = 0;    // load- or store-queue seat, taken at dispatch
     uint64_t  wb_cycle   = 0;    // writeback port booked at issue
     TrapCause trap       = TrapCause::NONE;
 };
@@ -107,7 +109,8 @@ public:
     bool idle() const {
         return fetch_q_.empty() && decode_q_.empty() && rename_q_.empty() &&
                iq_.empty() && executing_.empty() && wb_fast_.empty() &&
-               wb_slow_.empty() && rob_.empty();
+               wb_slow_.empty() && rob_.empty() && lsq_.loads().empty() &&
+               lsq_.stores().empty();
     }
 
     // False if anything ever committed out of program order.
@@ -119,6 +122,7 @@ public:
     const Rat&        rat()       const { return rat_; }
     const FreeList&   free_list() const { return free_list_; }
     const IssueQueue& iq()        const { return iq_; }
+    const Lsq&        lsq()       const { return lsq_; }
 
     uint32_t fetch_queue()   const { return static_cast<uint32_t>(fetch_q_.size()); }
     uint32_t decode_queue()  const { return static_cast<uint32_t>(decode_q_.size()); }
@@ -177,6 +181,11 @@ private:
     // Compute the result, the store address and data, or the branch target.
     void execute_uop(Uop& u);
 
+    // Resolve a load's address and ask the store queue about it. False means
+    // an older store might own these bytes but cannot say yet, so the load
+    // stays in the issue queue and tries again next cycle.
+    bool execute_load(Uop& u, uint32_t& latency);
+
     // Land a result: value into the PRF, tag onto the queue, entry marked done.
     void complete(const Uop& u);
 
@@ -193,10 +202,6 @@ private:
     // port count honest instead of letting results pile up at writeback.
     bool reserve_cdb(uint64_t at_cycle);
 
-    // True while any store older than `seq` is still in the ROB. Stores write
-    // memory at commit, so a load issued before then would read stale bytes.
-    bool older_store_pending(SeqNum seq) const;
-
     // Drop everything in flight and undo its renaming, so nothing behind a
     // halting instruction can reach commit or leak a physical register.
     void squash_in_flight();
@@ -208,6 +213,7 @@ private:
     FreeList    free_list_;
     Rat         rat_;
     IssueQueue  iq_;
+    Lsq         lsq_;
 
     // Per-instruction payload, indexed by ROB slot, read back at commit.
     std::vector<Uop> inflight_;
