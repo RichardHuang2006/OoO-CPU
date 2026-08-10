@@ -43,7 +43,7 @@ $(OBJDIR)/%.o: src/%.cpp | $(OBJDIR)
 
 # ------------------------------------------------------ debug / sanitized ---
 # Builds the instrumented CLI binary and runs the full test suite under
-# ASan + UBSan, matching Mini-GPU / Mini-TPU.
+# ASan + UBSan.
 debug: $(BUILD)/oooc-debug $(BUILD)/test_main-debug examples
 	./$(BUILD)/test_main-debug
 
