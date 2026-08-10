@@ -42,7 +42,10 @@ $(OBJDIR)/%.o: src/%.cpp | $(OBJDIR)
 	$(CXX) $(CXXFLAGS_REL) -MMD -MP -c $< -o $@
 
 # ------------------------------------------------------ debug / sanitized ---
-debug: $(BUILD)/oooc-debug
+# Builds the instrumented CLI binary and runs the full test suite under
+# ASan + UBSan, matching Mini-GPU / Mini-TPU.
+debug: $(BUILD)/oooc-debug $(BUILD)/test_main-debug examples
+	./$(BUILD)/test_main-debug
 
 $(BUILD)/oooc-debug: $(DBG_OBJ) | $(BUILD)
 	@if [ -z "$(DBG_OBJ)" ]; then echo "no src/*.cpp to build"; exit 1; fi
@@ -50,6 +53,10 @@ $(BUILD)/oooc-debug: $(DBG_OBJ) | $(BUILD)
 
 $(DBGDIR)/%.o: src/%.cpp | $(DBGDIR)
 	$(CXX) $(CXXFLAGS_DBG) -MMD -MP -c $< -o $@
+
+$(BUILD)/test_main-debug: $(TEST_SRC) $(CPU_SRC) $(HDR) | $(BUILD)
+	@if [ ! -f $(TEST_SRC) ]; then echo "no $(TEST_SRC)"; exit 1; fi
+	$(CXX) $(CXXFLAGS_DBG) $(TEST_SRC) $(LIB_SRC) -o $@ $(LDFLAGS_DBG)
 
 # --------------------------------------------------------------- tooling ---
 $(BUILD)/gen_examples: $(TOOLS_SRC) | $(BUILD)
@@ -85,7 +92,7 @@ clean:
 help:
 	@echo "Mini-CPU targets:"
 	@echo "  all      build/oooc         (release, -O2, warnings-as-errors off)"
-	@echo "  debug    build/oooc-debug   (ASan + UBSan, -O1 -g)"
+	@echo "  debug    build/oooc-debug + run the test suite under ASan + UBSan"
 	@echo "  test     compile+run tests/test_main after regenerating examples/"
 	@echo "  clean    remove build/ and examples/"
 
