@@ -10,15 +10,15 @@
 #include "asm.h"
 
 // ================================================================ workloads ===
-// The validation corpus: fourteen programs run through both the pipeline
-// model and ref.h, covering ALU semantics, loops, arrays, store forwarding,
-// sub-word and partial-overlap accesses, nested calls, recursive Fibonacci,
-// an unpredictable branch, mul/div with divide-by-zero, a pointer chase, a
+// The validation corpus: fourteen programs run through both the pipeline model
+// and ref.h, covering ALU semantics, loops, arrays, store-to-load forwarding,
+// sub-word and partial-overlap accesses, nested calls, recursive Fibonacci, an
+// unpredictable branch, mul/div including divide-by-zero, a pointer chase, a
 // WAW/WAR renaming stress, and a bitwise CRC-32.
 //
 // Every expected exit code is derived independently of the simulator: by hand
-// where the arithmetic is simple, by an equivalent C++ loop where it is not.
-// A value read off a previous run would assert nothing.
+// where the arithmetic is simple, by an equivalent C++ computation otherwise,
+// never from a previous run's output.
 
 namespace wl {
 
@@ -36,7 +36,7 @@ struct Workload {
 using asmc::Assembler;
 using namespace asmc;   // register aliases: a0, t0, s0, sp, ra, zero, ...
 
-// exit(a0) — every workload leaves its result in a0 and ends here.
+// exit(a0): every workload leaves its result in a0 and ends here.
 inline void exit_now(Assembler& p) {
     p.li(a7, 93);
     p.ecall();
@@ -87,8 +87,8 @@ inline Workload loop() {
 }
 
 // ---- 3. Arrays: bubble sort -----------------------------------------------
-// Sorts a permutation of 1..12, verifies the result is ordered, and exits
-// with a[0] * 100 + a[11] — 112 when sorted, 999 if any pair is out of order.
+// Sorts a permutation of 1..12, verifies the result is ordered, and exits with
+// a[0] * 100 + a[11]: 112 when sorted, 999 if any pair is out of order.
 inline Workload bubble_sort() {
     const int32_t input[12] = {9, 4, 7, 1, 12, 3, 8, 2, 11, 5, 10, 6};
 
@@ -279,9 +279,9 @@ inline Workload sieve() {
 }
 
 // ---- 6. Store-to-load forwarding ------------------------------------------
-// Twenty dependent store→load pairs at one address, each feeding the next.
-// The pipeline forwards them out of the store queue; the reference just sees
-// memory, which is the disagreement worth testing for.
+// Twenty dependent store-load pairs at one address, each feeding the next. The
+// pipeline serves them from the store queue while the reference reads memory,
+// so the two paths must still agree.
 inline Workload store_forward() {
     Assembler p;
     p.li(s0, static_cast<int32_t>(DATA));
@@ -485,8 +485,8 @@ inline Workload muldiv() {
 
 // ---- 12. Pointer chase ----------------------------------------------------
 // 32 two-word nodes in a stride-7 cycle (7 is coprime with 32, so the cycle
-// covers every node). The traversal is a chain of dependent loads, which no
-// amount of issue width can accelerate.
+// covers every node). The traversal is a chain of dependent loads, which issue
+// width cannot accelerate.
 inline Workload pointer_chase() {
     Assembler p;
     p.li(s0, static_cast<int32_t>(DATA));
@@ -554,9 +554,9 @@ inline Workload waw_war() {
 // ---- 14. CRC-32 -----------------------------------------------------------
 // Bitwise CRC-32 (reflected, polynomial 0xEDB88320) over the 256 bytes 0..255.
 // The inner loop branches on one data-dependent bit per iteration, which no
-// history length can predict, so this is the corpus' mispredict case. The
-// expected value is zlib's, which makes it an ISA check against an outside
-// authority rather than against ref.h.
+// history length predicts, so this is the corpus' mispredict case. The expected
+// value is zlib's, making it an ISA check against an external reference rather
+// than against ref.h.
 inline Workload crc32() {
     Assembler p;
     p.li(s0, static_cast<int32_t>(DATA));

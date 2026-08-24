@@ -1,8 +1,9 @@
 #pragma once
 
-// Header-only RV32IM assembler for the tests, so no external riscv-toolchain
-// is needed. Covers the whole ISA plus the pseudos li / mv / nop / j / jr /
-// ret / call, resolves labels in a second pass, and emits a word vector.
+// Header-only RV32IM assembler for the tests, removing any dependency on an
+// external RISC-V toolchain. Covers the whole ISA plus the pseudos li, mv, nop,
+// j, jr, ret and call, resolves labels in a second pass, and emits a word
+// vector.
 
 #include <cstdint>
 #include <stdexcept>

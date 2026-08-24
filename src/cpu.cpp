@@ -6,9 +6,9 @@
 
 namespace {
 
-// OP-IMM is the only class taking its second operand from the immediate;
-// ADDI and ADD share an Op because the function unit does not care where the
-// operand came from.
+// OP-IMM is the only class taking its second operand from the immediate. ADDI
+// and ADD share an Op, since the function unit is indifferent to the operand's
+// source.
 bool uses_immediate(const Decoded& d) { return (d.raw & 0x7Fu) == 0x13u; }
 
 // The proxy-kernel exit syscall: ecall with a7 == 93 halts and yields a0.
@@ -16,7 +16,7 @@ constexpr uint32_t SYS_EXIT = 93;
 constexpr ArchReg  REG_A0   = 10;
 constexpr ArchReg  REG_A7   = 17;
 
-// Bytes touched by a memory op, which is what decides overlap in the queues.
+// Bytes touched by a memory op; queue overlap is decided on this width.
 uint8_t access_size(Op op) {
     switch (op) {
     case Op::LB: case Op::LBU: case Op::SB: return 1;
@@ -35,8 +35,8 @@ uint32_t extend_load(Op op, uint32_t v) {
     }
 }
 
-// x1 and x5 are the link registers, which is how the ISA tells the predictor
-// a jump is really a call or a return.
+// x1 and x5 are the link registers, which is how the ISA distinguishes a call
+// or a return from a plain jump.
 bool is_link(ArchReg r) { return r == 1 || r == 5; }
 
 BranchKind kind_of(const Decoded& d) {
@@ -89,7 +89,7 @@ std::array<uint32_t, 32> Cpu::regs() const {
 }
 
 // Stages run in reverse order so each drains its input before the producer
-// refills it, giving one uop per stage per cycle at every width.
+// refills it, bounding every stage to `width` uops per cycle.
 void Cpu::tick() {
     if (done()) return;
 
@@ -114,15 +114,13 @@ bool Cpu::run(uint64_t max_cycles) {
 }
 
 // ---------------------------------------------------------------- fetch ---
-// Every PC is offered to the predictor, which answers from the target cache
-// alone — a PC it has never committed a taken branch for falls through, which
-// is exactly what hardware does and the reason a cold branch always costs a
+// Every PC is offered to the predictor, which answers from the BTB alone: a PC
+// with no committed taken branch falls through, so a cold branch always costs a
 // recovery.
 //
-// The history and return stack move here, speculatively, because the very next
-// prediction depends on them. What the checkpoint keeps is the history from
-// before this branch's own shift and the return stack from after its own push
-// or pop, which is precisely the state recovery has to get back to.
+// Global history and the return stack advance speculatively here, since the
+// next prediction depends on them. The checkpoint holds the history from before
+// this branch's shift and the return stack from after its push or pop.
 void Cpu::fetch() {
     if (fetch_stalled_) return;
 
@@ -177,11 +175,11 @@ void Cpu::decode_stage() {
 }
 
 // --------------------------------------------------------------- rename ---
-// Sources become the physical tags the RAT currently points at; the
-// destination takes a fresh register and the displaced mapping rides in the
-// ROB entry until commit hands it back. That is the whole trick: no two
-// writers of one architectural register ever share storage, so WAW and WAR
-// stop existing and only true dependences survive into the issue queue.
+// Sources take the RAT's current physical tags; the destination takes a fresh
+// free-list register and the displaced mapping rides in the ROB entry until
+// commit returns it. Two writers of one architectural register never share
+// storage, so WAW and WAR disappear and only true dependences reach the issue
+// queue.
 void Cpu::rename() {
     for (uint32_t n = 0; n < cfg_.width; ++n) {
         if (decode_q_.empty()) break;
@@ -245,11 +243,10 @@ void Cpu::rename() {
 }
 
 // ------------------------------------------------------------- dispatch ---
-// The uop takes its issue-queue seat here, and a memory op also takes its
-// place in line in the load or store queue. Those seats are handed out in
-// program order, which is what makes "older than me" answerable later without
-// searching. Ready bits are sampled from the PRF once, on the way in; after
-// that the entry only learns from tag broadcasts.
+// The uop takes its issue-queue seat here; a memory op also takes a load- or
+// store-queue seat. Seats are allocated in program order, so "older than me"
+// is a sequence-number comparison rather than a search. Ready bits are sampled
+// from the PRF on entry; afterwards the entry learns only from tag broadcasts.
 void Cpu::dispatch() {
     for (uint32_t n = 0; n < cfg_.width; ++n) {
         if (rename_q_.empty()) break;
@@ -278,8 +275,8 @@ void Cpu::dispatch() {
         e.src1       = u.src1;
         e.src2       = u.src2;
         e.dest       = u.dest;
-        // An unused source decodes to x0, which maps to p0 and is always
-        // ready, so no operand needs a "do I read this" flag.
+        // An unused source decodes to x0, which maps to p0 and is always ready,
+        // so no operand needs a separate "is this read" flag.
         e.src1_ready = prf_.is_ready(u.src1);
         e.src2_ready = prf_.is_ready(u.src2);
         e.latency    = latency_of(u.dec);
@@ -346,14 +343,13 @@ bool Cpu::reserve_cdb(uint64_t at_cycle) {
     return true;
 }
 
-// Oldest ready first, but a uop blocked on a unit or a writeback port only
-// blocks itself — the next candidate still gets a look. That is the point of
-// the whole machine: program order stopped constraining execution at rename.
+// Oldest-ready select. A uop blocked on a function unit or a writeback port
+// blocks only itself; the next candidate is still considered.
 //
 // A cycle offers exactly `width` issue slots, so the reasons candidates were
-// turned away are charged against the slots that actually went unused, oldest
-// first. Counting every turned-away candidate instead would let one cycle
-// report more lost slots than the machine has.
+// turned away are charged against the slots that went unused, oldest first.
+// Counting every turned-away candidate would let one cycle report more lost
+// slots than the machine has.
 void Cpu::issue() {
     const std::vector<IssueQueue::Entry> ready = iq_.select(iq_.size());
     uint32_t issued = 0;
@@ -375,12 +371,11 @@ void Cpu::issue() {
         u.val2 = prf_.read(u.src2);
 
         if (u.dec.is_load) {
-            // A load cannot book a writeback port at issue: whether it takes
-            // one cycle or all of memory latency depends on what the store
-            // queue says, which is only known now.
+            // A load cannot book a writeback port at issue: its latency depends
+            // on whether the store queue forwards, settled only here.
             if (!execute_load(u, lat)) {
-                // Address generation happened, so the unit is spent either
-                // way; the load keeps its seat and asks again next cycle.
+                // Address generation already happened, so the unit is spent
+                // either way; the load keeps its seat and retries next cycle.
                 fu_free_at_[static_cast<int>(Fu::MEM)][static_cast<std::size_t>(unit)] =
                     cycle_ + 1;
                 ++stats_.load_replays;
@@ -388,9 +383,8 @@ void Cpu::issue() {
                 continue;
             }
         } else {
-            // Everything else knows its latency at issue, so it books the
-            // writeback port for the cycle the value lands and does not go
-            // without one.
+            // Everything else knows its latency at issue and cannot issue
+            // without booking the writeback port for the cycle it lands.
             if (u.dec.writes_rd && !reserve_cdb(cycle_ + lat)) {
                 blocked.push_back(Stall::CDB);
                 continue;
@@ -408,9 +402,9 @@ void Cpu::issue() {
         }
         u.wb_cycle = cycle_ + lat;
 
-        // The guess is settled here. If it was wrong, the oldest offender in
-        // the cycle is the one that recovers: anything younger is on a path
-        // that never existed, including a younger branch that also "resolved".
+        // The prediction resolves here. On a misprediction the oldest offender
+        // in the cycle recovers; anything younger, including a younger branch
+        // that also resolved, is on a path that never existed.
         const uint32_t predicted = u.pred_taken ? u.pred_target : u.pc + 4;
         if (u.next_pc != predicted) {
             rob_.at(u.rob).mispredicted = true;
@@ -442,8 +436,8 @@ void Cpu::issue() {
         stats_.stall(s);
         --lost;
     }
-    // A slot nothing was even turned away from was lost to a producer, not to
-    // a resource — unless the queue is empty, in which case the front end is
+    // A slot where nothing was turned away was lost to a producer rather than a
+    // resource, unless the queue is empty, in which case the front end is
     // behind and has already accounted for it.
     for (; lost > 0 && !iq_.empty(); --lost) stats_.stall(Stall::OPERANDS);
 
@@ -457,14 +451,12 @@ void Cpu::release_cdb(const Uop& u) {
     if (booked > 0) --booked;
 }
 
-// Everything younger than the branch is undone in one cycle, and fetch — which
-// runs later in this same cycle — restarts on the real path.
+// Everything younger than the branch is undone in one cycle; fetch runs later
+// in the same cycle and restarts on the correct path.
 //
-// Registers go back youngest first, and each entry returns the register it
-// allocated rather than the stale one it displaced: that stale mapping still
-// belongs to an older entry, which will hand it back at its own commit.
-// Getting that direction backwards is the classic recovery bug, and it does
-// not show up until some unrelated register is quietly wrong much later.
+// Registers are reclaimed youngest first, each entry returning the register it
+// allocated rather than the stale one it displaced. The stale mapping still
+// belongs to an older entry, which returns it at its own commit.
 void Cpu::recover(const Uop& br) {
     const std::vector<RobEntry> killed = rob_.truncate_to(br.rob);
     for (const RobEntry& e : killed) {
@@ -481,7 +473,8 @@ void Cpu::recover(const Uop& br) {
 
     rat_.restore_checkpoint(br.ckpt);
     bpred_.restore(ckpt_fe_[br.ckpt]);
-    // The history the branch shifted in was a guess; replace it with the fact.
+    // Replace the speculative history bit this branch shifted in with the
+    // resolved outcome.
     if (br.btb_hit && br.bkind == BranchKind::CONDITIONAL) {
         bpred_.shift_history(br.next_pc != br.pc + 4);
     }
@@ -511,9 +504,9 @@ void Cpu::execute() {
     executing_.swap(still_running);
 }
 
-// Three answers, and only one of them touches memory. Forwarding is what lets
-// a load see a store that has not committed yet; replaying is what keeps it
-// from guessing when an older address is still unknown.
+// Three outcomes, one of which touches memory. Forwarding lets a load read an
+// uncommitted store; replay prevents it from guessing while an older store
+// address is unresolved.
 bool Cpu::execute_load(Uop& u, uint32_t& latency) {
     const uint32_t addr = u.val1 + static_cast<uint32_t>(u.dec.imm);
     lsq_.resolve_load_addr(u.lsq_idx, addr);
@@ -631,8 +624,8 @@ void Cpu::complete(const Uop& u) {
     ++stats_.wrote_back;
 }
 
-// Runs before issue, so a tag broadcast this cycle reaches select this cycle.
-// Everything about back-to-back dependent issue rests on that ordering.
+// Runs before issue, so a tag broadcast this cycle reaches select in the same
+// cycle. Back-to-back dependent issue depends on that ordering.
 void Cpu::writeback() {
     uint32_t ports = cfg_.num_cdb;
 
@@ -647,8 +640,8 @@ void Cpu::writeback() {
         wb_fast_.pop_front();
     }
 
-    // Loads could not book one — their latency is not known at issue — so they
-    // take whatever is left and retry next cycle otherwise.
+    // Loads could not book a port at issue, so they take the remaining
+    // bandwidth and retry next cycle otherwise.
     while (!wb_slow_.empty() && ports > 0) {
         complete(wb_slow_.front());
         wb_slow_.pop_front();
@@ -671,13 +664,12 @@ void Cpu::commit() {
         if (stats_.retired > 0 && u.seq <= last_committed_seq_) commit_in_order_ = false;
         last_committed_seq_ = u.seq;
 
-        // Every architectural effect that is not a register write happens here
-        // and nowhere else, memory included.
-        // The queue seats are given up in the same order they were taken.
+        // Every architectural effect other than a register write happens here,
+        // memory included. Queue seats are released in allocation order.
         if (u.dec.is_load) lsq_.loads().pop_head();
 
-        // The predictor only learns from instructions that really ran, so a
-        // wrong path can never train it.
+        // The predictor trains only on committed branches, so a wrong path
+        // never reaches its tables.
         if (u.dec.is_branch) {
             const bool taken = u.next_pc != u.pc + 4;
             bpred_.commit(u.pc, u.pht_index, u.bkind, taken, u.next_pc);
@@ -695,9 +687,8 @@ void Cpu::commit() {
         TrapCause cause = u.trap;
         if (cause == TrapCause::NONE) {
             switch (u.dec.op) {
-            // A store leaves the queue and becomes visible to the world in
-            // the same instant, which is what makes a squash able to erase it
-            // by doing nothing at all.
+            // A store leaves the queue and becomes globally visible in the same
+            // instant, so a squash erases it by doing nothing.
             case Op::SB:
             case Op::SH:
             case Op::SW: {
@@ -726,10 +717,9 @@ void Cpu::commit() {
             }
         }
 
-        // The mapping becomes architectural and the one it displaced goes back
-        // to the free list. This is the only place a register is freed on the
-        // correct path, which is exactly why two writers of one architectural
-        // register can never end up aliasing the same physical storage.
+        // The mapping becomes architectural and the displaced one returns to
+        // the free list. This is the only correct-path free, so two writers of
+        // one architectural register never alias the same physical storage.
         if (u.dest != INVALID_PHYSREG) {
             arch_rat_[u.dec.rd] = u.dest;
             free_list_.free(u.stale);
@@ -751,8 +741,8 @@ void Cpu::commit() {
     }
 }
 
-// Youngest first, so each entry hands back the register it allocated — not the
-// stale one it displaced, which an older entry still owns.
+// Youngest first, so each entry returns the register it allocated, not the
+// stale one it displaced and an older entry still owns.
 void Cpu::squash_in_flight() {
     for (const RobEntry& e : rob_.squash_all()) {
         free_list_.free(e.dest_phys);

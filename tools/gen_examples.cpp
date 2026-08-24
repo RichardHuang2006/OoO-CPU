@@ -1,8 +1,7 @@
-// Writes the bundled workloads to examples/*.hex so the CLI has something to
-// run without the test binary.
-//
-// The programs come from the same assembler and the same corpus the test suite
-// validates, so an example file cannot drift away from what was verified.
+// Writes the bundled workloads to examples/*.hex so the CLI has programs to run
+// without the test binary. They come from the same assembler and the same
+// corpus the test suite validates, so the examples cannot drift from what was
+// verified.
 
 #include <cstdio>
 #include <fstream>

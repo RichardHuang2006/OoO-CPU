@@ -3,9 +3,9 @@
 #include <array>
 #include <cstdint>
 
-// Why a uop that was otherwise ready did not move this cycle. Every stall the
-// machine can suffer is one of these, so the breakdown accounts for the whole
-// gap between issued and width.
+// Why an otherwise ready uop did not move this cycle. Every stall the machine
+// can suffer is one of these, so the breakdown accounts for the whole gap
+// between issued and width.
 enum class Stall : uint8_t {
     ROB_FULL,
     PHYSREG,        // free list empty
@@ -45,8 +45,8 @@ inline const char* stall_name(Stall s) {
     return "none";
 }
 
-// Everything the run reports. Counters are plain fields because every one of
-// them is written from exactly one place in the pipeline.
+// Everything the run reports. Counters are plain fields because each is written
+// from exactly one place in the pipeline.
 struct Stats {
     uint64_t cycles   = 0;
     uint64_t fetched  = 0;
@@ -95,9 +95,9 @@ struct Stats {
         return ras_pops ? static_cast<double>(ras_hits) / ras_pops : 0.0;
     }
 
-    // The resource the machine ran out of most often. Waiting on a producer is
-    // not a resource — it is the program — so it does not compete here, or it
-    // would win on every workload and diagnose nothing.
+    // The resource exhausted most often. OPERANDS is excluded: waiting on a
+    // producer is a property of the program's dependence chains, not of a
+    // structure that can be resized.
     Stall dominant_stall() const {
         Stall best = Stall::COUNT;
         uint64_t most = 0;

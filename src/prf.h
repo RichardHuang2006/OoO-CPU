@@ -7,10 +7,10 @@
 #include "config.h"
 #include "types.h"
 
-// Unified physical register file: one value and one ready bit per register.
-// The ready bit is what the issue queue subscribes to; the value is what
-// execute reads after select. p0 is hard-wired to zero and always ready, so
-// callers never guard rd == x0 before writing.
+// Unified physical register file: one value and one ready bit per register. The
+// issue queue tracks the ready bit; the value is read after select. p0 is
+// hard-wired to zero and always ready, so callers never guard rd == x0 before
+// writing.
 
 class Prf {
 public:
@@ -35,8 +35,8 @@ public:
         return r == 0 || ready_[r] != 0;
     }
 
-    // Flips ready off after a fresh allocation. p0 stays ready; no in-flight
-    // uop is ever allowed to depend on x0 producing a value.
+    // Clears ready after a fresh allocation. p0 stays ready, so no in-flight
+    // uop ever waits on x0 to produce a value.
     void mark_pending(PhysReg r) {
         if (r == 0) return;
         ready_[r] = 0;

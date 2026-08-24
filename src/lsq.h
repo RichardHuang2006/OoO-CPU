@@ -7,14 +7,12 @@
 #include "config.h"
 #include "types.h"
 
-// Load and store queues. Entries are allocated at dispatch, in program order,
-// so "older than me" is a comparison and never a search.
+// Load and store queues. Entries are allocated at dispatch in program order, so
+// "older than me" is a sequence-number comparison rather than a search.
 //
-// A store does not touch memory until it commits, which makes the store queue
-// a speculative write buffer: memory holds the committed past, the queue holds
-// everything a younger load might still need to see. That is why a load
-// consults the queue first and only falls through to memory when no older
-// store can possibly cover it.
+// Stores reach memory only at commit, making the store queue a speculative
+// write buffer: a load searches it for store-to-load forwarding and falls
+// through to memory only when no older store can cover it.
 
 struct LsqEntry {
     SeqNum   seq        = INVALID_SEQNUM;
@@ -114,11 +112,10 @@ public:
         sq_.at(idx).data_ready = true;
     }
 
-    // Walk the older stores oldest to youngest. A store that fully covers the
-    // load with known data settles the question and shadows everything before
-    // it; anything that might cover it but cannot say so yet leaves the load
-    // to ask again. Partial overlap is treated as unknown rather than stitched
-    // together — rare enough that the simplicity is worth the replay.
+    // Walk older stores oldest to youngest. A store that fully covers the load
+    // with known data forwards and shadows everything before it; a possible
+    // overlap that cannot yet be decided forces a replay. Partial overlap is
+    // treated as unknown rather than stitched together from several stores.
     ForwardResult search_older_stores(uint32_t load_idx) const {
         const LsqEntry& ld = lq_.at(load_idx);
         ForwardResult out;
@@ -171,7 +168,7 @@ public:
 
 private:
     // The load's bytes out of the store's word, zero-extended. Sign extension
-    // belongs to the load itself, which is the only thing that knows its op.
+    // belongs to the load, the only party that knows its op.
     static uint32_t extract(const LsqEntry& st, const LsqEntry& ld) {
         const uint32_t off = ld.addr - st.addr;
         uint32_t v = st.data >> (8u * off);

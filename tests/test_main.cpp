@@ -112,7 +112,7 @@ SECTION("types") {
         REQUIRE(from_opt(opt) == r);
     }
 
-    // OpKind values are distinct — enough of a smoke test at this stage.
+    // OpKind values are distinct, which is the whole invariant at this stage.
     static_assert(static_cast<int>(OpKind::ALU)  != static_cast<int>(OpKind::TRAP));
     static_assert(static_cast<int>(OpKind::LOAD) != static_cast<int>(OpKind::STORE));
     static_assert(static_cast<int>(OpKind::NOP)  != static_cast<int>(OpKind::ALU));
@@ -405,8 +405,8 @@ SECTION("alu") {
     REQUIRE( alu::bgeu(static_cast<uint32_t>(-1), 1));
     REQUIRE(!alu::bltu(static_cast<uint32_t>(-1), 1));
 
-    // A few compile-time sanity checks — a regression in the pure primitives
-    // fails to build rather than fails to run.
+    // Compile-time checks, so a regression in the pure primitives fails to
+    // build rather than fails to run.
     static_assert(alu::add(3, 5) == 8u);
     static_assert(alu::div(0x80000000u, 0xFFFFFFFFu) == 0x80000000u);
     static_assert(alu::rem(0x80000000u, 0xFFFFFFFFu) == 0u);
@@ -1277,7 +1277,7 @@ SECTION("ref") {
 
     // ---- 7. Halt, trap, and budget are three distinct outcomes ------------
     {
-        // ecall with a7 != 93 is not the exit syscall — it traps.
+        // ecall with a7 != 93 is not the exit syscall, so it traps.
         Assembler p;
         p.li(a7, 42);
         p.ecall();
@@ -1379,12 +1379,12 @@ SECTION("ref") {
 
 
 // ========================================================= differential run ===
-// `diff_run` runs a workload on the reference and on the model under test,
-// then compares all 32 architectural registers, the exit code, and the
+// `diff_run` runs a workload on the reference and on the model under test, then
+// compares all 32 architectural registers, the exit code, and the
 // retired-instruction count.
 //
-// The model is a swappable function defaulting to the reference itself, so
-// the comparison can be tested against a known-equal pair and against
+// The model is a swappable function defaulting to the reference itself, so the
+// comparison can be exercised against a known-equal pair and against
 // deliberately corrupted ones.
 
 namespace diff {
@@ -1480,9 +1480,8 @@ inline Report compare(const std::string& name, const Outcome& want, const Outcom
     return {ok, d.str()};
 }
 
-// Run `w` on both layers and compare. A reference run that did not halt
-// cleanly is reported as a broken workload; comparing two runs that both
-// fell off the end proves nothing.
+// Run `w` on both layers and compare. A reference run that did not halt cleanly
+// is reported as a broken workload rather than a model mismatch.
 inline Report diff_run(const wl::Workload& w, const Config& cfg) {
     const Outcome want = run_reference(w, cfg);
     if (!want.halted || want.trapped || want.budget) {
@@ -1667,10 +1666,9 @@ SECTION("cpu_tick") {
     }
 
     // ---- One addi, cycle by cycle -----------------------------------------
-    // Fetch, decode, rename, dispatch, issue, writeback, commit — one cycle
-    // each. The value exists in the physical register file after writeback,
-    // but reading a0 only follows the committed mapping, so it appears at
-    // commit and not a cycle earlier.
+    // Fetch, decode, rename, dispatch, issue, writeback, commit: one cycle
+    // each. The value is in the physical register file after writeback, but
+    // reading a0 follows the committed mapping, so it appears at commit.
     {
         Assembler p;
         p.addi(a0, zero, 42);
@@ -2067,8 +2065,8 @@ SECTION("execute_fu") {
 
     // ---- A younger op overtakes a divide, and commit still does not -------
     // The add is nineteen cycles quicker than the divide it sits behind and
-    // writes its physical register first. Renaming is what makes that safe;
-    // in-order commit is what keeps it invisible from the outside.
+    // writes its physical register first. Renaming makes that safe; in-order
+    // commit keeps it externally invisible.
     {
         Config cfg;
         cfg.width = 1;
@@ -3091,8 +3089,8 @@ SECTION("load_forward") {
     }
 
     // ---- An unresolved older store makes the load wait, then finish -------
-    // The store's address depends on a 20-cycle divide, so the load has to
-    // replay until the ambiguity clears — and then reads the right bytes.
+    // The store's address depends on a 20-cycle divide, so the load replays
+    // until the ambiguity clears, then reads the correct bytes.
     {
         Config cfg;
         cfg.width = 1;
@@ -3511,8 +3509,8 @@ SECTION("ras") {
     }
 
     // ---- Recursion is where the stack earns its keep ----------------------
-    // A one-deep stack cannot hold a recursive call chain, so its returns go
-    // to the target cache instead — which always names the last caller.
+    // A one-deep stack cannot hold a recursive call chain, so its returns fall
+    // back to the BTB, which always names the last caller.
     {
         auto mispredicts_with = [](uint32_t ras_size) {
             Config cfg;
@@ -3866,10 +3864,9 @@ struct Machine {
     Config      cfg;
 };
 
-// Six machines that stress different parts of the same design. Correctness is
-// supposed to be identical on all of them; a renaming, wakeup or recovery bug
-// usually is not, which is what makes running the corpus six times worth more
-// than running it once.
+// Six machines that stress different parts of the same design. Correctness must
+// be identical on all of them, whereas renaming, wakeup and recovery bugs are
+// usually configuration-dependent.
 inline const std::vector<Machine>& machines() {
     static const std::vector<Machine> m = [] {
         std::vector<Machine> v;
@@ -4110,10 +4107,9 @@ SECTION("properties") {
     }
 
     // ---- The predictor learns, and then the loop is free ------------------
-    // The honest statement of "it learned" is not a rate — it is that ten
-    // times the iterations cost the same number of mispredicts. What the
-    // machine pays for is filling the history once; a coin flip would pay
-    // half of every trip forever.
+    // Learning shows up as a constant, not a rate: ten times the iterations
+    // cost the same number of mispredicts, because the only cost is filling the
+    // history once. An unpredicted branch would pay on half of every trip.
     {
         auto spin = [](int32_t trips) {
             Assembler p;
@@ -4140,8 +4136,8 @@ SECTION("properties") {
     }
 
     // ---- crc32 agrees with zlib, byte for byte ----------------------------
-    // The only check in the suite that does not appeal to ref.h: an outside
-    // authority fixed this number long before this simulator existed.
+    // The only check in the suite that does not appeal to ref.h: the expected
+    // value is fixed by an external reference implementation.
     {
         std::vector<uint8_t> bytes(256);
         for (int i = 0; i < 256; ++i) bytes[i] = static_cast<uint8_t>(i);
@@ -4174,9 +4170,9 @@ inline Config tiny() {
     return c;
 }
 
-// Loads a generated example the way the CLI would, and hands back exactly the
-// words the file held — the loader places them in memory, and the file's own
-// data lines say how many there are.
+// Loads a generated example the way the CLI would and returns exactly the words
+// the file held: the loader places them in memory, and the file's own data lines
+// give the count.
 inline std::optional<std::vector<uint32_t>> read_hex(const std::string& path) {
     std::ifstream count_pass(path);
     if (!count_pass) return std::nullopt;
@@ -4393,8 +4389,8 @@ SECTION("rob") {
         REQUIRE(rob.in_flight(branch));
         REQUIRE(!rob.in_flight(rob.capacity() - 1));
 
-        // The tail is restored, so the next allocation lands right behind the
-        // survivor — with a fresh sequence number, never a reused one.
+        // The tail is restored, so the next allocation lands directly behind the
+        // survivor, with a fresh sequence number rather than a reused one.
         REQUIRE(rob.tail() == 4u);
         REQUIRE(!rob.full());
         const RobIndex refill = rob.allocate(entry(0x2000));
@@ -4509,7 +4505,7 @@ SECTION("rat") {
     REQUIRE(rat.num_free_checkpoints() == cfg.num_checkpoints - 1);
 
     // ---- Restore reproduces the RAT bit-identical -----------------------
-    // Snapshot the pre-restore mapping so we can compare byte-for-byte.
+    // Snapshot the pre-restore mapping for a byte-for-byte comparison.
     const auto expected = rat.mapping();
     // Arbitrary writes on top of the snapshot.
     for (ArchReg a = 1; a < Rat::ARCH_REGS; ++a) rat.set(a, 100 + a);

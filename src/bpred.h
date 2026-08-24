@@ -7,9 +7,9 @@
 #include "config.h"
 #include "types.h"
 
-// What the target predictor has to tell apart. Direction comes from history
-// for a conditional branch, from the return stack for a return, and is simply
-// "taken" for everything else.
+// The control-transfer classes the predictor distinguishes. Direction comes
+// from global history for a conditional branch, from the return stack for a
+// return, and is always taken for everything else.
 enum class BranchKind : uint8_t {
     NONE,
     CONDITIONAL,
@@ -19,9 +19,8 @@ enum class BranchKind : uint8_t {
 };
 
 // gshare: a table of two-bit saturating counters indexed by the global history
-// XORed with the PC. The XOR is the whole idea — the same branch under
-// different histories lands in different counters, so a branch that is only
-// predictable in context becomes predictable.
+// XORed with the PC. The XOR gives one branch distinct counters under distinct
+// histories, so context-dependent branches become predictable.
 class Gshare {
 public:
     Gshare(uint32_t ghr_bits, uint32_t pht_size)
@@ -58,10 +57,8 @@ private:
     uint32_t             ghr_mask_ = 0;
 };
 
-// PC-tagged, set-associative, least-recently-used. A miss means the front end
-// has never seen this PC take a branch, so it falls through to the next
-// instruction — which is what hardware does, and the source of a whole class
-// of bug if a model pretends otherwise.
+// PC-tagged, set-associative, LRU replacement. A miss means no committed taken
+// branch at this PC, so the front end falls through to the next instruction.
 class Btb {
 public:
     struct Hit {
@@ -121,8 +118,8 @@ private:
     uint64_t           clock_ = 0;      // LRU ordering, not cycles
 };
 
-// Return address stack. Fixed storage and trivially copyable, because every
-// fetch has to be able to snapshot it cheaply for a possible recovery.
+// Return address stack. Fixed storage and trivially copyable, so every fetch
+// can snapshot it cheaply for a possible recovery.
 class Ras {
 public:
     static constexpr uint32_t MAX_ENTRIES = 32;
@@ -135,15 +132,15 @@ public:
     uint32_t depth()    const { return count_; }
     bool     empty()    const { return count_ == 0; }
 
-    // Overwrites the deepest entry once full, which is what costs a very deep
-    // recursion its outermost return predictions and nothing else.
+    // Overwrites the deepest entry once full, so recursion deeper than the
+    // stack loses only its outermost return predictions.
     void push(uint32_t addr) {
         top_ = (top_ + 1) % size_;
         stack_[top_] = addr;
         if (count_ < size_) ++count_;
     }
 
-    // Empty is a real state, not an error: the prediction just falls back.
+    // Empty is a valid state, not an error: the prediction falls back.
     uint32_t pop() {
         if (count_ == 0) return 0;
         const uint32_t addr = stack_[top_];
@@ -161,12 +158,11 @@ private:
     uint32_t count_ = 0;
 };
 
-// The three structures behind one fetch-time question: where do I go next?
+// The three structures that together produce the next fetch PC.
 //
-// History and the return stack move speculatively, at fetch, because the very
-// next prediction depends on them. The tables that learn — the counters and
-// the target cache — are only written at commit, so nothing a wrong path did
-// can train them.
+// Global history and the return stack advance speculatively at fetch, since the
+// next prediction depends on them. The learning tables, the counters and the
+// BTB, are written only at commit, so a wrong path cannot train them.
 class BranchPredictor {
 public:
     struct Prediction {
@@ -201,9 +197,9 @@ public:
     }
     void shift_history(bool taken) { gshare_.shift(taken); }
 
-    // One PC in, the next PC out. Only a BTB hit can redirect the front end,
-    // so a branch the machine has never committed is always predicted to fall
-    // through and is corrected when it executes.
+    // One PC in, the next PC out. Only a BTB hit redirects the front end, so a
+    // never-committed branch is predicted to fall through and is corrected when
+    // it executes.
     Prediction predict(uint32_t pc) {
         Prediction p;
         p.pht_index = gshare_.index(pc);

@@ -13,9 +13,9 @@
 // set(0, _) is a no-op so callers do not guard on x0.
 //
 // A bounded pool holds full RAT snapshots, one per in-flight branch.
-// alloc_checkpoint() copies the RAT at call time; restore_checkpoint()
-// copies it back; free_checkpoint() releases the slot. The pool refuses
-// allocation when full — the caller stalls the branch that would take it.
+// alloc_checkpoint() copies the RAT at call time, restore_checkpoint() copies
+// it back, free_checkpoint() releases the slot. The pool refuses allocation
+// when full; the caller stalls the branch that would have taken it.
 
 class Rat {
 public:
@@ -56,9 +56,8 @@ public:
         return id;
     }
 
-    // Copy the snapshot back into the RAT. Does not release the slot;
-    // recovery frees it separately so age-ordered squash logic stays in
-    // one place.
+    // Copy the snapshot back into the RAT. Does not release the slot; recovery
+    // frees it separately, keeping age-ordered squash logic in one place.
     void restore_checkpoint(CheckpointId id) {
         rat_ = snapshots_[id];
     }

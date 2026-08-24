@@ -7,12 +7,12 @@
 #include "types.h"
 
 // Non-data-capture issue queue: entries hold physical register tags and ready
-// bits, never values. Operands are read from the PRF at select, so a waiting
-// entry costs two tags instead of two 32-bit words and a wakeup is a tag
-// compare rather than a value copy.
+// bits, never values. Operands are read from the PRF at select, so an entry
+// costs two tags instead of two 32-bit words and tag wakeup is a tag compare
+// rather than a value copy.
 //
-// Entries are kept in dispatch order, which is program order, so "oldest
-// ready" is the first match in a forward scan.
+// Entries stay in dispatch order, which is program order, so oldest-ready
+// select is the first match in a forward scan.
 
 class IssueQueue {
 public:
@@ -52,9 +52,9 @@ public:
         }
     }
 
-    // Ready entries, oldest first, at most `limit`. Whether one of them can
-    // actually go depends on function units and writeback ports, which the
-    // caller owns; passing size() gives it the whole ready set to choose from.
+    // Ready entries, oldest first, at most `limit`. Function units and
+    // writeback ports belong to the caller; passing size() hands it the whole
+    // ready set.
     std::vector<Entry> select(uint32_t limit) const {
         std::vector<Entry> out;
         for (const Entry& e : entries_) {

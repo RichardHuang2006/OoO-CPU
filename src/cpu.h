@@ -18,32 +18,26 @@
 #include "stats.h"
 #include "types.h"
 
-// Seven stages — fetch, decode, rename, dispatch, issue, execute, writeback —
-// feeding in-order commit off the reorder-buffer head, `Config::width` uops per
-// stage per cycle.
+// Seven-stage out-of-order pipeline (fetch, decode, rename, dispatch, issue,
+// execute, writeback) with in-order commit from the ROB head, `Config::width`
+// uops per stage per cycle.
 //
-// tick() runs the stages in reverse order, so each drains what its producer
-// left behind last cycle and the queues between them behave like latches. The
-// one deliberate exception is writeback, which broadcasts a result before issue
-// runs in the same cycle: that is what lets a dependent single-cycle op issue
-// back to back with its producer instead of losing a cycle to the round trip.
+// tick() runs the stages in reverse order so the inter-stage queues behave as
+// latches. Writeback is the exception: it broadcasts before issue in the same
+// cycle, so a dependent single-cycle op can issue back to back with its
+// producer.
 //
-// Rename is what makes the back end out of order. Sources become physical tags
-// from the RAT, destinations come off the free list, and the displaced mapping
-// rides in the ROB entry until commit returns it — so two writers to the same
-// architectural register never share storage and only true dependences remain.
-// Issue then picks the oldest ready ops the function units and writeback ports
-// can accept, in whatever order that turns out to be.
+// Rename maps sources to the RAT's current physical tags and destinations to
+// free-list registers, holding the displaced mapping in the ROB entry until
+// commit returns it. WAW and WAR hazards disappear, so only true dependences
+// reach the issue queue, which selects the oldest ready ops the function units
+// and writeback ports can accept. Loads consult the store queue for forwarding
+// instead of waiting for older stores to commit.
 //
-// Loads go through the store queue rather than waiting for older stores to
-// commit, so a load can read a store that only exists in the queue so far.
-//
-// The front end predicts and is therefore sometimes wrong. Every branch takes
-// a checkpoint of the register mapping, the history and the return stack at
-// rename; when one resolves against its prediction, recovery hands back every
-// younger register, erases every younger entry in every structure, restores
-// the checkpoint and redirects fetch — all before fetch runs in the same
-// cycle, so the correct path starts immediately.
+// Branches checkpoint the register mapping, global history, and return stack at
+// rename. On misprediction, recovery reclaims younger physical registers,
+// flushes younger entries from every structure, restores the checkpoint, and
+// redirects fetch in the same cycle.
 
 enum class TrapCause : uint8_t {
     NONE,
@@ -79,7 +73,7 @@ struct Uop {
     uint64_t  wb_cycle   = 0;    // writeback port booked at issue
     TrapCause trap       = TrapCause::NONE;
 
-    // ---- what the front end guessed, and what it will need to undo --------
+    // ---- front-end prediction state, and what recovery must undo ---------
     bool       pred_taken  = false;
     uint32_t   pred_target = 0;
     bool       btb_hit     = false;
@@ -103,8 +97,8 @@ public:
     const Config& config() const { return cfg_; }
 
     // ---- architectural state ---------------------------------------------
-    // What a register holds is whatever its committed mapping points at, so
-    // reads here never see a speculative value.
+    // Reads go through the committed mapping, so they never observe a
+    // speculative value.
     uint32_t reg(ArchReg r) const { return prf_.read(arch_rat_[r]); }
     std::array<uint32_t, 32> regs() const;
     uint32_t fetch_pc() const { return pc_; }        // where fetch looks next
@@ -198,9 +192,9 @@ private:
     // Compute the result, the store address and data, or the branch target.
     void execute_uop(Uop& u);
 
-    // Resolve a load's address and ask the store queue about it. False means
-    // an older store might own these bytes but cannot say yet, so the load
-    // stays in the issue queue and tries again next cycle.
+    // Resolve a load's address and search the store queue. False means an older
+    // store may own these bytes but cannot yet say, so the load keeps its
+    // issue-queue seat and retries next cycle.
     bool execute_load(Uop& u, uint32_t& latency);
 
     // Land a result: value into the PRF, tag onto the queue, entry marked done.
@@ -215,17 +209,17 @@ private:
     int free_unit(Fu f) const;
 
     // Book a writeback port for the cycle a result will land. Ops with a known
-    // latency do this at issue and cannot issue without it, which keeps the
-    // port count honest instead of letting results pile up at writeback.
+    // latency do this at issue and cannot issue without it, so CDB bandwidth is
+    // modelled rather than assumed.
     bool reserve_cdb(uint64_t at_cycle);
 
     // Drop everything in flight and undo its renaming, so nothing behind a
     // halting instruction can reach commit or leak a physical register.
     void squash_in_flight();
 
-    // Unwind to just after `br`, which mispredicted. Every younger uop hands
-    // back the register it allocated — its own, never the stale one it
-    // displaced, which an older entry still owns and will return itself.
+    // Unwind to just after `br`, which mispredicted. Every younger uop returns
+    // the register it allocated, never the stale one it displaced, which an
+    // older entry still owns and returns itself.
     void recover(const Uop& br);
 
     // Give back a writeback port booked by a uop that is being squashed.
@@ -259,8 +253,8 @@ private:
     // Per-instruction payload, indexed by ROB slot, read back at commit.
     std::vector<Uop> inflight_;
 
-    // The mapping as of the last commit. Speculation cannot reach it, so it is
-    // what an architectural register read means.
+    // The mapping as of the last commit. Speculation cannot reach it, so it
+    // defines what an architectural register read returns.
     std::array<PhysReg, 32> arch_rat_{};
 
     uint32_t pc_      = 0;

@@ -24,8 +24,8 @@ struct RobEntry {
 };
 
 // Circular buffer of in-flight instructions, oldest at the head. Entries are
-// allocated in program order and popped from the head, so the buffer is what
-// program order means once execution stops following it.
+// allocated in program order and popped from the head, so the buffer carries
+// program order for a back end that no longer follows it.
 //
 // Sequence numbers are stamped here and never reused, including after a
 // squash, so comparing them is always a valid "older than" test.
@@ -50,8 +50,8 @@ public:
         return k < count_ ? wrap(head_ + k) : INVALID_ROBINDEX;
     }
 
-    // The k-th oldest entry itself, for callers walking the live range. Takes
-    // the age rather than a slot, so no sentinel can reach the storage.
+    // The k-th oldest entry itself, for callers walking the live range. Takes an
+    // age rather than a slot, so no sentinel can reach the storage.
     RobEntry&       nth_entry(uint32_t k)       { return slots_[wrap(head_ + k)]; }
     const RobEntry& nth_entry(uint32_t k) const { return slots_[wrap(head_ + k)]; }
 
@@ -84,10 +84,10 @@ public:
         return e;
     }
 
-    // Squash everything younger than `idx`, which survives — the shape of
+    // Squash everything younger than `idx`, which survives: the shape of
     // recovery from a mispredicted branch. Returns the discarded entries
-    // youngest first, the order their physical registers must be freed in.
-    // An index that is not live squashes nothing.
+    // youngest first, the order their physical registers must be freed in. An
+    // index that is not live squashes nothing.
     std::vector<RobEntry> truncate_to(RobIndex idx) {
         if (!in_flight(idx)) return {};
         return drop_to(age_of(idx) + 1);

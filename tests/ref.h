@@ -1,12 +1,12 @@
 #pragma once
 
-// The oracle: a straight in-order RV32IM interpreter, one instruction per
-// iteration, with no pipeline or speculation to get wrong. `Cpu` is checked
-// against it by comparing all 32 registers, the exit code, and the retired
-// count.
+// Correctness oracle: an in-order RV32IM interpreter with no pipeline and no
+// speculation. `Cpu` is validated against it by comparing all 32 architectural
+// registers, the exit code, and the retired count.
 //
-// The switch below duplicates the pipeline's execute logic on purpose. Two
-// implementations that agree are evidence; one called twice is not.
+// The switch below duplicates the pipeline's execute logic deliberately; two
+// independent implementations that agree are evidence, one shared helper called
+// twice is not.
 
 #include <cstdint>
 #include <cstdio>

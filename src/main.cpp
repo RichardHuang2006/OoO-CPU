@@ -1,11 +1,11 @@
 // Top-level driver for Mini-CPU.
 //
-// `int main()` is guarded so tests can #include this file and drive
-// parse_args / print_help directly. Everything else is inline or file-static,
-// so including it twice does not violate ODR.
+// `int main()` is guarded so tests can #include this file and drive parse_args
+// and print_help directly; everything else is inline or file-static, so
+// including it twice does not violate ODR.
 //
-// Programs run on the out-of-order model by default; --ref runs the in-order
-// interpreter the model is validated against.
+// Programs run on the out-of-order model by default; --ref selects the in-order
+// reference interpreter the model is validated against.
 
 #include <cstddef>
 #include <cstdint>
@@ -218,9 +218,9 @@ inline void print_help() {
 // Reporting
 // ============================================================================
 
-// Everything the run measured, in the order it happens: the funnel from fetch
-// to commit, then what the front end guessed, then memory, then the reasons
-// issue slots went unused.
+// Everything the run measured, in pipeline order: the fetch-to-commit funnel,
+// front-end prediction, memory behaviour, then the reasons issue slots went
+// unused.
 inline void print_stats(const Stats& s) {
     std::printf("\ncycles %llu  retired %llu  IPC %.3f  CPI %.3f\n",
                 static_cast<unsigned long long>(s.cycles),
@@ -265,8 +265,8 @@ inline void print_stats(const Stats& s) {
     std::printf("  limited by: %s\n", worst == Stall::COUNT ? "no structure" : stall_name(worst));
 }
 
-// Same program, four machines. The point is the shape of the column: what a
-// program gains from width says more about the program than about the machine.
+// The same program on four machines. What a program gains from width depends on
+// its dependence chains more than on the machine.
 inline void print_ipc_table(const Memory& image, uint32_t entry, uint64_t max_cycles) {
     struct Row { const char* name; Config cfg; };
 

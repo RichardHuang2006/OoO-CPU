@@ -8,9 +8,9 @@
 #include "config.h"
 #include "types.h"
 
-// Physical registers not currently mapped to an architectural register and
-// not sitting in the ROB as a stale mapping. FIFO order is arbitrary but
-// keeps traces deterministic and spreads reuse out in time.
+// Physical registers neither mapped by the RAT nor held in the ROB as a stale
+// mapping. FIFO order is arbitrary but keeps traces deterministic and spreads
+// reuse out in time.
 //
 // p0 is reserved for x0 forever; p1..p31 hold the reset RAT; p32 upward
 // start free. free() silently ignores p0, INVALID_PHYSREG, and out-of-range
@@ -42,7 +42,7 @@ public:
         free_.push_back(r);
     }
 
-    // Linear, but only tests ask — the pipeline never needs to look.
+    // Linear, but only tests ask; the pipeline never looks.
     bool contains(PhysReg r) const {
         return std::find(free_.begin(), free_.end(), r) != free_.end();
     }
