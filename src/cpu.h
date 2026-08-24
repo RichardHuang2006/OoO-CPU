@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <string>
 #include <vector>
 
 #include "bpred.h"
@@ -46,6 +47,19 @@ enum class TrapCause : uint8_t {
     ECALL_UNKNOWN,    // ecall with a7 != 93
 };
 
+// The cycle each stage handled a uop, 0 meaning "has not happened". Written
+// once per stage and never read by the pipeline itself: an instruction's
+// timing is something an observer wants and the machine does not, so nothing
+// here can change how the machine behaves.
+struct StageCycles {
+    uint64_t fetch    = 0;
+    uint64_t decode   = 0;
+    uint64_t rename   = 0;
+    uint64_t dispatch = 0;
+    uint64_t issue    = 0;
+    uint64_t complete = 0;
+};
+
 // One in-flight instruction, gaining fields as it moves down the pipeline:
 // fetch fills pc/raw, decode fills `dec`, rename fills the tags and the ROB
 // index, issue fills the operand values and the result, store address or
@@ -56,6 +70,13 @@ struct Uop {
     uint32_t  pc         = 0;
     uint32_t  raw        = 0;
     Decoded   dec        {};
+
+    // Identity from fetch onward. Sequence numbers are only stamped at rename,
+    // so this is the only way to follow a uop through the front end — and the
+    // only way a trace can say that the thing in the decode queue this cycle is
+    // the thing that was in the fetch queue last cycle.
+    uint32_t  uid        = 0;
+    StageCycles at       {};
 
     PhysReg   src1       = 0;
     PhysReg   src2       = 0;
@@ -145,6 +166,45 @@ public:
     // Committed mapping of an architectural register.
     PhysReg committed_map(ArchReg r) const { return arch_rat_[r]; }
 
+    // ---- cycle-level observability ----------------------------------------
+    // The whole state a photograph of one cycle needs. Everything here is a
+    // const view of storage the pipeline already keeps, so an external tracer
+    // can write a snapshot without the machine knowing what a trace is.
+
+    // Function-unit classes, in the order fu_free_at() indexes them.
+    static constexpr int FU_CLASSES = 5;
+    static const char* fu_class_name(int cls);
+
+    const std::deque<Uop>&  fetch_uops()   const { return fetch_q_; }
+    const std::deque<Uop>&  decode_uops()  const { return decode_q_; }
+    const std::deque<Uop>&  rename_uops()  const { return rename_q_; }
+    const std::vector<Uop>& executing_uops() const { return executing_; }
+    const std::deque<Uop>&  wb_fast_uops() const { return wb_fast_; }
+    const std::deque<Uop>&  wb_slow_uops() const { return wb_slow_; }
+
+    // Per-instruction payload behind a live ROB slot. Only meaningful for a
+    // slot the ROB reports as in flight.
+    const Uop& inflight(RobIndex idx) const { return inflight_[idx]; }
+
+    // Cycle each unit becomes free again, one vector per class.
+    const std::array<std::vector<uint64_t>, FU_CLASSES>& fu_free_at() const {
+        return fu_free_at_;
+    }
+
+    // Writeback ports booked, as a ring indexed by cycle % cdb_window().
+    const std::vector<uint32_t>& cdb_bookings() const { return cdb_booked_; }
+    uint64_t cdb_window() const { return cdb_window_; }
+
+    // ---- what happened during the current cycle ----------------------------
+    // Recorded only while observing, and cleared at the top of every tick, so
+    // these describe the cycle that just ran and nothing else. Off by default:
+    // an untraced run pays one branch per would-be event.
+    void observe(bool on) { observing_ = on; }
+    bool observing() const { return observing_; }
+    const std::vector<std::string>& events()        const { return events_; }
+    const std::vector<SeqNum>&      squashed_seqs() const { return squashed_seqs_; }
+    const std::vector<SeqNum>&      retired_seqs()  const { return retired_seqs_; }
+
     // ---- traces, recorded only when a test asks for them -------------------
     struct DecodeRecord {
         uint64_t cycle;
@@ -176,9 +236,9 @@ public:
     const std::vector<IssueRecord>&  issue_log()  const { return issue_log_; }
 
 private:
-    // Function-unit pools. NONE covers the ops that occupy no unit.
+    // Function-unit pools, in FU_CLASSES order. NONE covers the ops that
+    // occupy no unit and is not a pool.
     enum class Fu : uint8_t { ALU, BRANCH, MUL, DIV, MEM, NONE };
-    static constexpr int FU_COUNT = 5;
 
     void commit();
     void writeback();
@@ -224,6 +284,15 @@ private:
 
     // Give back a writeback port booked by a uop that is being squashed.
     void release_cdb(const Uop& u);
+
+    // Append a line to this cycle's event log, printf-style. Does nothing
+    // unless the machine is being observed. Checked like printf where the
+    // compiler can, since a wrong specifier here is undefined behaviour that
+    // only a traced run would ever hit.
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 2, 3)))
+#endif
+    void event(const char* fmt, ...);
 
     // Drop the uops younger than `seq` from a queue of in-flight work.
     template <typename Q>
@@ -275,7 +344,7 @@ private:
     std::deque<Uop> wb_slow_;
 
     // Cycle each unit of each class becomes free again.
-    std::array<std::vector<uint64_t>, FU_COUNT> fu_free_at_;
+    std::array<std::vector<uint64_t>, FU_CLASSES> fu_free_at_;
 
     // Writeback ports booked per cycle, as a ring indexed by cycle. The window
     // is wider than the longest latency, so no two bookings can collide.
@@ -293,6 +362,13 @@ private:
     bool      commit_in_order_ = true;
     SeqNum    last_committed_seq_ = INVALID_SEQNUM;
     Stats     stats_{};
+
+    uint32_t next_uid_ = 0;   // fetch order, never reused, squashes included
+
+    bool                     observing_ = false;
+    std::vector<std::string> events_;
+    std::vector<SeqNum>      squashed_seqs_;   // killed this cycle, before they vanish
+    std::vector<SeqNum>      retired_seqs_;    // committed this cycle
 
     bool record_decode_ = false;
     bool record_rename_ = false;

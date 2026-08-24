@@ -1,0 +1,1401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>oooviz — Mini-CPU cycle viewer</title>
+<style>
+/* ---------------------------------------------------------------- tokens --
+   One dark surface, one accent hue for magnitude, four reserved state
+   colours. State colour never means "series n": green is ready or complete,
+   amber is waiting, red is squashed, violet is head or selection. Every one
+   of them is paired with a glyph or a word, so colour is never the only
+   thing carrying the meaning.                                              */
+:root {
+  --bg:      #0b0f14;
+  --panel:   #121820;
+  --panel2:  #171f29;
+  --line:    #222c39;
+  --ink:     #c8d4e2;
+  --ink2:    #8b98a8;
+  --ink3:    #5d6875;
+
+  --green:   #3fb950;
+  --amber:   #d89a2c;
+  --red:     #f0503a;
+  --violet:  #a371f7;
+  --accent:  #3d9fd6;
+
+  --green-d: #14301b;
+  --amber-d: #33260c;
+  --red-d:   #3a1510;
+  --violet-d:#241a3a;
+
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --r: 5px;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 12px/1.45 var(--mono);
+  padding: 10px 12px 40px;
+}
+h1, h2, h3 { margin: 0; font-weight: 600; }
+
+/* ------------------------------------------------------------- structure -- */
+#app { max-width: 1500px; margin: 0 auto; }
+.grid { display: grid; gap: 8px; margin-top: 8px; }
+.c3 { grid-template-columns: 1fr 1fr 1fr; }
+.c2 { grid-template-columns: 1fr 1fr; }
+.c2u { grid-template-columns: 1.15fr 1fr; }
+.c4 { grid-template-columns: 1fr 1fr 1fr 1fr; }
+@media (max-width: 1100px) { .c4 { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 700px) {
+  .grid { grid-template-columns: 1fr !important; }
+  body { font-size: 11.5px; }
+}
+
+.pane {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.pane > h2 {
+  font-size: 10.5px;
+  letter-spacing: .09em;
+  color: var(--ink2);
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+  flex: none;
+}
+.pane > h2 .cap { color: var(--ink3); letter-spacing: 0; font-weight: 400; }
+.pane .body { padding: 6px; overflow: auto; }
+.scroll-s { max-height: 190px; }
+.scroll-m { max-height: 260px; }
+.empty { color: var(--ink3); padding: 4px 2px; }
+
+/* ----------------------------------------------------------------- rows -- */
+.row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  border-left: 2px solid transparent;
+  white-space: nowrap;
+  cursor: default;
+}
+.row.pick { cursor: pointer; }
+.row.pick:hover { background: var(--panel2); }
+.row + .row { margin-top: 1px; }
+.seq {
+  color: var(--accent);
+  min-width: 44px;
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+.seq.none { color: var(--ink3); }
+.txt { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.dim { color: var(--ink3); }
+.mut { color: var(--ink2); }
+.rt { margin-left: auto; flex: none; }
+
+.row.ok   { border-left-color: var(--green); }
+.row.wait { border-left-color: var(--amber); }
+.row.head { border-left-color: var(--violet); background: rgba(163,113,247,.07); }
+.row.dead { border-left-color: var(--red); background: var(--red-d); opacity: .8; }
+.row.sel  { background: rgba(163,113,247,.16); outline: 1px solid var(--violet); }
+
+/* --------------------------------------------------------------- chips --- */
+.chip {
+  display: inline-block;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  color: var(--ink2);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.chip.g { color: var(--green);  border-color: #1d4527; background: var(--green-d); }
+.chip.a { color: var(--amber);  border-color: #4a3711; background: var(--amber-d); }
+.chip.r { color: var(--red);    border-color: #56201a; background: var(--red-d); }
+.chip.v { color: var(--violet); border-color: #392a58; background: var(--violet-d); }
+.chip.k { color: var(--accent); }
+.chip.sel { outline: 1px solid var(--violet); }
+.chips { display: flex; flex-wrap: wrap; gap: 3px; }
+
+/* Newly changed things tint once and fade; nodes are rebuilt each cycle, so
+   the animation replays on its own. */
+@keyframes flash-g { from { background: rgba(63,185,80,.35);  } to { background: transparent; } }
+@keyframes flash-a { from { background: rgba(216,154,44,.35); } to { background: transparent; } }
+@keyframes flash-v { from { background: rgba(163,113,247,.4); } to { background: transparent; } }
+@keyframes flash-r { from { background: rgba(240,80,58,.45);  } to { background: transparent; } }
+.fg { animation: flash-g .55s ease-out; }
+.fa { animation: flash-a .55s ease-out; }
+.fv { animation: flash-v .55s ease-out; }
+.fr { animation: flash-r .55s ease-out; }
+
+/* ------------------------------------------------------------ transport -- */
+#top {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 7px 9px;
+}
+#top .grow { flex: 1 1 240px; display: flex; align-items: center; gap: 8px; min-width: 180px; }
+button, select, input {
+  font: inherit; color: var(--ink);
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 4px; padding: 2px 7px;
+}
+button { cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .4; cursor: default; }
+button.on { border-color: var(--violet); color: var(--violet); }
+input[type=number], input[type=text] { font-variant-numeric: tabular-nums; }
+input[type=range] { flex: 1 1 auto; accent-color: var(--accent); background: none; border: none; padding: 0; }
+label.f { color: var(--ink3); }
+
+#hud { display: flex; flex-wrap: wrap; gap: 14px; align-items: baseline; padding: 7px 9px; }
+#hud .kv b { color: #fff; font-weight: 600; }
+#hud .kv span { color: var(--ink3); margin-right: 4px; }
+.badge {
+  padding: 1px 7px; border-radius: 3px; font-weight: 700; letter-spacing: .08em;
+}
+.badge.halt { background: var(--green-d); color: var(--green); border: 1px solid #1d4527; }
+.badge.trap { background: var(--red-d);   color: var(--red);   border: 1px solid #56201a; }
+.badge.run  { background: var(--panel2);  color: var(--ink3);  border: 1px solid var(--line); }
+
+/* ---------------------------------------------------------------- misc --- */
+#events .body { max-height: 150px; }
+.ev { white-space: pre-wrap; padding: 1px 3px; border-radius: 3px; }
+.ev.mis { color: var(--red); background: var(--red-d); font-weight: 600; }
+.ev.iss { color: var(--accent); }
+.ev.ret { color: var(--green); }
+.ev.wrn { color: var(--amber); }
+
+.bars { display: flex; flex-direction: column; gap: 3px; }
+.bar-row { display: grid; grid-template-columns: 118px 1fr 74px; gap: 6px; align-items: center; }
+.bar-row .lab { color: var(--ink2); overflow: hidden; text-overflow: ellipsis; }
+.track { background: #0a0e13; border-radius: 3px; height: 11px; overflow: hidden; }
+.fill { height: 100%; background: var(--accent); border-radius: 0 3px 3px 0; }
+.fill.a { background: var(--amber); }
+.bar-row .val { text-align: right; color: var(--ink2); font-variant-numeric: tabular-nums; }
+
+.cols { display: flex; gap: 3px; align-items: flex-end; height: 62px; }
+.col { flex: 1 1 0; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; min-width: 0; }
+.col .stack { background: var(--accent); border-radius: 3px 3px 0 0; min-height: 2px; }
+.col .stack.full { background: var(--amber); }
+.col .stack.zero { background: #1b2530; }
+.col .t { text-align: center; color: var(--ink3); font-size: 10px; margin-top: 2px; }
+
+.bits { display: flex; flex-wrap: wrap; gap: 2px; }
+.bit {
+  width: 13px; height: 16px; line-height: 16px; text-align: center;
+  border-radius: 2px; background: #0a0e13; color: var(--ink3); font-size: 10px;
+}
+.bit.one { background: var(--accent); color: #04121b; font-weight: 700; }
+
+table.kv2 { border-collapse: collapse; width: 100%; }
+table.kv2 td { padding: 1px 6px 1px 0; vertical-align: top; }
+table.kv2 td.k { color: var(--ink3); white-space: nowrap; width: 1%; }
+
+#detail { margin-top: 8px; }
+#detail .cols2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 700px) { #detail .cols2 { grid-template-columns: 1fr; } }
+
+#iqwrap { position: relative; }
+#arrows { position: absolute; inset: 0; pointer-events: none; overflow: visible; }
+
+#pipewrap { position: relative; overflow: auto; height: 460px; background: var(--panel); }
+#pipespacer { position: relative; }
+#pipecanvas { position: absolute; top: 0; left: 0; }
+.legend { display: flex; flex-wrap: wrap; gap: 10px; color: var(--ink3); padding: 6px 9px; }
+.legend b { color: var(--ink); }
+
+#drop {
+  border: 1px dashed var(--line); border-radius: var(--r);
+  padding: 22px; text-align: center; color: var(--ink2); margin-top: 8px;
+}
+#drop.hot { border-color: var(--accent); color: var(--accent); }
+#paste { width: 100%; height: 90px; margin-top: 6px; }
+.hide { display: none !important; }
+.note { color: var(--ink3); padding: 4px 9px; }
+.err { color: var(--red); padding: 6px 9px; }
+progress { width: 220px; }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ============================================================ load -- -->
+  <div id="top">
+    <strong style="letter-spacing:.06em">oooviz</strong>
+    <input type="file" id="file" accept=".ndjson,.json,.jsonl,.txt">
+    <button id="pastebtn" title="Paste a trace instead of loading a file">paste</button>
+    <span class="grow" id="fileinfo"><span class="dim">no trace loaded</span></span>
+    <button id="viewbtn" title="Toggle the pipeline diagram (v)">pipeline view</button>
+  </div>
+  <div id="pastebox" class="pane hide" style="margin-top:8px">
+    <h2>PASTE A TRACE <span class="cap">newline-delimited JSON records, or one JSON array</span></h2>
+    <div class="body">
+      <textarea id="paste" spellcheck="false" placeholder='{"cycle":1,...}
+{"cycle":2,...}'></textarea>
+      <div style="margin-top:6px;display:flex;gap:6px">
+        <button id="pasteload">load</button>
+        <button id="pastecancel">cancel</button>
+      </div>
+    </div>
+  </div>
+  <div id="drop">drop a <b>.ndjson</b> trace here — or use the file picker above<br>
+    <span class="dim">generate one with: build/oooc --hex examples/fib.hex --base 0x1000 --trace=fib.ndjson</span>
+  </div>
+  <div id="loaderr" class="err hide"></div>
+
+  <!-- ======================================================== viewer -- -->
+  <div id="viewer" class="hide">
+
+    <!-- transport -->
+    <div id="top2" style="margin-top:8px" class="pane">
+      <div class="body" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:7px 9px">
+        <button id="b-start" title="Home">|&lt;</button>
+        <button id="b-b10" title="-10">&laquo;</button>
+        <button id="b-b1" title="Left arrow">&lsaquo;</button>
+        <button id="b-play" title="Space" style="min-width:58px">play</button>
+        <button id="b-f1" title="Right arrow">&rsaquo;</button>
+        <button id="b-f10" title="+10">&raquo;</button>
+        <button id="b-end" title="End">&gt;|</button>
+        <label class="f">speed
+          <select id="speed">
+            <option>0.25</option><option>0.5</option><option selected>1</option>
+            <option>2</option><option>4</option>
+          </select>x
+        </label>
+        <label class="f">cycle <input type="number" id="cycbox" style="width:88px"></label>
+        <span class="grow"><input type="range" id="scrub" min="0" value="0" step="1"></span>
+        <label class="f">find <input type="text" id="find" style="width:150px"
+          placeholder="seq 61 / 0x1010 / mispredict"></label>
+        <button id="b-prev" title="Previous match">&uarr;</button>
+        <button id="b-next" title="Next match">&darr;</button>
+        <span id="findinfo" class="dim"></span>
+      </div>
+    </div>
+
+    <!-- row 1: header strip -->
+    <div class="pane" style="margin-top:8px"><div id="hud"></div></div>
+
+    <!-- ---------------------------------------------------- cycle view -- -->
+    <div id="cycleview">
+      <div class="grid c3">
+        <section class="pane"><h2>FETCH_Q <span class="cap" id="cap-fq"></span></h2>
+          <div class="body scroll-s" id="fq"></div></section>
+        <section class="pane"><h2>DECODE_Q <span class="cap" id="cap-dq"></span></h2>
+          <div class="body scroll-s" id="dq"></div></section>
+        <section class="pane"><h2>RENAME_Q <span class="cap" id="cap-rq"></span></h2>
+          <div class="body scroll-s" id="rq"></div></section>
+      </div>
+
+      <div class="grid c2u">
+        <section class="pane"><h2>ISSUE QUEUE <span class="cap" id="cap-iq"></span></h2>
+          <div class="body scroll-m" id="iqwrap">
+            <svg id="arrows"></svg>
+            <div id="iq"></div>
+          </div></section>
+        <section class="pane"><h2>REORDER BUFFER <span class="cap" id="cap-rob"></span></h2>
+          <div class="body scroll-m" id="rob"></div></section>
+      </div>
+
+      <div class="grid c2u">
+        <section class="pane"><h2>REGISTER ALIAS TABLE <span class="cap">speculative / retirement</span></h2>
+          <div class="body" id="rat"></div></section>
+        <div class="grid" style="grid-template-columns:1fr;margin:0">
+          <section class="pane"><h2>PHYSICAL REGISTERS <span class="cap" id="cap-prf">in use</span></h2>
+            <div class="body scroll-s" id="prf"></div></section>
+          <section class="pane"><h2>FREE LIST <span class="cap" id="cap-free"></span></h2>
+            <div class="body" id="free"></div></section>
+        </div>
+      </div>
+
+      <div class="grid c4">
+        <section class="pane"><h2>LOAD QUEUE <span class="cap" id="cap-lq"></span></h2>
+          <div class="body scroll-s" id="lq"></div></section>
+        <section class="pane"><h2>STORE QUEUE <span class="cap" id="cap-sq"></span></h2>
+          <div class="body scroll-s" id="sq"></div></section>
+        <section class="pane"><h2>FUNCTION UNITS <span class="cap">free at cycle</span></h2>
+          <div class="body scroll-s" id="fu"></div></section>
+        <section class="pane"><h2>CDB BOOKINGS <span class="cap" id="cap-cdb"></span></h2>
+          <div class="body" id="cdb"></div></section>
+      </div>
+
+      <div class="grid c3">
+        <section class="pane"><h2>GLOBAL HISTORY <span class="cap" id="cap-ghr"></span></h2>
+          <div class="body" id="ghr"></div></section>
+        <section class="pane"><h2>RETURN ADDRESS STACK <span class="cap" id="cap-ras"></span></h2>
+          <div class="body scroll-s" id="ras"></div></section>
+        <section class="pane"><h2>PHT SAMPLE <span class="cap">gshare counters in play</span></h2>
+          <div class="body scroll-s" id="pht"></div></section>
+      </div>
+
+      <div class="grid c2">
+        <section class="pane" id="events"><h2>EVENTS THIS CYCLE</h2>
+          <div class="body" id="ev"></div></section>
+        <section class="pane"><h2>STALL HISTOGRAM <span class="cap" id="cap-stall">cumulative lost issue slots</span></h2>
+          <div class="body scroll-m" id="stalls"></div></section>
+      </div>
+
+      <section class="pane hide" id="detail">
+        <h2>INSTRUCTION <span class="cap" id="cap-detail"></span></h2>
+        <div class="body cols2" id="detailbody"></div>
+      </section>
+    </div>
+
+    <!-- -------------------------------------------------- pipeline view -- -->
+    <div id="pipeview" class="hide">
+      <section class="pane" style="margin-top:8px">
+        <h2>PIPELINE DIAGRAM <span class="cap" id="cap-pipe"></span></h2>
+        <div class="legend">
+          <span><b>F</b> fetch</span><span><b>D</b> decode</span><span><b>R</b> rename</span>
+          <span><b>S</b> in the issue queue</span><span><b>X</b> executing</span>
+          <span><b>W</b> written back, waiting to commit</span><span><b>C</b> commit</span>
+          <span style="color:var(--red)"><b>×</b> squashed</span>
+          <span class="dim">click a cell to select the instruction and jump to that cycle</span>
+        </div>
+        <div id="pipestatus" class="note"></div>
+        <div id="pipewrap"><div id="pipespacer"><canvas id="pipecanvas"></canvas></div></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<!-- An embedded trace makes the page self-contained: paste records between the
+     brackets (a JSON array, or newline-delimited records) and the viewer loads
+     them at startup with no file to pick. -->
+<script id="embedded-trace" type="application/json">[]</script>
+
+<script>
+"use strict";
+/* ===========================================================================
+   oooviz — a trace viewer for the Mini-CPU out-of-order RV32IM simulator.
+
+   It renders what the trace says and nothing else. There is no model of a
+   pipeline in this file: no stage is simulated, no value is recomputed, no
+   state is guessed. Every number on screen was read out of one record, and a
+   field the trace does not carry is drawn as "n/a" rather than derived.
+   The two exceptions are arithmetic on numbers that are present (IPC is
+   retired/cycle) and joins between structures inside the same record (an
+   entry's producer is the ROB entry whose dest_phys equals its source tag).
+
+   Scrubbing is O(1): records are kept as unparsed lines and the current one
+   is parsed on demand, so a 50k-cycle trace costs a JSON.parse per frame
+   rather than a pass over the run.
+   =========================================================================== */
+
+const $  = (id) => document.getElementById(id);
+const el = (sel) => document.querySelector(sel);
+
+/* --------------------------------------------------------------- state --- */
+const S = {
+  lines:  [],        // one raw JSON record per cycle, never mutated
+  cycles: [],        // cycle number of each line, for the scrubber and search
+  header: null,      // the header record, if the trace has one
+  cfg:    {},        // header.config, or {}
+  disasm: new Map(), // pc -> instruction text, accumulated from "disasm" maps
+  cache:  new Map(), // index -> parsed record (bounded)
+  idx:    0,
+  playing:false,
+  timer:  null,
+  sel:    null,      // selected seq
+  view:   "cycle",
+  index:  null,      // lifecycle index, built on demand for the pipeline view
+  indexing:false,
+};
+const CACHE_MAX = 96;
+
+/* -------------------------------------------------------------- helpers --- */
+const hex  = (v) => (v === undefined || v === null) ? "n/a" : "0x" + (v >>> 0).toString(16).toUpperCase();
+const num  = (v) => (v === undefined || v === null) ? "n/a" : String(v);
+const esc  = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+const flag = (v) => v === true;                    // an absent boolean is false
+
+// Instruction text: from the entry if it carries one, else from the PC map the
+// trace built, else unknown. Never disassembled here.
+function textOf(e) {
+  if (!e) return "n/a";
+  if (typeof e.text === "string") return e.text;
+  if (e.pc !== undefined && S.disasm.has(e.pc)) return S.disasm.get(e.pc);
+  return "n/a";
+}
+
+function record(i) {
+  if (i < 0 || i >= S.lines.length) return null;
+  const hit = S.cache.get(i);
+  if (hit) return hit;
+  let r;
+  try { r = JSON.parse(S.lines[i]); }
+  catch (err) { r = { cycle: S.cycles[i], _bad: String(err) }; }
+  if (S.cache.size >= CACHE_MAX) S.cache.delete(S.cache.keys().next().value);
+  S.cache.set(i, r);
+  return r;
+}
+const cur  = () => record(S.idx);
+const prev = () => record(S.idx - 1);
+
+/* =========================================================== loading ===== */
+// A trace is newline-delimited records, or one JSON array of them. Either way
+// it ends up as an array of unparsed lines plus a cycle number per line.
+function loadText(text) {
+  const t = text.trim();
+  if (!t) throw new Error("empty trace");
+
+  let lines;
+  if (t[0] === "[") {
+    const arr = JSON.parse(t);
+    if (!Array.isArray(arr)) throw new Error("expected an array of records");
+    lines = arr.map((r) => JSON.stringify(r));
+  } else {
+    lines = t.split("\n").map((s) => s.trim()).filter((s) => s.length > 1);
+  }
+
+  const recs = [], cycles = [];
+  let header = null;
+  const disasm = new Map();
+
+  for (const line of lines) {
+    // Cheap probes first: only records that need parsing get parsed.
+    const m = /"cycle"\s*:\s*(\d+)/.exec(line);
+    if (!m) {                                  // no cycle: metadata, e.g. the header
+      try {
+        const h = JSON.parse(line);
+        if (!header) header = h;
+      } catch (e) { /* not JSON: skip rather than throw the whole load away */ }
+      continue;
+    }
+    if (line.indexOf('"disasm"') >= 0) {
+      try {
+        const r = JSON.parse(line);
+        for (const [pc, txt] of Object.entries(r.disasm || {})) disasm.set(Number(pc), txt);
+      } catch (e) { /* leave those PCs unknown */ }
+    }
+    recs.push(line);
+    cycles.push(Number(m[1]));
+  }
+  if (!recs.length) throw new Error("no cycle records found");
+
+  S.lines = recs; S.cycles = cycles; S.header = header;
+  S.cfg = (header && header.config) || {};
+  S.disasm = disasm;
+  S.cache.clear(); S.index = null; S.sel = null; S.idx = 0;
+
+  $("scrub").max = String(recs.length - 1);
+  $("scrub").value = "0";
+  $("viewer").classList.remove("hide");
+  $("drop").classList.add("hide");
+  $("loaderr").classList.add("hide");
+  $("fileinfo").innerHTML =
+    `<b>${recs.length.toLocaleString()}</b> cycles <span class="dim">(${cycles[0]}…${cycles[cycles.length-1]})</span>` +
+    (header ? ` <span class="dim">· width ${num(S.cfg.width)} · ROB ${num(S.cfg.rob_size)}` +
+              ` · PRF ${num(S.cfg.prf_size)} · IQ ${num(S.cfg.iq_size)}</span>`
+            : ` <span class="dim">· no header record</span>`);
+  render();
+}
+
+function loadFile(f) {
+  const rd = new FileReader();
+  rd.onload = () => { try { loadText(String(rd.result)); } catch (e) { fail(e); } };
+  rd.onerror = () => fail(rd.error || new Error("read failed"));
+  rd.readAsText(f);
+}
+function fail(e) {
+  const box = $("loaderr");
+  box.textContent = "could not load trace: " + (e && e.message ? e.message : e);
+  box.classList.remove("hide");
+}
+
+/* ========================================================== transport ==== */
+function goto(i) {
+  const n = S.lines.length;
+  if (!n) return;
+  S.idx = Math.max(0, Math.min(n - 1, i));
+  $("scrub").value = String(S.idx);
+  render();
+}
+const step = (d) => goto(S.idx + d);
+
+// Cycle numbers are contiguous within a window but need not start at 1, so a
+// jump by cycle is a search, not arithmetic.
+function gotoCycle(c) {
+  let lo = 0, hi = S.cycles.length - 1, best = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (S.cycles[mid] <= c) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  goto(best);
+}
+
+function play(on) {
+  S.playing = on === undefined ? !S.playing : on;
+  if (S.timer) { clearInterval(S.timer); S.timer = null; }
+  $("b-play").textContent = S.playing ? "pause" : "play";
+  $("b-play").classList.toggle("on", S.playing);
+  if (!S.playing) return;
+  const rate = Number($("speed").value) || 1;
+  S.timer = setInterval(() => {
+    if (S.idx >= S.lines.length - 1) { play(false); return; }
+    step(1);
+  }, Math.max(16, 130 / rate));
+}
+
+/* ============================================================= search ==== */
+// Substring probes over the raw lines: no parsing, so scanning a whole trace
+// stays instant even at 50k cycles.
+function matcher(q) {
+  const s = q.trim();
+  if (!s) return null;
+  if (/^mis/i.test(s))    return (l) => l.indexOf("MISPREDICT") >= 0;
+  if (/^rep/i.test(s))    return (l) => l.indexOf("replay seq") >= 0;
+  if (/^squash/i.test(s)) return (l) => l.indexOf('"squashed_seqs":[]') < 0 &&
+                                        l.indexOf('"squashed_seqs":[') >= 0;
+  if (/^(halt|exit)/i.test(s)) return (l) => l.indexOf('"halted":true') >= 0;
+  if (/^(fwd|forward)/i.test(s)) return (l) => l.indexOf("forward seq") >= 0;
+
+  // A key can be the last one in its object, so the value may be followed by
+  // either a comma or a brace.
+  let m = /^(?:seq\s*)?(\d+)$/i.exec(s);
+  if (m) { const re = new RegExp(`"seq":${m[1]}[,}]`); return (l) => re.test(l); }
+  m = /^(?:pc\s*)?(0x[0-9a-f]+)$/i.exec(s);
+  if (m) { const re = new RegExp(`"pc":${parseInt(m[1], 16)}[,}]`); return (l) => re.test(l); }
+  const lit = s;
+  return (l) => l.indexOf(lit) >= 0;
+}
+
+function search(dir) {
+  const test = matcher($("find").value);
+  const info = $("findinfo");
+  if (!test) { info.textContent = ""; return; }
+  for (let i = S.idx + dir; i >= 0 && i < S.lines.length; i += dir) {
+    if (test(S.lines[i])) {
+      goto(i);
+      info.textContent = `cycle ${S.cycles[i]}`;
+      return;
+    }
+  }
+  info.textContent = dir > 0 ? "no match after here" : "no match before here";
+}
+
+/* ====================================================== lifecycle index ==
+   Rows for the pipeline diagram, and the retire/squash cycles the per-cycle
+   panes cannot know. Built from what the records already carry — each ROB
+   entry's own stage stamps, plus the retired/squashed lists — so this is a
+   collection pass, not a reconstruction. Chunked, because a long trace should
+   not freeze the page while it runs.                                        */
+function buildIndex(done) {
+  if (S.index) { done(S.index); return; }
+  if (S.indexing) return;
+  S.indexing = true;
+
+  const bySeq = new Map();
+  let i = 0;
+  const t0 = performance.now();
+
+  const chunk = () => {
+    const end = Math.min(S.lines.length, i + 400);
+    for (; i < end; i++) {
+      let r;
+      try { r = JSON.parse(S.lines[i]); } catch (e) { continue; }
+      for (const e of r.rob || []) {
+        let it = bySeq.get(e.seq);
+        if (!it) {
+          it = { seq: e.seq, uid: e.uid, pc: e.pc, kind: e.kind, at: [], mis: false };
+          bySeq.set(e.seq, it);
+        }
+        if (Array.isArray(e.at) && e.at.length >= it.at.length) it.at = e.at;
+        if (flag(e.mispredicted)) it.mis = true;
+      }
+      for (const s of r.retired_seqs  || []) { const it = bySeq.get(s); if (it) it.retire = r.cycle; }
+      for (const s of r.squashed_seqs || []) { const it = bySeq.get(s); if (it) it.squash = r.cycle; }
+    }
+    $("pipestatus").textContent =
+      `indexing ${Math.round(100 * i / S.lines.length)}% …`;
+    if (i < S.lines.length) { setTimeout(chunk, 0); return; }
+
+    const order = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+    S.index = { bySeq, order, ms: Math.round(performance.now() - t0) };
+    S.indexing = false;
+    const stamped = order.some((it) => it.at && it.at.length);
+    $("pipestatus").textContent =
+      `${order.length.toLocaleString()} instructions · cycles ${S.cycles[0]}…${S.cycles[S.cycles.length-1]}` +
+      ` · indexed in ${S.index.ms} ms` +
+      (stamped ? "" : " · this trace carries no per-stage cycle stamps, so there is nothing to draw");
+    done(S.index);
+  };
+  chunk();
+}
+
+/* ============================================================= render ==== */
+function render() {
+  const r = cur(), p = prev();
+  if (!r) return;
+  $("cycbox").value = String(S.cycles[S.idx] !== undefined ? S.cycles[S.idx] : 0);
+  renderHud(r);
+  if (S.view === "cycle") {
+    renderFrontEnd(r, p);
+    renderIq(r, p);
+    renderRob(r, p);
+    renderRat(r, p);
+    renderPrf(r, p);
+    renderFree(r, p);
+    renderLsq(r, p);
+    renderFu(r);
+    renderCdb(r);
+    renderBpred(r, p);
+    renderEvents(r);
+    renderStalls(r);
+    renderDetail(r);
+    drawArrows(r);
+  } else {
+    followPipeline();
+    drawPipeline();
+  }
+}
+
+/* ---- row 1: header strip ------------------------------------------------ */
+function renderHud(r) {
+  const st = r.stats || {};
+  const ipc = (r.cycle && st.retired !== undefined) ? (st.retired / r.cycle).toFixed(3) : "n/a";
+  const badge = r.halted ? `<span class="badge halt">HALTED</span>`
+              : r.trap   ? `<span class="badge trap">TRAP ${esc(r.trap)}</span>`
+                         : `<span class="badge run">running</span>`;
+  const kv = (k, v) => `<span class="kv"><span>${k}</span><b>${v}</b></span>`;
+  $("hud").innerHTML =
+    kv("cycle", `${r.cycle} <span class="dim">/ ${S.cycles[S.cycles.length - 1]}</span>`) +
+    kv("PC", hex(r.pc)) +
+    kv("IPC", ipc) +
+    kv("retired", num(st.retired)) +
+    kv("issued", num(st.issued)) +
+    kv("mispredicts", num(st.mispredicts)) +
+    kv("squashed", num(st.squashed)) +
+    badge +
+    (flag(r.fetch_stalled) ? `<span class="chip a">fetch stalled</span>` : "") +
+    (S.sel !== null ? `<span class="chip v">seq ${S.sel} selected · esc to clear</span>` : "");
+}
+
+// One row of a queue pane. `cls` carries state colour, `fl` the flash class.
+function rowHtml(seq, left, right, cls, fl, extra) {
+  const sel = (seq !== null && seq !== undefined && seq === S.sel) ? " sel" : "";
+  const pick = (seq !== null && seq !== undefined) ? " pick" : "";
+  const tag = (seq === null || seq === undefined)
+    ? `<span class="seq none">—</span>`
+    : `<span class="seq">${seq}</span>`;
+  return `<div class="row${cls ? " " + cls : ""}${sel}${pick}${fl ? " " + fl : ""}"` +
+         (seq !== null && seq !== undefined ? ` data-seq="${seq}"` : "") +
+         (extra || "") + `>${tag}${left}${right || ""}</div>`;
+}
+const empty = (what) => `<div class="empty">— ${what} —</div>`;
+
+/* ---- row 2: fetch / decode / rename queues ------------------------------ */
+function renderFrontEnd(r, p) {
+  const draw = (list, prevList, node, cap) => {
+    const before = new Set((prevList || []).map((e) => e.uid));
+    $(cap).textContent = `${(list || []).length} entr${(list||[]).length === 1 ? "y" : "ies"}`;
+    if (!list || !list.length) { $(node).innerHTML = empty("empty"); return; }
+    $(node).innerHTML = list.map((e) => {
+      const fl = (e.uid !== undefined && !before.has(e.uid)) ? "fv" : "";
+      const pred = flag(e.pred_taken)
+        ? `<span class="chip a" title="predicted taken">→ ${hex(e.pred_target)}</span>` : "";
+      return rowHtml(e.seq === null ? null : e.seq,
+        `<span class="txt">${esc(textOf(e))}</span>`,
+        `<span class="rt dim">${hex(e.pc)}</span> ${pred}`, "", fl,
+        e.uid !== undefined ? ` data-uid="${e.uid}"` : "");
+    }).join("");
+  };
+  draw(r.fetch_q,  p && p.fetch_q,  "fq", "cap-fq");
+  draw(r.decode_q, p && p.decode_q, "dq", "cap-dq");
+  draw(r.rename_q, p && p.rename_q, "rq", "cap-rq");
+}
+
+/* ---- row 3a: issue queue ------------------------------------------------ */
+function srcChip(tag, ready, flashed) {
+  if (tag === undefined || tag === null) return "";
+  const cls = ready ? "g" : "a";
+  const mark = ready ? "✓" : "…";
+  return `<span class="chip ${cls}${flashed ? " fg" : ""}" data-phys="${tag}">p${tag} ${mark}</span>`;
+}
+
+function renderIq(r, p) {
+  const list = r.iq || [];
+  $("cap-iq").textContent = `${list.length}${S.cfg.iq_size ? " / " + S.cfg.iq_size : ""}`;
+  const was = new Map((p && p.iq ? p.iq : []).map((e) => [e.seq, e]));
+  if (!list.length) { $("iq").innerHTML = empty("no waiting instructions"); return; }
+
+  $("iq").innerHTML = list.map((e) => {
+    const before = was.get(e.seq);
+    const ready = flag(e.src1_ready) && flag(e.src2_ready);
+    const w1 = before && !flag(before.src1_ready) && flag(e.src1_ready);
+    const w2 = before && !flag(before.src2_ready) && flag(e.src2_ready);
+    const left =
+      `<span class="txt">${esc(textOf(e))}</span>` +
+      `<span class="chip k">${esc(e.kind || "?")}</span>` +
+      srcChip(e.src1, flag(e.src1_ready), w1) +
+      srcChip(e.src2, flag(e.src2_ready), w2);
+    const right =
+      `<span class="rt">` +
+      (e.dest === null || e.dest === undefined ? `<span class="chip">no dest</span>`
+                                               : `<span class="chip v">→ p${e.dest}</span>`) +
+      ` <span class="dim">${num(e.latency)}c</span></span>`;
+    return rowHtml(e.seq, left, right, ready ? "ok" : "wait", !before ? "fv" : "");
+  }).join("");
+}
+
+// Dependency arrows: for the selected entry, a line from each producer that is
+// still in the issue queue. A producer that has already issued has no row to
+// point at — the detail panel names it instead.
+function drawArrows(r) {
+  const svg = $("arrows");
+  svg.innerHTML = "";
+  if (S.sel === null) return;
+  const list = r.iq || [];
+  const me = list.find((e) => e.seq === S.sel);
+  if (!me) return;
+
+  const rows = [...$("iq").children];
+  const rowOf = (seq) => rows[list.findIndex((e) => e.seq === seq)];
+  const target = rowOf(me.seq);
+  if (!target) return;
+
+  const box = $("iqwrap").getBoundingClientRect();
+  const y = (node) => node.getBoundingClientRect().top - box.top + $("iqwrap").scrollTop + node.offsetHeight / 2;
+  const parts = [];
+  for (const tag of [me.src1, me.src2]) {
+    if (tag === undefined || tag === null) continue;
+    const prod = list.find((e) => e.dest === tag && e.seq !== me.seq);
+    if (!prod) continue;
+    const from = rowOf(prod.seq);
+    if (!from) continue;
+    const y1 = y(from), y2 = y(target);
+    const bend = 16 + Math.min(26, Math.abs(y2 - y1) / 3);
+    parts.push(
+      `<path d="M 6 ${y1} C ${bend} ${y1}, ${bend} ${y2}, 6 ${y2}" fill="none"
+             stroke="var(--violet)" stroke-width="1.5" opacity=".9"/>` +
+      `<circle cx="6" cy="${y1}" r="2.5" fill="var(--violet)"/>` +
+      `<polygon points="6,${y2} 12,${y2-3.5} 12,${y2+3.5}" fill="var(--violet)"/>`);
+  }
+  svg.innerHTML = parts.join("");
+}
+
+/* ---- row 3b: reorder buffer --------------------------------------------- */
+function robRow(e, opts) {
+  const o = opts || {};
+  const dest = (e.dest_arch === null || e.dest_arch === undefined)
+    ? `<span class="chip">no dest</span>`
+    : `<span class="chip v">x${e.dest_arch} ← p${num(e.dest_phys)}</span>` +
+      `<span class="chip" title="mapping this one displaced; freed at commit">stale p${num(e.stale_phys)}</span>`;
+  const flags =
+    (flag(e.mispredicted) ? `<span class="chip r">MIS</span>` : "") +
+    (flag(e.is_branch)    ? `<span class="chip">B</span>` : "") +
+    (flag(e.is_store)     ? `<span class="chip">S</span>` : "") +
+    (flag(e.is_load)      ? `<span class="chip">L</span>` : "") +
+    (e.ckpt !== undefined && e.ckpt !== null ? `<span class="chip">ckpt ${e.ckpt}</span>` : "");
+  const state = o.dead ? `<span class="chip r">SQUASHED</span>`
+    : flag(e.complete) ? `<span class="chip g${o.newDone ? " fg" : ""}">complete</span>`
+                       : `<span class="chip a">pending</span>`;
+  const left =
+    (o.head ? `<span class="chip v" title="oldest entry, commits next">▶ head</span>` : "") +
+    `<span class="txt">${esc(textOf(e))}</span>` + dest + flags;
+  const right = `<span class="rt">${state} <span class="dim">${hex(e.pc)}</span></span>`;
+  const cls = o.dead ? "dead" : (o.head ? "head" : (flag(e.complete) ? "ok" : "wait"));
+  return rowHtml(e.seq, left, right, cls, o.fl);
+}
+
+function renderRob(r, p) {
+  const list = r.rob || [];
+  const size = r.rob_size || S.cfg.rob_size;
+  $("cap-rob").textContent =
+    `${num(r.rob_count !== undefined ? r.rob_count : list.length)}${size ? " / " + size : ""}` +
+    (r.rob_head !== undefined && r.rob_head !== null ? ` · head slot ${r.rob_head}` : "");
+
+  const was = new Map((p && p.rob ? p.rob : []).map((e) => [e.seq, e]));
+  let html = list.map((e, i) => {
+    const before = was.get(e.seq);
+    const newDone = !!(before && !flag(before.complete) && flag(e.complete));
+    return robRow(e, { head: i === 0, newDone, fl: !before ? "fv" : (newDone ? "fg" : "") });
+  });
+
+  // Killed this cycle: they are gone from the buffer, so they are drawn from
+  // the previous record — briefly, in red, where they used to sit.
+  const killed = r.squashed_seqs || [];
+  if (killed.length && p) {
+    const ghosts = (p.rob || []).filter((e) => killed.indexOf(e.seq) >= 0);
+    html = html.concat(ghosts.map((e) => robRow(e, { dead: true, fl: "fr" })));
+  }
+  $("rob").innerHTML = html.length ? html.join("") : empty("no instructions in flight");
+}
+
+/* ---- row 4: mapping tables, physical registers, free list --------------- */
+function renderRat(r, p) {
+  const one = (name, arr, was, dim) => {
+    if (!Array.isArray(arr)) return `<div class="empty">${name}: n/a</div>`;
+    const chips = arr.map((phys, a) => {
+      const changed = was && was[a] !== undefined && was[a] !== phys;
+      const sel = S.sel !== null && selPhys(r) === phys ? " sel" : "";
+      return `<span class="chip${dim ? "" : " k"}${sel}${changed ? " fv" : ""}" data-phys="${phys}"
+                    title="architectural x${a}">x${a}<span class="dim">:</span>p${phys}</span>`;
+    }).join("");
+    return `<div class="mut" style="margin:2px 0 3px">${name}</div><div class="chips">${chips}</div>`;
+  };
+  $("rat").innerHTML =
+    one("speculative — what rename sees", r.rat, p && p.rat, false) +
+    one("retirement — what has committed", r.arch_rat, p && p.arch_rat, true);
+}
+
+// The physical register the selected instruction writes, for cross-highlight.
+function selPhys(r) {
+  if (S.sel === null) return null;
+  const e = (r.rob || []).find((x) => x.seq === S.sel);
+  return e ? (e.dest_phys === undefined ? null : e.dest_phys) : null;
+}
+
+function renderPrf(r, p) {
+  const list = r.prf || [];
+  $("cap-prf").textContent = `${list.length} in use${S.cfg.prf_size ? " / " + S.cfg.prf_size : ""}`;
+  if (!list.length) { $("prf").innerHTML = empty("n/a"); return; }
+  const was = new Map((p && p.prf ? p.prf : []).map((e) => [e.phys, e]));
+  const mine = selPhys(r);
+  $("prf").innerHTML = `<div class="chips">` + list.map((e) => {
+    // "ready" is written as the absence of "pending"; either spelling is read.
+    const ready = e.ready !== undefined ? !!e.ready : !flag(e.pending);
+    const before = was.get(e.phys);
+    const landed = before && !(before.ready !== undefined ? !!before.ready : !flag(before.pending)) && ready;
+    const sel = mine !== null && mine === e.phys ? " sel" : "";
+    const val = ready ? hex(e.value) : "pend";
+    return `<span class="chip ${ready ? "g" : "a"}${sel}${landed ? " fg" : ""}" data-phys="${e.phys}"
+                  title="physical register ${e.phys}">p${e.phys}<span class="dim">=</span>${val}</span>`;
+  }).join("") + `</div>`;
+}
+
+function renderFree(r, p) {
+  const f = r.free_list;
+  if (!f) { $("free").innerHTML = empty("n/a"); $("cap-free").textContent = ""; return; }
+  const changed = p && p.free_list && p.free_list.count !== f.count;
+  $("cap-free").textContent = `${num(f.count)} free`;
+  const head = (f.head || []).map((p2) => `<span class="chip">p${p2}</span>`).join("");
+  $("free").innerHTML =
+    `<div class="row${changed ? " fv" : ""}"><span class="mut">next out</span>` +
+    `<span class="chips" style="margin-left:6px">${head || `<span class="dim">— none —</span>`}</span></div>`;
+}
+
+/* ---- row 5: load / store queues, function units, CDB -------------------- */
+function renderLsq(r, p) {
+  const drawQ = (list, prevList, node, cap, capSize, isStore) => {
+    list = list || [];
+    $(cap).textContent = `${list.length}${capSize ? " / " + capSize : ""}`;
+    if (!list.length) { $(node).innerHTML = empty("empty"); return; }
+    const was = new Set((prevList || []).map((e) => e.seq));
+    $(node).innerHTML = list.map((e) => {
+      const a = flag(e.addr_ready)
+        ? `<span class="chip g">@${hex(e.addr)}</span>`
+        : `<span class="chip a">addr …</span>`;
+      const d = !isStore ? "" : (flag(e.data_ready)
+        ? `<span class="chip g">=${hex(e.data)}</span>`
+        : `<span class="chip a">data …</span>`);
+      const ready = flag(e.addr_ready) && (!isStore || flag(e.data_ready));
+      return rowHtml(e.seq, `<span class="txt">${esc(textOf(bySeq(r, e.seq)) )}</span>${a}${d}`,
+                     `<span class="rt dim">${num(e.size)}B</span>`,
+                     ready ? "ok" : "wait", was.has(e.seq) ? "" : "fv");
+    }).join("");
+  };
+  drawQ(r.lq, p && p.lq, "lq", "cap-lq", S.cfg.lq_size, false);
+  drawQ(r.sq, p && p.sq, "sq", "cap-sq", S.cfg.sq_size, true);
+}
+
+// Queue entries name a sequence number, not a PC; the ROB in the same record
+// is what turns one into the other.
+function bySeq(r, seq) {
+  return (r.rob || []).find((e) => e.seq === seq) || null;
+}
+
+function renderFu(r) {
+  const fu = r.fu;
+  if (!fu) { $("fu").innerHTML = empty("n/a"); return; }
+  const rows = [];
+  for (const [cls, units] of Object.entries(fu)) {
+    const chips = (units || []).map((freeAt, i) => {
+      const busy = freeAt > r.cycle;
+      return `<span class="chip ${busy ? "a" : "g"}" title="${cls}${i} free at cycle ${freeAt}">` +
+             `${esc(cls)}${i} ${busy ? "busy→" + freeAt : "free"}</span>`;
+    }).join("");
+    rows.push(`<div class="row"><span class="mut" style="min-width:56px">${esc(cls)}</span>` +
+              `<span class="chips">${chips || `<span class="dim">none</span>`}</span></div>`);
+  }
+  $("fu").innerHTML = rows.join("");
+}
+
+// Writeback ports booked for the next few cycles: magnitude against a known
+// capacity, so the bar is a fraction of the ports and a full one is amber.
+function renderCdb(r) {
+  const b = r.cdb_booked;
+  if (!Array.isArray(b) || !b.length) { $("cdb").innerHTML = empty("n/a"); $("cap-cdb").textContent = ""; return; }
+  const capn = S.cfg.num_cdb || Math.max(1, ...b);
+  $("cap-cdb").textContent = `${capn} port${capn === 1 ? "" : "s"} per cycle`;
+  const show = b.slice(0, 14);
+  $("cdb").innerHTML =
+    `<div class="cols">` + show.map((v, i) => {
+      const h = Math.round(100 * Math.min(1, v / capn));
+      const cls = v >= capn ? "stack full" : (v === 0 ? "stack zero" : "stack");
+      return `<div class="col" title="cycle ${r.cycle + i}: ${v} of ${capn} booked">` +
+             `<div class="${cls}" style="height:${Math.max(h, v ? 8 : 3)}%"></div>` +
+             `<div class="t">${i === 0 ? "now" : "+" + i}</div></div>`;
+    }).join("") + `</div>`;
+}
+
+/* ---- row 6: branch predictor -------------------------------------------- */
+function renderBpred(r, p) {
+  const b = r.bpred;
+  if (!b) {
+    $("ghr").innerHTML = $("ras").innerHTML = $("pht").innerHTML = empty("n/a");
+    return;
+  }
+  // Bit strip. Width comes from the trace; without it the value alone is shown
+  // rather than a strip of guessed length.
+  const bits = b.ghr_bits || S.cfg.ghr_bits;
+  $("cap-ghr").textContent = bits ? `${bits} bits · newest on the right` : "";
+  if (b.ghr === undefined) {
+    $("ghr").innerHTML = empty("n/a");
+  } else if (!bits) {
+    $("ghr").innerHTML = `<div class="row"><span class="mut">value</span>` +
+                         `<span class="chip k">${hex(b.ghr)}</span>` +
+                         `<span class="dim">width n/a</span></div>`;
+  } else {
+    const was = p && p.bpred ? p.bpred.ghr : undefined;
+    let strip = "";
+    for (let i = bits - 1; i >= 0; i--) {
+      const on = (b.ghr >>> i) & 1;
+      const changed = was !== undefined && (((was >>> i) & 1) !== on);
+      strip += `<span class="bit${on ? " one" : ""}${changed ? " fv" : ""}" title="bit ${i}">${on}</span>`;
+    }
+    $("ghr").innerHTML = `<div class="bits">${strip}</div>` +
+      `<div class="dim" style="margin-top:4px">${hex(b.ghr)}` +
+      (b.free_checkpoints !== undefined ? ` · ${b.free_checkpoints} free checkpoints` : "") + `</div>`;
+  }
+
+  const ras = b.ras || [];
+  $("cap-ras").textContent = `${ras.length} deep${S.cfg.ras_size ? " / " + S.cfg.ras_size : ""}`;
+  $("ras").innerHTML = ras.length
+    ? ras.map((addr, i) => `<div class="row${i === 0 ? " head" : ""}">` +
+        `<span class="seq">${i === 0 ? "top" : i}</span>` +
+        `<span class="txt">${hex(addr)}</span></div>`).join("")
+    : empty("stack empty");
+
+  const pht = b.pht_sample || [];
+  const NAMES = ["strong NT", "weak NT", "weak T", "strong T"];
+  $("pht").innerHTML = pht.length
+    ? pht.map((e) => {
+        const c = e.counter;
+        const cls = c >= 2 ? "g" : "a";
+        return `<div class="row"><span class="seq">${e.index}</span>` +
+               `<span class="chip ${cls}">${num(c)} · ${NAMES[c] || "n/a"}</span></div>`;
+      }).join("")
+    : empty("n/a");
+}
+
+/* ---- row 7: events ------------------------------------------------------ */
+function renderEvents(r) {
+  const ev = r.events;
+  if (!Array.isArray(ev) || !ev.length) { $("ev").innerHTML = empty("nothing to report"); return; }
+  $("ev").innerHTML = ev.map((line) => {
+    const cls = /MISPREDICT|TRAP|squash/.test(line) ? "mis"
+              : /^issue|^predict/.test(line) ? "iss"
+              : /^retire|^HALT/.test(line) ? "ret"
+              : /^replay|^forward/.test(line) ? "wrn" : "";
+    const m = /seq(\d+)/.exec(line);
+    const pick = m ? ` class="ev ${cls} pick" data-seq="${m[1]}"` : ` class="ev ${cls}"`;
+    return `<div${pick}>${esc(line)}</div>`;
+  }).join("");
+}
+
+/* ---- row 8: stall histogram --------------------------------------------- */
+function renderStalls(r) {
+  const st = r.stalls;
+  if (!st) { $("stalls").innerHTML = empty("n/a"); return; }
+  const rows = Object.entries(st).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+  const total = Object.values(st).reduce((a, b) => a + b, 0);
+  $("cap-stall").textContent = `${total.toLocaleString()} lost issue slots, cumulative`;
+  if (!rows.length) { $("stalls").innerHTML = empty("no slots lost yet"); return; }
+  const top = rows[0][1];
+  $("stalls").innerHTML = `<div class="bars">` + rows.map(([k, v]) => {
+    const pct = total ? (100 * v / total).toFixed(1) : "0.0";
+    // Waiting on a producer is the program, not a resource: shown, but not in
+    // the colour that means "the machine ran out of something".
+    const cls = k === "OPERANDS" ? "fill a" : "fill";
+    return `<div class="bar-row" title="${esc(k)}: ${v} slots (${pct}%)">` +
+           `<span class="lab">${esc(k.toLowerCase())}</span>` +
+           `<span class="track"><span class="${cls}" style="width:${Math.max(2, 100 * v / top)}%"></span></span>` +
+           `<span class="val">${v.toLocaleString()} <span class="dim">${pct}%</span></span></div>`;
+  }).join("") + `</div>`;
+}
+
+/* ---- detail panel ------------------------------------------------------- */
+function renderDetail(r) {
+  const box = $("detail");
+  if (S.sel === null) { box.classList.add("hide"); return; }
+  box.classList.remove("hide");
+
+  const rob = bySeq(r, S.sel);
+  const iq  = (r.iq || []).find((e) => e.seq === S.sel);
+  const lq  = (r.lq || []).find((e) => e.seq === S.sel);
+  const sq  = (r.sq || []).find((e) => e.seq === S.sel);
+  const ex  = (r.executing || []).find((e) => e.seq === S.sel);
+  const wb  = [...(r.wb_fast || []), ...(r.wb_slow || [])].find((e) => e.seq === S.sel);
+  const idxIt = S.index ? S.index.bySeq.get(S.sel) : null;
+  const src = rob || idxIt;
+
+  $("cap-detail").textContent = src ? `seq ${S.sel} · ${textOf(src)}` : `seq ${S.sel}`;
+  if (!src) {
+    $("detailbody").innerHTML =
+      `<div class="empty">seq ${S.sel} is not in this cycle's snapshot. ` +
+      `Use find (${"↑↓"}) to reach a cycle that has it, or open the pipeline view.</div>`;
+    return;
+  }
+
+  const at = Array.isArray(src.at) ? src.at : [];
+  const stamp = (i) => (at[i] === undefined || at[i] === null) ? "n/a" : at[i];
+  const retire = idxIt && idxIt.retire !== undefined ? idxIt.retire
+               : ((r.retired_seqs || []).indexOf(S.sel) >= 0 ? r.cycle : null);
+  const squash = idxIt && idxIt.squash !== undefined ? idxIt.squash
+               : ((r.squashed_seqs || []).indexOf(S.sel) >= 0 ? r.cycle : null);
+
+  // Where a source tag came from: the ROB entry that writes it, if one is
+  // still in flight. Anything else was committed before this cycle.
+  const producer = (tag) => {
+    if (tag === undefined || tag === null) return "";
+    const prod = (r.rob || []).find((e) => e.dest_phys === tag && e.seq !== S.sel);
+    if (prod) return ` <span class="dim">from</span> <span class="chip k pick" data-seq="${prod.seq}">seq ${prod.seq}</span>`;
+    return ` <span class="dim">no producer in flight</span>`;
+  };
+  const readyOf = (tag) => {
+    if (iq) {
+      if (tag === iq.src1) return flag(iq.src1_ready);
+      if (tag === iq.src2) return flag(iq.src2_ready);
+    }
+    const p = (r.prf || []).find((e) => e.phys === tag);
+    if (!p) return null;
+    return p.ready !== undefined ? !!p.ready : !flag(p.pending);
+  };
+  const srcRow = (label, tag) => {
+    if (tag === undefined || tag === null) return `<tr><td class="k">${label}</td><td class="dim">n/a</td></tr>`;
+    const rdy = readyOf(tag);
+    const chip = rdy === null ? `<span class="chip">p${tag}</span>`
+                              : `<span class="chip ${rdy ? "g" : "a"}">p${tag} ${rdy ? "✓ ready" : "… waiting"}</span>`;
+    return `<tr><td class="k">${label}</td><td>${chip}${producer(tag)}</td></tr>`;
+  };
+
+  const predicted = flag(src.pred_taken) ? hex(src.pred_target)
+                  : (src.pc !== undefined ? hex(src.pc + 4) + ` <span class="dim">(fall through)</span>` : "n/a");
+  const actual = (src.next_pc === undefined || src.next_pc === null)
+    ? `<span class="dim">n/a — not executed yet</span>` : hex(src.next_pc);
+  const wrong = src.next_pc !== undefined && src.next_pc !== null &&
+                ((flag(src.pred_taken) ? src.pred_target : src.pc + 4) !== src.next_pc);
+
+  const where = [
+    rob ? `<span class="chip v">ROB</span>` : "",
+    iq  ? `<span class="chip ${flag(iq.src1_ready) && flag(iq.src2_ready) ? "g" : "a"}">issue queue</span>` : "",
+    ex  ? `<span class="chip a">executing → wb@${num(ex.wb_cycle)}</span>` : "",
+    wb  ? `<span class="chip g">writeback</span>` : "",
+    lq  ? `<span class="chip">load queue</span>` : "",
+    sq  ? `<span class="chip">store queue</span>` : "",
+  ].filter(Boolean).join(" ") || `<span class="dim">not in any structure this cycle</span>`;
+
+  $("detailbody").innerHTML = `
+    <table class="kv2">
+      <tr><td class="k">seq</td><td>${num(src.seq)} <span class="dim">uid ${num(src.uid)}</span></td></tr>
+      <tr><td class="k">pc</td><td>${hex(src.pc)}</td></tr>
+      <tr><td class="k">text</td><td>${esc(textOf(src))}</td></tr>
+      <tr><td class="k">class</td><td><span class="chip k">${esc(src.kind || "n/a")}</span>
+        ${flag(src.is_branch) ? `<span class="chip">branch</span>` : ""}
+        ${flag(src.is_load)   ? `<span class="chip">load</span>` : ""}
+        ${flag(src.is_store)  ? `<span class="chip">store</span>` : ""}</td></tr>
+      <tr><td class="k">dest</td><td>${
+        (src.dest_arch === undefined || src.dest_arch === null)
+          ? `<span class="dim">writes no register</span>`
+          : `x${src.dest_arch} ← <span class="chip v">p${num(src.dest_phys)}</span>` +
+            ` <span class="dim">displacing</span> <span class="chip">p${num(src.stale_phys)}</span>`
+      }</td></tr>
+      ${srcRow("src1", src.src1)}
+      ${srcRow("src2", src.src2)}
+      ${src.mem_addr !== undefined ? `<tr><td class="k">address</td><td>${hex(src.mem_addr)}</td></tr>` : ""}
+      <tr><td class="k">checkpoint</td><td>${src.ckpt === undefined || src.ckpt === null
+        ? `<span class="dim">none</span>` : num(src.ckpt)}</td></tr>
+      <tr><td class="k">in</td><td>${where}</td></tr>
+    </table>
+    <table class="kv2">
+      <tr><td class="k">fetched</td><td>${stamp(0)}</td></tr>
+      <tr><td class="k">decoded</td><td>${stamp(1)}</td></tr>
+      <tr><td class="k">renamed</td><td>${stamp(2)}</td></tr>
+      <tr><td class="k">dispatched</td><td>${stamp(3)}</td></tr>
+      <tr><td class="k">issued</td><td>${stamp(4)}</td></tr>
+      <tr><td class="k">completed</td><td>${stamp(5)}</td></tr>
+      <tr><td class="k">retired</td><td>${retire !== null && retire !== undefined ? retire
+        : `<span class="dim">${S.index ? "not in this trace" : "n/a — open the pipeline view to index"}</span>`}</td></tr>
+      ${squash !== null && squash !== undefined
+        ? `<tr><td class="k">squashed</td><td><span class="chip r">cycle ${squash}</span></td></tr>` : ""}
+      <tr><td class="k">predicted</td><td>${predicted}</td></tr>
+      <tr><td class="k">actual</td><td>${actual} ${
+        wrong ? `<span class="chip r">mispredicted</span>` : ""}</td></tr>
+      <tr><td class="k">writeback</td><td>${src.wb_cycle === undefined
+        ? `<span class="dim">n/a — not issued yet</span>` : "cycle " + num(src.wb_cycle)}</td></tr>
+    </table>`;
+}
+
+/* ===================================================== pipeline diagram ==
+   Rows are instructions, columns are cycles. Each cell is the stage the
+   instruction was in, taken from the stamps the trace carries; nothing here
+   decides when a stage happened.                                            */
+const PIPE = { cw: 15, rh: 17, lab: 190, head: 22 };
+
+function stageAt(it, cycle) {
+  const at = it.at || [];
+  const span = (from, to) => at[from] !== undefined && at[from] !== null &&
+                             cycle >= at[from] && (to === null || cycle < to);
+  const next = (i) => {
+    for (let k = i + 1; k < 6; k++) if (at[k] !== undefined && at[k] !== null) return at[k];
+    if (it.squash !== undefined) return it.squash + 1;
+    if (it.retire !== undefined) return it.retire + 1;
+    return null;
+  };
+  if (it.squash !== undefined && cycle > it.squash) return null;
+  if (it.retire !== undefined && cycle > it.retire) return null;
+  if (it.squash !== undefined && cycle === it.squash) return "×";
+  if (it.retire !== undefined && cycle === it.retire) return "C";
+  if (span(5, next(5))) return "W";
+  if (span(4, next(4))) return "X";
+  if (span(3, next(3))) return "S";
+  if (span(2, next(2))) return "R";
+  if (span(1, next(1))) return "D";
+  if (span(0, next(0))) return "F";
+  return null;
+}
+
+const STAGE_COLOR = {
+  F: "#2b3a4a", D: "#33465a", R: "#3d5570",
+  S: "#6b4f16", X: "#1f5c8b", W: "#1d5c2c", C: "#2f7a3d", "×": "#7a2418",
+};
+
+function drawPipeline() {
+  const wrap = $("pipewrap"), cv = $("pipecanvas"), sp = $("pipespacer");
+  if (!S.index) return;
+  const rows = S.index.order;
+  const c0 = S.cycles[0], c1 = S.cycles[S.cycles.length - 1];
+  const ncy = c1 - c0 + 1;
+
+  sp.style.width  = (PIPE.lab + ncy * PIPE.cw) + "px";
+  sp.style.height = (PIPE.head + rows.length * PIPE.rh) + "px";
+
+  const vw = wrap.clientWidth, vh = wrap.clientHeight;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.ceil(vw * dpr); cv.height = Math.ceil(vh * dpr);
+  cv.style.width = vw + "px"; cv.style.height = vh + "px";
+  cv.style.transform = `translate(${wrap.scrollLeft}px, ${wrap.scrollTop}px)`;
+
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, vw, vh);
+  g.font = '10px ui-monospace, Menlo, monospace';
+  g.textBaseline = "middle";
+
+  const sx = wrap.scrollLeft, sy = wrap.scrollTop;
+  const firstRow = Math.max(0, Math.floor((sy - PIPE.head) / PIPE.rh));
+  const lastRow  = Math.min(rows.length - 1, Math.ceil((sy + vh) / PIPE.rh));
+  const firstCol = Math.max(0, Math.floor((sx - PIPE.lab) / PIPE.cw));
+  const lastCol  = Math.min(ncy - 1, Math.ceil((sx + vw - PIPE.lab) / PIPE.cw));
+
+  // Cells
+  for (let ri = firstRow; ri <= lastRow; ri++) {
+    const it = rows[ri];
+    const y = PIPE.head + ri * PIPE.rh - sy;
+    if (it.seq === S.sel) { g.fillStyle = "rgba(163,113,247,.14)"; g.fillRect(0, y, vw, PIPE.rh); }
+    for (let ci = firstCol; ci <= lastCol; ci++) {
+      const cycle = c0 + ci;
+      const st = stageAt(it, cycle);
+      if (!st) continue;
+      const x = PIPE.lab + ci * PIPE.cw - sx;
+      g.fillStyle = STAGE_COLOR[st] || "#2b3a4a";
+      g.fillRect(x + 1, y + 1, PIPE.cw - 2, PIPE.rh - 3);
+      g.fillStyle = st === "×" ? "#ffb3a7" : "#dbe6f2";
+      g.textAlign = "center";
+      g.fillText(st, x + PIPE.cw / 2, y + PIPE.rh / 2);
+    }
+  }
+
+  // Current cycle marker
+  const curCycle = S.cycles[S.idx];
+  const cx = PIPE.lab + (curCycle - c0) * PIPE.cw - sx;
+  if (cx >= PIPE.lab - PIPE.cw && cx <= vw) {
+    g.fillStyle = "rgba(163,113,247,.85)";
+    g.fillRect(cx, 0, 1.5, vh);
+  }
+
+  // Sticky row labels
+  g.fillStyle = "#0e141b"; g.fillRect(0, 0, PIPE.lab, vh);
+  g.strokeStyle = "#222c39"; g.beginPath();
+  g.moveTo(PIPE.lab + .5, 0); g.lineTo(PIPE.lab + .5, vh); g.stroke();
+  g.textAlign = "left";
+  for (let ri = firstRow; ri <= lastRow; ri++) {
+    const it = rows[ri];
+    const y = PIPE.head + ri * PIPE.rh - sy + PIPE.rh / 2;
+    if (y < PIPE.head) continue;
+    g.fillStyle = it.seq === S.sel ? "#a371f7" : "#5d6875";
+    g.fillText(String(it.seq).padStart(6, " "), 6, y);
+    g.fillStyle = it.squash !== undefined ? "#f0503a" : (it.seq === S.sel ? "#ffffff" : "#c8d4e2");
+    const label = (S.disasm.get(it.pc) || "n/a");
+    g.fillText(label.length > 22 ? label.slice(0, 21) + "…" : label, 52, y);
+  }
+
+  // Sticky cycle header
+  g.fillStyle = "#0e141b"; g.fillRect(0, 0, vw, PIPE.head);
+  g.strokeStyle = "#222c39"; g.beginPath();
+  g.moveTo(0, PIPE.head + .5); g.lineTo(vw, PIPE.head + .5); g.stroke();
+  g.fillStyle = "#5d6875"; g.textAlign = "left";
+  g.fillText("seq   instruction", 6, PIPE.head / 2);
+  g.textAlign = "center";
+  const every = PIPE.cw < 24 ? 5 : 1;
+  for (let ci = firstCol; ci <= lastCol; ci++) {
+    const cycle = c0 + ci;
+    if (cycle % every) continue;
+    const x = PIPE.lab + ci * PIPE.cw - sx + PIPE.cw / 2;
+    if (x < PIPE.lab) continue;
+    g.fillStyle = cycle === curCycle ? "#a371f7" : "#5d6875";
+    g.fillText(String(cycle), x, PIPE.head / 2);
+  }
+}
+
+function pipeClick(ev) {
+  if (!S.index) return;
+  const wrap = $("pipewrap");
+  const box = wrap.getBoundingClientRect();
+  const x = ev.clientX - box.left + wrap.scrollLeft;
+  const y = ev.clientY - box.top + wrap.scrollTop;
+  if (y < PIPE.head) return;
+  const ri = Math.floor((y - PIPE.head) / PIPE.rh);
+  const it = S.index.order[ri];
+  if (!it) return;
+  S.sel = it.seq;
+  if (x > PIPE.lab) {
+    const cycle = S.cycles[0] + Math.floor((x - PIPE.lab) / PIPE.cw);
+    gotoCycle(cycle);
+  }
+  drawPipeline();
+}
+
+// Keep the playhead in view while scrubbing in the diagram.
+function followPipeline() {
+  const wrap = $("pipewrap");
+  const x = PIPE.lab + (S.cycles[S.idx] - S.cycles[0]) * PIPE.cw;
+  const left = wrap.scrollLeft, right = left + wrap.clientWidth;
+  if (x < left + PIPE.lab || x > right - 40) {
+    wrap.scrollLeft = Math.max(0, x - wrap.clientWidth * 0.6);
+  }
+}
+
+function setView(v) {
+  S.view = v;
+  $("cycleview").classList.toggle("hide", v !== "cycle");
+  $("pipeview").classList.toggle("hide", v !== "pipe");
+  $("viewbtn").textContent = v === "cycle" ? "pipeline view" : "cycle view";
+  $("viewbtn").classList.toggle("on", v === "pipe");
+  if (v === "pipe") {
+    $("pipestatus").textContent = "indexing …";
+    buildIndex(() => { drawPipeline(); followPipeline(); drawPipeline(); });
+  } else {
+    render();
+  }
+}
+
+/* ============================================================== events === */
+function onPick(ev) {
+  const node = ev.target && ev.target.closest && ev.target.closest("[data-seq]");
+  if (!node) return;
+  const seq = Number(node.dataset.seq);
+  S.sel = (S.sel === seq) ? null : seq;
+  render();
+}
+
+function wire() {
+  $("file").addEventListener("change", (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+  $("pastebtn").addEventListener("click", () => $("pastebox").classList.toggle("hide"));
+  $("pastecancel").addEventListener("click", () => $("pastebox").classList.add("hide"));
+  $("pasteload").addEventListener("click", () => {
+    try { loadText($("paste").value); $("pastebox").classList.add("hide"); }
+    catch (e) { fail(e); }
+  });
+
+  const drop = $("drop");
+  const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+  ["dragenter", "dragover"].forEach((t) =>
+    document.addEventListener(t, (e) => { stop(e); drop.classList.add("hot"); }));
+  ["dragleave", "drop"].forEach((t) =>
+    document.addEventListener(t, (e) => { stop(e); drop.classList.remove("hot"); }));
+  document.addEventListener("drop", (e) => {
+    const f = e.dataTransfer && e.dataTransfer.files[0];
+    if (f) loadFile(f);
+  });
+
+  $("b-start").onclick = () => goto(0);
+  $("b-end").onclick   = () => goto(S.lines.length - 1);
+  $("b-b1").onclick    = () => step(-1);
+  $("b-f1").onclick    = () => step(1);
+  $("b-b10").onclick   = () => step(-10);
+  $("b-f10").onclick   = () => step(10);
+  $("b-play").onclick  = () => play();
+  $("speed").onchange  = () => { if (S.playing) play(true); };
+  $("scrub").oninput   = (e) => goto(Number(e.target.value));
+  $("cycbox").onchange = (e) => gotoCycle(Number(e.target.value));
+  $("b-next").onclick  = () => search(1);
+  $("b-prev").onclick  = () => search(-1);
+  $("find").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { search(e.shiftKey ? -1 : 1); e.preventDefault(); }
+    e.stopPropagation();
+  });
+  $("viewbtn").onclick = () => setView(S.view === "cycle" ? "pipe" : "cycle");
+
+  document.addEventListener("click", onPick);
+  $("pipewrap").addEventListener("scroll", () => drawPipeline(), { passive: true });
+  $("pipewrap").addEventListener("click", pipeClick);
+  window.addEventListener("resize", () => { if (S.view === "pipe") drawPipeline(); });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+    switch (e.key) {
+      case "ArrowLeft":  step(e.shiftKey ? -10 : -1); break;
+      case "ArrowRight": step(e.shiftKey ?  10 :  1); break;
+      case " ":          play(); break;
+      case "Home":       goto(0); break;
+      case "End":        goto(S.lines.length - 1); break;
+      case "v":          setView(S.view === "cycle" ? "pipe" : "cycle"); return;
+      case "Escape":     S.sel = null; render(); return;
+      case "n":          search(1); return;
+      case "p":          search(-1); return;
+      default: return;
+    }
+    e.preventDefault();
+  });
+}
+
+wire();
+
+// An embedded trace, if the page was shipped with one.
+try {
+  const raw = $("embedded-trace").textContent.trim();
+  if (raw && raw !== "[]") loadText(raw);
+} catch (e) { fail(e); }
+</script>
+</body>
+</html>

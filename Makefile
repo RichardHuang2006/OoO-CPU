@@ -28,7 +28,7 @@ HDR        = $(wildcard src/*.h) $(wildcard tests/*.h)
 # #including it.
 LIB_SRC = $(filter-out src/main.cpp,$(CPU_SRC))
 
-.PHONY: all debug test examples clean help
+.PHONY: all debug test examples trace clean help
 .DEFAULT_GOAL := all
 
 # ---------------------------------------------------------------- release ---
@@ -72,6 +72,21 @@ examples:
 	  echo "examples: skipped, no $(TOOLS_SRC)"; \
 	fi
 
+# ----------------------------------------------------------------- trace ---
+# A cycle trace of a bundled program, sized for the visualiser rather than for
+# a full run: records average ~8 KB, so a window is what you want.
+TRACE_PROG   ?= fib
+TRACE_CYCLES ?= 2000
+TRACE_OUT     = $(BUILD)/$(TRACE_PROG).ndjson
+
+# oooc exits with the traced program's own exit code, so the status says
+# nothing about whether the trace was written — the file does.
+trace: all examples
+	./$(BUILD)/oooc --hex examples/$(TRACE_PROG).hex --base 0x1000 \
+	  --trace=$(TRACE_OUT) --trace-max $(TRACE_CYCLES) || true
+	@test -s $(TRACE_OUT) || { echo "trace: nothing written to $(TRACE_OUT)"; exit 1; }
+	@echo "open tools/oooviz.html in a browser and load $(TRACE_OUT)"
+
 # ------------------------------------------------------------------ test ---
 # One translation unit that pulls in nearly every header, so it is rebuilt on
 # any header change rather than tracked dependency by dependency.
@@ -94,6 +109,8 @@ help:
 	@echo "  all      build/oooc         (release, -O2, warnings-as-errors off)"
 	@echo "  debug    build/oooc-debug + run the test suite under ASan + UBSan"
 	@echo "  test     compile+run tests/test_main after regenerating examples/"
+	@echo "  trace    write a cycle trace for tools/oooviz.html"
+	@echo "           (TRACE_PROG=fib TRACE_CYCLES=2000)"
 	@echo "  clean    remove build/ and examples/"
 
 # Auto-generated header dependencies.

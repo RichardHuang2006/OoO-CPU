@@ -23,6 +23,7 @@
 #include "memory.h"
 #include "ref.h"
 #include "stats.h"
+#include "trace.h"
 
 // ============================================================================
 // CLI surface
@@ -36,6 +37,9 @@ struct CliOpts {
     bool        has_base = false;
     bool        print_regs = false;
     bool        trace = false;
+    std::string trace_path;           // empty: the default file name
+    uint64_t    trace_from = 0;       // first cycle recorded
+    uint64_t    trace_max = 50'000;   // cycles recorded, not cycles run
     bool        show_help = false;
     bool        use_ref = false;      // interpreter instead of the pipeline
     bool        show_stats = false;
@@ -44,6 +48,8 @@ struct CliOpts {
     uint64_t    max_cycles = 1'000'000'000;
     Config      cfg;
 };
+
+inline constexpr const char* DEFAULT_TRACE_PATH = "trace.ndjson";
 
 // One entry per Config knob. The pointer-to-member lets the parser assign to
 // any field uniformly.
@@ -126,7 +132,14 @@ inline int parse_args(int argc, char** argv, CliOpts& opts) {
 
         if (flag == "--help" || flag == "-h") { opts.show_help = true; return 0; }
         if (flag == "--regs")      { opts.print_regs = true; continue; }
-        if (flag == "--trace")     { opts.trace = true; continue; }
+        // The path is optional, so only the --trace=PATH spelling supplies one:
+        // taking the next argument would swallow a positional ELF.
+        if (flag == "--trace") {
+            opts.trace = true;
+            const auto eq = tok.find('=');
+            if (eq != std::string::npos) opts.trace_path = tok.substr(eq + 1);
+            continue;
+        }
         if (flag == "--ref")       { opts.use_ref = true; continue; }
         if (flag == "--stats")     { opts.show_stats = true; continue; }
         if (flag == "--ipc-table") { opts.ipc_table = true; continue; }
@@ -147,6 +160,22 @@ inline int parse_args(int argc, char** argv, CliOpts& opts) {
             if (!take_value(v))                     return 1;
             if (!parse_u64(v, opts.max_insts)) {
                 std::fprintf(stderr, "oooc: bad --max-insts '%s'\n", v.c_str()); return 1;
+            }
+            continue;
+        }
+        if (flag == "--trace-from") {
+            std::string v;
+            if (!take_value(v))                     return 1;
+            if (!parse_u64(v, opts.trace_from)) {
+                std::fprintf(stderr, "oooc: bad --trace-from '%s'\n", v.c_str()); return 1;
+            }
+            continue;
+        }
+        if (flag == "--trace-max") {
+            std::string v;
+            if (!take_value(v))                    return 1;
+            if (!parse_u64(v, opts.trace_max)) {
+                std::fprintf(stderr, "oooc: bad --trace-max '%s'\n", v.c_str()); return 1;
             }
             continue;
         }
@@ -204,7 +233,14 @@ inline void print_help() {
     std::printf("  --stats           print cycles, IPC, prediction and the stall breakdown\n");
     std::printf("  --ipc-table       run the program 1-, 2-, 4-wide and starved, and compare\n");
     std::printf("  --ref             run the in-order reference interpreter instead\n");
-    std::printf("  --trace           print each retired instruction to stderr (--ref only)\n");
+    std::printf("  --trace[=PATH]    write a cycle-by-cycle JSON trace for tools/oooviz.html\n");
+    std::printf("                    (default %s); with --ref, the retired-instruction\n",
+                DEFAULT_TRACE_PATH);
+    std::printf("                    trace instead, to PATH or to stderr\n");
+    std::printf("  --trace-from N    start recording at cycle N, to capture a window of a\n");
+    std::printf("                    long run (default 1, the first cycle)\n");
+    std::printf("  --trace-max N     stop recording after N cycles (default 50000); the run\n");
+    std::printf("                    itself continues to completion\n");
     std::printf("  --max-insts N     abort after N retired instructions (default 1e8)\n");
     std::printf("  --max-cycles N    abort after N cycles (default 1e9)\n");
     std::printf("  --help, -h        this message\n");
@@ -299,6 +335,48 @@ inline void print_ipc_table(const Memory& image, uint32_t entry, uint64_t max_cy
 }
 
 // ============================================================================
+// Cycle trace
+// ============================================================================
+
+// Runs the machine one cycle at a time with an observer attached, writing one
+// JSON record per cycle for tools/oooviz.html. Recording stops at --trace-max
+// but the run does not: the caller finishes it untraced, so a capped trace
+// still reports the program's real exit code.
+//
+// Returns false only when the file cannot be opened. Tracing never changes
+// what the machine does — that is the whole point of it.
+inline bool run_with_trace(Cpu& cpu, const CliOpts& opts, uint32_t entry_pc) {
+    const std::string path =
+        opts.trace_path.empty() ? std::string(DEFAULT_TRACE_PATH) : opts.trace_path;
+
+    std::FILE* out = std::fopen(path.c_str(), "w");
+    if (!out) {
+        std::fprintf(stderr, "oooc: cannot write %s\n", path.c_str());
+        return false;
+    }
+
+    CycleTrace trace(out);
+    trace.header(cpu.config(), entry_pc, cpu.cdb_window());
+
+    // Cycles before the window are run at full speed, unobserved: a window is
+    // meant to make a long run affordable, so it must not pay for the part it
+    // is not recording.
+    while (!cpu.done() && cpu.cycle() < opts.max_cycles &&
+           trace.records() < opts.trace_max) {
+        cpu.observe(cpu.cycle() + 1 >= opts.trace_from);
+        cpu.tick();
+        if (cpu.cycle() >= opts.trace_from) trace.snapshot(cpu);
+    }
+    cpu.observe(false);
+    std::fclose(out);
+
+    std::fprintf(stderr, "oooc: traced %llu cycle(s) to %s%s\n",
+                 static_cast<unsigned long long>(trace.records()), path.c_str(),
+                 cpu.done() ? "" : "  (cut short; raise --trace-max for more)");
+    return true;
+}
+
+// ============================================================================
 // Entry point (compiled out when included from a test TU).
 // ============================================================================
 
@@ -355,16 +433,27 @@ int main(int argc, char** argv) {
         ref::Options ropts;
         ropts.max_insts = opts.max_insts;
         ropts.trace     = opts.trace;
+
+        // The interpreter has no cycles to photograph, so --trace keeps its
+        // older meaning here: one line per retired instruction.
+        std::FILE* trace_file = nullptr;
+        if (opts.trace && !opts.trace_path.empty()) {
+            trace_file = std::fopen(opts.trace_path.c_str(), "w");
+            if (!trace_file) {
+                std::fprintf(stderr, "oooc: cannot write %s\n", opts.trace_path.c_str());
+                return 2;
+            }
+            ropts.trace_out = trace_file;
+        }
+
         const ref::Result r = ref::run(mem, loaded.entry, ropts);
+        if (trace_file) std::fclose(trace_file);
         for (int i = 0; i < 32; ++i) regs[i] = r.regs[i];
         halted = r.halted; trapped = r.trapped; budget = r.budget;
         retired = r.retired; exit_code = r.exit_code;
     } else {
-        if (opts.trace) {
-            std::fprintf(stderr, "oooc: --trace needs --ref\n");
-            return 2;
-        }
         Cpu cpu(mem, opts.cfg, loaded.entry);
+        if (opts.trace && !run_with_trace(cpu, opts, loaded.entry)) return 2;
         cpu.run(opts.max_cycles);
         regs      = cpu.regs();
         halted    = cpu.halted();

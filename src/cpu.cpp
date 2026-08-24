@@ -1,6 +1,8 @@
 #include "cpu.h"
 
 #include <algorithm>
+#include <cstdarg>
+#include <cstdio>
 
 #include "alu.h"
 
@@ -82,6 +84,30 @@ Cpu::Cpu(Memory& mem, const Config& cfg, uint32_t entry_pc)
     cdb_booked_.assign(static_cast<std::size_t>(cdb_window_), 0);
 }
 
+const char* Cpu::fu_class_name(int cls) {
+    switch (cls) {
+    case 0: return "ALU";
+    case 1: return "BRANCH";
+    case 2: return "MUL";
+    case 3: return "DIV";
+    case 4: return "MEM";
+    default: break;
+    }
+    return "NONE";
+}
+
+// Bounded on purpose: an event line is a label, and a machine that is not
+// being watched should not be paying to format one.
+void Cpu::event(const char* fmt, ...) {
+    if (!observing_) return;
+    char buf[160];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    events_.emplace_back(buf);
+}
+
 std::array<uint32_t, 32> Cpu::regs() const {
     std::array<uint32_t, 32> out{};
     for (ArchReg a = 0; a < 32; ++a) out[a] = prf_.read(arch_rat_[a]);
@@ -95,6 +121,13 @@ void Cpu::tick() {
 
     ++cycle_;
     ++stats_.cycles;
+
+    // Whatever an observer has not read by now belongs to a cycle that is
+    // over. Cleared unconditionally, so turning observation off cannot leave
+    // one cycle's events standing in for a later one.
+    events_.clear();
+    squashed_seqs_.clear();
+    retired_seqs_.clear();
 
     commit();
     if (done()) return;   // squashed by the halt; no stage may refill
@@ -126,8 +159,10 @@ void Cpu::fetch() {
 
     for (uint32_t n = 0; n < cfg_.width && fetch_q_.size() < queue_cap_; ++n) {
         Uop u;
-        u.pc  = pc_;
-        u.raw = mem_.load_u32(pc_);
+        u.uid      = next_uid_++;
+        u.at.fetch = cycle_;
+        u.pc       = pc_;
+        u.raw      = mem_.load_u32(pc_);
 
         const uint32_t ghr_before = bpred_.ghr();
         const BranchPredictor::Prediction pr = bpred_.predict(pc_);
@@ -143,7 +178,11 @@ void Cpu::fetch() {
         ++stats_.fetched;
 
         // One redirect per cycle: the rest of this bundle lives somewhere else.
-        if (pr.taken) break;
+        if (pr.taken) {
+            event("predict taken 0x%X -> 0x%X%s", u.pc, pr.target,
+                  pr.from_ras ? " (RAS)" : "");
+            break;
+        }
     }
 }
 
@@ -155,6 +194,7 @@ void Cpu::decode_stage() {
 
         Uop u = fetch_q_.front();
         fetch_q_.pop_front();
+        u.at.decode = cycle_;
         u.dec     = decode(u.raw);
         u.next_pc = u.pc + 4;
         u.bkind   = kind_of(u.dec);
@@ -203,6 +243,7 @@ void Cpu::rename() {
             dest = *got;
         }
         decode_q_.pop_front();
+        u.at.rename = cycle_;
 
         u.src1 = rat_.map(u.dec.rs1);
         u.src2 = rat_.map(u.dec.rs2);
@@ -235,6 +276,12 @@ void Cpu::rename() {
 
         rename_q_.push_back(u);
         ++stats_.renamed;
+        if (needs_reg) {
+            event("rename seq%u 0x%X: x%u -> p%u (stale p%u)", u.seq, u.pc,
+                  u.dec.rd, u.dest, u.stale);
+        } else {
+            event("rename seq%u 0x%X", u.seq, u.pc);
+        }
         if (record_rename_) {
             rename_log_.push_back({cycle_, u.seq, u.pc, needs_reg ? u.dec.rd : INVALID_ARCHREG,
                                    u.dest, u.stale, u.src1, u.src2});
@@ -266,6 +313,7 @@ void Cpu::dispatch() {
             u.lsq_idx = *slot;
         }
         rename_q_.pop_front();
+        u.at.dispatch = cycle_;
         inflight_[u.rob] = u;
 
         IssueQueue::Entry e;
@@ -380,6 +428,7 @@ void Cpu::issue() {
                     cycle_ + 1;
                 ++stats_.load_replays;
                 blocked.push_back(Stall::STORE_ORDER);
+                event("replay seq%u - older store address unknown", u.seq);
                 continue;
             }
         } else {
@@ -401,6 +450,15 @@ void Cpu::issue() {
                 cycle_ + (pipelined(f) ? 1 : lat);
         }
         u.wb_cycle = cycle_ + lat;
+        u.at.issue = cycle_;
+        if (f == Fu::NONE) {
+            event("issue seq%u -> no unit, wb@%llu", u.seq,
+                  static_cast<unsigned long long>(u.wb_cycle));
+        } else {
+            event("issue seq%u -> %s%d, wb@%llu", u.seq,
+                  fu_class_name(static_cast<int>(f)), unit,
+                  static_cast<unsigned long long>(u.wb_cycle));
+        }
 
         // The prediction resolves here. On a misprediction the oldest offender
         // in the cycle recovers; anything younger, including a younger branch
@@ -463,6 +521,7 @@ void Cpu::recover(const Uop& br) {
         free_list_.free(e.dest_phys);
         rat_.free_checkpoint(e.ckpt);
         ++stats_.squashed;
+        if (observing_) squashed_seqs_.push_back(e.seq);
     }
 
     iq_.squash_after(br.seq);
@@ -487,6 +546,8 @@ void Cpu::recover(const Uop& br) {
     fetch_stalled_ = false;
     pc_ = br.next_pc;
     ++stats_.mispredicts;
+    event("MISPREDICT seq%u - squashed %u younger, PC->0x%X", br.seq,
+          static_cast<unsigned>(killed.size()), br.next_pc);
 }
 
 // -------------------------------------------------------------- execute ---
@@ -520,6 +581,7 @@ bool Cpu::execute_load(Uop& u, uint32_t& latency) {
         u.result = extend_load(u.dec.op, f.data);
         latency  = 1;                       // never left the store queue
         ++stats_.load_forwards;
+        event("forward seq%u <- store queue, [0x%X] = 0x%X", u.seq, addr, u.result);
         return true;
     }
 
@@ -621,7 +683,14 @@ void Cpu::complete(const Uop& u) {
     iq_.wakeup(u.dest);
     rob_.at(u.rob).complete = true;
     inflight_[u.rob] = u;
+    inflight_[u.rob].at.complete = cycle_;
     ++stats_.wrote_back;
+
+    if (u.has_result && u.dest != INVALID_PHYSREG) {
+        event("writeback seq%u p%u = 0x%X", u.seq, u.dest, u.result);
+    } else {
+        event("writeback seq%u", u.seq);
+    }
 }
 
 // Runs before issue, so a tag broadcast this cycle reaches select in the same
@@ -663,6 +732,8 @@ void Cpu::commit() {
         // strictly increasing rather than consecutive.
         if (stats_.retired > 0 && u.seq <= last_committed_seq_) commit_in_order_ = false;
         last_committed_seq_ = u.seq;
+        if (observing_) retired_seqs_.push_back(u.seq);
+        event("retire seq%u 0x%X", u.seq, u.pc);
 
         // Every architectural effect other than a register write happens here,
         // memory included. Queue seats are released in allocation order.
@@ -728,6 +799,9 @@ void Cpu::commit() {
         if (cause != TrapCause::NONE) {
             trapped_    = true;
             trap_cause_ = cause;
+            event("TRAP at 0x%X", u.pc);
+        } else if (halted_) {
+            event("HALT exit=%u", exit_code_);
         }
 
         arch_pc_ = done() ? u.pc : u.next_pc;   // a trap reports its own PC
@@ -744,11 +818,15 @@ void Cpu::commit() {
 // Youngest first, so each entry returns the register it allocated, not the
 // stale one it displaced and an older entry still owns.
 void Cpu::squash_in_flight() {
+    uint32_t killed = 0;
     for (const RobEntry& e : rob_.squash_all()) {
         free_list_.free(e.dest_phys);
         rat_.free_checkpoint(e.ckpt);
         ++stats_.squashed;
+        ++killed;
+        if (observing_) squashed_seqs_.push_back(e.seq);
     }
+    if (killed > 0) event("squashed %u in flight behind the halt", killed);
 
     rat_.adopt(arch_rat_);
     lsq_.clear();

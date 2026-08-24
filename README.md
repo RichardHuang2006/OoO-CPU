@@ -53,6 +53,8 @@ src/
   alu.h          integer/branch/mul/div functional semantics
   memory.h       lazily paged flat byte memory
   loader.h       .hex, raw-binary and ELF32 program loaders
+  disasm.h       one decoded instruction as text, for traces and humans
+  trace.h        the cycle-by-cycle JSON trace writer
   rob.h          reorder buffer
   prf.h          unified physical register file with ready bits
   freelist.h     physical register free list
@@ -72,6 +74,7 @@ tests/
 
 tools/
   gen_examples.cpp  assembles the bundled workloads into examples/*.hex
+  oooviz.html       single-file cycle-by-cycle trace viewer (no build, no server)
 ```
 
 ## Build
@@ -97,8 +100,54 @@ Programs are loaded from a plain hex-word file (`--hex` with `--base`), a raw bi
 (`--raw` with `--base`), or a positional ELF32 path. `--stats` prints cycles, IPC, branch
 and memory behaviour, and the stall-cause breakdown. `--ipc-table` runs the same program
 on four machine configurations and reports the scaling. `--ref` runs the in-order
-reference interpreter instead of the pipeline, and `--trace` prints each retired
-instruction to stderr (reference runs only).
+reference interpreter instead of the pipeline, and `--trace` records the run for the
+viewer described below (with `--ref`, the retired-instruction trace instead).
+
+## Watching a run, cycle by cycle
+
+`--trace` writes one JSON object per cycle, and `tools/oooviz.html` renders it. The viewer is
+a single file with no build step, no dependencies and no server: open it from the filesystem
+and pick a trace, or drop one on the page.
+
+```bash
+make trace                                   # build/fib.ndjson, 2000 cycles
+open tools/oooviz.html                       # then load that file
+
+build/oooc --hex examples/crc32.hex --base 0x1000 \
+  --trace=crc.ndjson --trace-from 5000 --trace-max 2000     # a window of a long run
+```
+
+Records average about 8 KB, so trace a window rather than a whole long program: `--trace-from`
+skips to the interesting part at full speed and `--trace-max` bounds the file. The run
+continues to completion after recording stops, so the exit code and `--stats` match an
+untraced run; the test suite asserts exactly that.
+
+The viewer shows every structure the machine has: the three front-end queues, the issue queue
+with ready bits, the reorder buffer with its head marker, both mapping tables, the physical
+registers in use, the free list, the load and store queues, function-unit occupancy, writeback
+port bookings, the branch predictor's history, return stack and counters, the events of the
+cycle, and the cumulative stall breakdown. Changed entries flash; clicking anything with a
+sequence number selects that instruction and highlights it in every pane at once, with a detail
+panel giving its tags, its producers, the cycle each stage happened, and its predicted versus
+actual next PC. `v` switches to a pipeline diagram — one row per instruction, one column per
+cycle, cells showing `F D R S X W C` — the view that makes a stall obvious at a glance. Arrow
+keys step, space plays, `Home`/`End` jump, and the find box takes `seq 61`, `0x1010`,
+`mispredict` or `replay`.
+
+### Trace format
+
+Newline-delimited JSON. The first line is a header (no `cycle` key) carrying the `Config`, so
+the viewer can show occupancy against capacity; every line after it is one cycle. Two
+conventions keep the files small enough for a browser:
+
+- **Instruction text is sent once.** A PC is disassembled into the `disasm` map on the first
+  record that mentions it; later entries carry the PC alone.
+- **A false boolean is an absent key**, and a sentinel (`INVALID_PHYSREG` and friends) is
+  written as `null` or left out — never as `4294967295`.
+
+Each in-flight instruction carries `at`, the cycles its stages happened, as
+`[fetch, decode, rename, dispatch, issue, complete]` truncated at the stage it has reached. The
+viewer never infers a field the trace does not carry: a missing one is drawn as `n/a`.
 
 ## Validation
 

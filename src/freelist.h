@@ -42,6 +42,10 @@ public:
         free_.push_back(r);
     }
 
+    // The queue in alloc() order; only the trace looks, to show what rename
+    // takes next.
+    const std::deque<PhysReg>& order() const { return free_; }
+
     // Linear, but only tests ask; the pipeline never looks.
     bool contains(PhysReg r) const {
         return std::find(free_.begin(), free_.end(), r) != free_.end();

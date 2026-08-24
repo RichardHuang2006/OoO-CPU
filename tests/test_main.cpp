@@ -4734,6 +4734,300 @@ SECTION("prf") {
 }
 
 
+// ----------------------------------------------------- @section("disasm") ---
+SECTION("disasm") {
+    // The text a trace carries is the only description of an instruction the
+    // viewer ever gets, so it has to name the operands the encoding really has
+    // — including the two places where the decoder deliberately forgets:
+    // ADD/ADDI share an Op, and a store keeps its data register in rs2.
+    struct Case { uint32_t raw; uint32_t pc; const char* want; };
+
+    asmc::Assembler a;
+    a.addi(1, 1, -1);
+    a.add(2, 2, 1);
+    a.sub(3, 2, 1);
+    a.slli(4, 1, 3);
+    a.srai(5, 1, 2);
+    a.lui(2, 0x8);
+    a.auipc(6, 0x1);
+    a.mul(5, 4, 4);
+    a.divu(7, 5, 4);
+    a.lw(8, 2, 8);
+    a.lbu(9, 2, -3);
+    a.sw(1, 2, 12);
+    a.sb(9, 2, 0);
+    a.jalr(1, 5, 16);
+    a.andi(10, 10, 255);
+    a.ecall();
+    a.ebreak();
+    const std::vector<uint32_t> words = const_cast<asmc::Assembler&>(a).assemble();
+
+    const char* want[] = {
+        "addi x1,x1,-1", "add x2,x2,x1", "sub x3,x2,x1", "slli x4,x1,3",
+        "srai x5,x1,2", "lui x2,0x8", "auipc x6,0x1", "mul x5,x4,x4",
+        "divu x7,x5,x4", "lw x8,8(x2)", "lbu x9,-3(x2)", "sw x1,12(x2)",
+        "sb x9,0(x2)", "jalr x1,16(x5)", "andi x10,x10,255", "ecall", "ebreak",
+    };
+    REQUIRE(words.size() == sizeof(want) / sizeof(want[0]));
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        const std::string got = disasm(words[i], wl::TEXT + static_cast<uint32_t>(i * 4));
+        REQUIRE_MSG(got == want[i],
+                    "    got \"" + got + "\", want \"" + std::string(want[i]) + "\"");
+    }
+
+    // ---- Control flow prints where it goes, not how far ------------------
+    // A viewer compares the target against a PC; a displacement would make it
+    // do the arithmetic the trace is supposed to have already done.
+    {
+        asmc::Assembler b;
+        b.label("top");
+        b.addi(1, 1, -1);
+        b.bne(1, 0, "top");
+        b.jal(1, "top");
+        const std::vector<uint32_t> ws = b.assemble();
+        REQUIRE(disasm(ws[1], 0x1004) == "bne x1,x0,0x1000");
+        REQUIRE(disasm(ws[2], 0x1008) == "jal x1,0x1000");
+    }
+
+    // ---- An undecodable word says so rather than inventing an opcode -----
+    REQUIRE(disasm(0xFFFFFFFFu, 0x1000).rfind("<invalid", 0) == 0);
+}
+
+// ------------------------------------------------------ @section("trace") ---
+namespace tracetest {
+
+inline std::string slurp(std::FILE* f) {
+    std::rewind(f);
+    std::string out;
+    char buf[4096];
+    std::size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    return out;
+}
+
+inline std::vector<std::string> split_lines(const std::string& s) {
+    std::vector<std::string> out;
+    std::size_t start = 0;
+    while (start < s.size()) {
+        const std::size_t nl = s.find('\n', start);
+        if (nl == std::string::npos) { out.push_back(s.substr(start)); break; }
+        out.push_back(s.substr(start, nl - start));
+        start = nl + 1;
+    }
+    return out;
+}
+
+// Enough of a JSON check to catch what a hand-rolled writer gets wrong: an
+// unbalanced container, an unterminated string, or a comma with nothing on one
+// side of it. Delimiters inside strings do not count, which matters because
+// instruction text is full of commas.
+inline bool json_ok(const std::string& s) {
+    int depth = 0;
+    bool in_str = false, esc = false;
+    char last = 0;                       // last significant char outside a string
+    for (const char c : s) {
+        if (in_str) {
+            if (esc)             esc = false;
+            else if (c == '\\')  esc = true;
+            else if (c == '"')   { in_str = false; last = '"'; }
+            continue;
+        }
+        switch (c) {
+        case '"': in_str = true; break;
+        case '{': case '[':
+            if (last == '"' || last == '}' || last == ']') return false;  // missing comma
+            ++depth; break;
+        case '}': case ']':
+            if (last == ',') return false;                                // trailing comma
+            if (--depth < 0) return false;
+            break;
+        case ',':
+            if (last == ',' || last == '{' || last == '[' || last == 0) return false;
+            break;
+        case ' ': continue;
+        default: break;
+        }
+        last = c;
+    }
+    return depth == 0 && !in_str && last == '}';
+}
+
+inline std::size_t count_of(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0, at = 0;
+    while ((at = hay.find(needle, at)) != std::string::npos) { ++n; at += needle.size(); }
+    return n;
+}
+
+// The text between "key":[ and the matching ], for shallow arrays.
+inline std::string array_of(const std::string& line, const std::string& key) {
+    const std::size_t at = line.find("\"" + key + "\":[");
+    if (at == std::string::npos) return "";
+    const std::size_t open = line.find('[', at);
+    const std::size_t close = line.find(']', open);
+    return line.substr(open + 1, close - open - 1);
+}
+
+}  // namespace tracetest
+
+SECTION("trace") {
+    using namespace tracetest;
+
+    // fib exercises everything the trace has to describe: branches that
+    // mispredict, loads that forward, stores that drain at commit.
+    const wl::Workload& w = stattest::named("fib");
+    const Config cfg;
+    constexpr uint64_t WINDOW = 300;
+
+    Memory mem = cputest::image(w.words);
+    Cpu cpu(mem, cfg, wl::TEXT);
+
+    std::FILE* f = std::tmpfile();
+    REQUIRE(f != nullptr);
+    if (!f) return;
+
+    CycleTrace tr(f);
+    tr.header(cfg, wl::TEXT, cpu.cdb_window());
+    cpu.observe(true);
+    while (!cpu.done() && cpu.cycle() < WINDOW) {
+        cpu.tick();
+        tr.snapshot(cpu);
+    }
+    cpu.observe(false);
+
+    const std::string text = slurp(f);
+    std::fclose(f);
+    const std::vector<std::string> lines = split_lines(text);
+
+    // ---- One header and one record per cycle, in order -------------------
+    REQUIRE(tr.records() == cpu.cycle());
+    REQUIRE(lines.size() == cpu.cycle() + 1);
+    REQUIRE(lines[0].find("\"kind\":\"header\"") != std::string::npos);
+    REQUIRE(lines[0].find("\"rob_size\":32") != std::string::npos);
+    REQUIRE(lines[0].find("\"cycle\":") == std::string::npos);   // how a reader tells it apart
+
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        REQUIRE_MSG(json_ok(lines[i]), "    malformed record on line " + std::to_string(i));
+    }
+    for (uint64_t c = 1; c <= cpu.cycle(); ++c) {
+        const std::string want = "{\"cycle\":" + std::to_string(c) + ",";
+        REQUIRE_MSG(lines[c].rfind(want, 0) == 0, "    line " + std::to_string(c) +
+                    " does not start with cycle " + std::to_string(c));
+    }
+
+    // ---- Every structure the viewer draws is in every record -------------
+    for (const char* key : {"stalls", "stats", "fetch_q", "decode_q", "rename_q",
+                            "iq", "rob", "rob_head", "rob_count", "executing",
+                            "wb_fast", "wb_slow", "rat", "arch_rat", "free_list",
+                            "prf", "lq", "sq", "fu", "cdb_booked", "bpred",
+                            "events", "squashed_seqs", "retired_seqs"}) {
+        const std::string k = std::string("\"") + key + "\":";
+        for (std::size_t i = 1; i < lines.size(); ++i) {
+            REQUIRE_MSG(lines[i].find(k) != std::string::npos,
+                        std::string("    line ") + std::to_string(i) + " is missing " + key);
+        }
+    }
+
+    // ---- The mapping tables are always 32 wide ---------------------------
+    for (std::size_t i = 1; i < lines.size(); ++i) {
+        REQUIRE(count_of(array_of(lines[i], "rat"), ",") == 31);
+        REQUIRE(count_of(array_of(lines[i], "arch_rat"), ",") == 31);
+    }
+
+    // ---- Every stall cause has a key, so no bar can go missing -----------
+    {
+        const std::size_t at = lines[1].find("\"stalls\":{");
+        const std::size_t end = lines[1].find('}', at);
+        const std::string block = lines[1].substr(at, end - at);
+        REQUIRE(count_of(block, ":") == static_cast<std::size_t>(Stall::COUNT) + 1);
+        for (int s = 0; s < static_cast<int>(Stall::COUNT); ++s) {
+            const std::string k = std::string("\"") +
+                                  trace_detail::stall_key(static_cast<Stall>(s)) + "\":";
+            REQUIRE(block.find(k) != std::string::npos);
+        }
+    }
+
+    // ---- A sentinel is written as absence, never as its numeric value ----
+    for (const char* k : {"\"seq\":4294967295", "\"dest\":4294967295",
+                          "\"dest_arch\":4294967295", "\"dest_phys\":4294967295",
+                          "\"stale_phys\":4294967295", "\"ckpt\":4294967295",
+                          "\"rob_head\":4294967295"}) {
+        REQUIRE_MSG(text.find(k) == std::string::npos,
+                    std::string("    sentinel leaked into the trace: ") + k);
+    }
+
+    // ---- Instruction text is sent once per PC ----------------------------
+    // The dictionary is what keeps a long trace small; a PC that re-registers
+    // every cycle would quietly undo that.
+    REQUIRE(lines[1].find("\"disasm\":{") != std::string::npos);
+    REQUIRE(count_of(text, "\"" + std::to_string(wl::TEXT) + "\":\"") == 1);
+    REQUIRE(count_of(text, "\"" + std::to_string(wl::TEXT + 4) + "\":\"") == 1);
+
+    // ---- Events name the instructions they are about ---------------------
+    REQUIRE(count_of(text, "issue seq") > 0);
+    REQUIRE(count_of(text, "retire seq") > 0);
+    REQUIRE(count_of(text, "MISPREDICT seq") > 0);      // fib mispredicts early and often
+
+    // ---- Observing a run does not change it ------------------------------
+    // The one property that makes a trace worth trusting.
+    {
+        Memory quiet_mem = cputest::image(w.words);
+        Cpu quiet(quiet_mem, cfg, wl::TEXT);
+        while (!quiet.done() && quiet.cycle() < WINDOW) quiet.tick();
+
+        REQUIRE(quiet.cycle() == cpu.cycle());
+        REQUIRE(quiet.retired() == cpu.retired());
+        REQUIRE(quiet.issued() == cpu.issued());
+        REQUIRE(quiet.stats().squashed == cpu.stats().squashed);
+        REQUIRE(quiet.stats().mispredicts == cpu.stats().mispredicts);
+        REQUIRE(quiet.fetch_pc() == cpu.fetch_pc());
+        REQUIRE(quiet.regs() == cpu.regs());
+        for (int s = 0; s < static_cast<int>(Stall::COUNT); ++s) {
+            REQUIRE(quiet.stats().stalls[static_cast<std::size_t>(s)] ==
+                    cpu.stats().stalls[static_cast<std::size_t>(s)]);
+        }
+    }
+
+    // ---- Per-cycle logs describe one cycle and not the ones before it ----
+    {
+        Memory m2 = cputest::image(w.words);
+        Cpu c2(m2, cfg, wl::TEXT);
+        c2.observe(true);
+        std::size_t cycles_with_events = 0;
+        for (int i = 0; i < 60; ++i) {
+            c2.tick();
+            if (!c2.events().empty()) ++cycles_with_events;
+            REQUIRE(c2.events().size() < 64);          // cleared, not accumulated
+        }
+        REQUIRE(cycles_with_events > 0);
+        c2.observe(false);
+        c2.tick();
+        REQUIRE(c2.events().empty());                  // nothing recorded while unobserved
+    }
+
+    // ---- The stage stamps are consistent with the pipeline ---------------
+    // Fetch happens before decode before rename before dispatch, and nothing
+    // is stamped with a cycle that has not happened yet.
+    {
+        Memory m3 = cputest::image(w.words);
+        Cpu c3(m3, cfg, wl::TEXT);
+        for (int i = 0; i < 200 && !c3.done(); ++i) c3.tick();
+        REQUIRE(c3.rob().size() > 0);
+        for (uint32_t k = 0; k < c3.rob().size(); ++k) {
+            const Uop& u = c3.inflight(c3.rob().nth(k));
+            REQUIRE(u.at.fetch >= 1);
+            REQUIRE(u.at.fetch <= u.at.decode);
+            REQUIRE(u.at.decode <= u.at.rename);
+            REQUIRE(u.at.rename <= c3.cycle());
+            // A ROB entry exists from rename, so the stages after it may not
+            // have happened yet — 0 means "not yet", never cycle zero.
+            if (u.at.dispatch) REQUIRE(u.at.rename <= u.at.dispatch);
+            if (u.at.issue)    REQUIRE(u.at.issue >= u.at.dispatch);
+            if (u.at.complete) REQUIRE(u.at.complete >= u.at.issue);
+            REQUIRE(c3.rob().nth_entry(k).complete == (u.at.complete != 0));
+        }
+    }
+}
+
 // -------------------------------------------------------------------- main ---
 int main() {
     int passes = 0, fails = 0;

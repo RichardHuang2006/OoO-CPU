@@ -151,6 +151,14 @@ public:
 
     uint32_t peek() const { return count_ == 0 ? 0 : stack_[top_]; }
 
+    // The k-th live entry counting down from the top, k == 0 being what pop()
+    // would return. Out of range reads as 0, the same as popping an empty
+    // stack, so a caller walking the whole stack needs no bound of its own.
+    uint32_t peek_at(uint32_t k) const {
+        if (k >= count_) return 0;
+        return stack_[(top_ + size_ - (k % size_)) % size_];
+    }
+
 private:
     std::array<uint32_t, MAX_ENTRIES> stack_{};
     uint32_t size_;
