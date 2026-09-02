@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<!--
+  oooviz — viewer for Mini-CPU cycle traces.
+
+  Open this file in any browser (no server needed) and load an NDJSON trace
+  produced by:  build/oooc --hex examples/fib.hex --base 0x1000 --trace fib.ndjson
+
+  Left: a pipeline diagram — one row per instruction, one column per cycle,
+  with the stage events lettered (F fetch, D decode, R rename, d dispatch,
+  I issue, r replay, C complete, X commit, ~ squashed, ! mispredict) and the
+  waits between them shaded. Right: the machine state at the selected cycle —
+  ROB, issue queue, load/store queues, RAT (speculative vs. committed),
+  free-list and checkpoint headroom, function units, CDB reservations, and
+  branch-predictor state.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>oooviz — Mini-CPU trace viewer</title>
+<style>
+  :root {
+    --bg: #14161c; --panel: #1c1f27; --line: #2a2e3a; --fg: #d7dae2;
+    --dim: #8a90a2; --accent: #6cb2ff; --good: #55c47a; --warn: #e2b345;
+    --bad: #e2645a; --spec: #b085e0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 13px/1.45 "SF Mono", Consolas, Menlo, monospace;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header .title { color: var(--accent); font-weight: bold; }
+  header .cfg { color: var(--dim); font-size: 12px; }
+  button, input[type=file]::file-selector-button {
+    background: #262b36; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 4px; padding: 3px 10px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  input[type=range] { width: 260px; }
+  #cycleLabel { min-width: 160px; color: var(--accent); }
+  main { display: flex; gap: 10px; padding: 10px; align-items: flex-start; }
+  #left { flex: 1 1 62%; min-width: 0; }
+  #right { flex: 1 1 38%; max-width: 620px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; padding: 8px 10px; margin-bottom: 10px;
+  }
+  .panel h3 {
+    margin: 0 0 6px; font-size: 12px; color: var(--dim);
+    text-transform: uppercase; letter-spacing: .08em;
+  }
+  canvas { display: block; background: #101218; border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { text-align: left; padding: 1px 8px 1px 0; white-space: nowrap; }
+  th { color: var(--dim); font-weight: normal; }
+  .done  { color: var(--good); }
+  .wait  { color: var(--warn); }
+  .misp  { color: var(--bad); }
+  .spec  { color: var(--spec); }
+  .dim   { color: var(--dim); }
+  #ratGrid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px 12px;
+    font-size: 12px;
+  }
+  #events div { padding: 0; }
+  .legend span { margin-right: 12px; color: var(--dim); }
+  .legend b { color: var(--fg); }
+  #drop {
+    border: 2px dashed var(--line); border-radius: 8px; margin: 40px auto;
+    max-width: 640px; padding: 60px 30px; text-align: center; color: var(--dim);
+  }
+  #drop code { color: var(--accent); }
+  .kv span { display: inline-block; margin-right: 16px; }
+  .kv b { color: var(--accent); font-weight: normal; }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">oooviz</span>
+  <input type="file" id="file" accept=".ndjson,.json,.txt,.log">
+  <button id="prev">◀</button>
+  <input type="range" id="slider" min="0" max="0" value="0">
+  <button id="next">▶</button>
+  <button id="play">play</button>
+  <span id="cycleLabel">no trace loaded</span>
+  <span class="cfg" id="cfgLabel"></span>
+</header>
+
+<div id="drop">
+  <p><b>Drop a Mini-CPU trace here</b> (or use the file picker above).</p>
+  <p>Make one with:<br><code>build/oooc --hex examples/fib.hex --base 0x1000 --trace fib.ndjson</code></p>
+  <p>Keys: ← → step one cycle · space play/pause</p>
+</div>
+
+<main id="main" style="display:none">
+  <div id="left">
+    <div class="panel">
+      <h3>Pipeline diagram <span class="dim">(rows: instructions by fetch order · columns: cycles)</span></h3>
+      <canvas id="pipe"></canvas>
+      <div class="legend" style="margin-top:6px">
+        <span><b>F</b> fetch</span><span><b>D</b> decode</span><span><b>R</b> rename</span>
+        <span><b>d</b> dispatch</span><span><b>I</b> issue</span><span><b>r</b> replay</span>
+        <span><b>C</b> complete</span><span><b>X</b> commit</span>
+        <span><b>~</b> squashed</span><span><b>!</b> mispredict</span>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Events in cycle <span id="evCycle"></span></h3>
+      <div id="events" class="dim">—</div>
+    </div>
+  </div>
+
+  <div id="right">
+    <div class="panel"><h3>Machine</h3><div class="kv" id="machine"></div></div>
+    <div class="panel"><h3>Reorder buffer <span class="dim" id="robCount"></span></h3>
+      <table id="rob"></table></div>
+    <div class="panel"><h3>Issue queue <span class="dim" id="iqCount"></span></h3>
+      <table id="iq"></table></div>
+    <div class="panel"><h3>Load / store queues</h3><table id="lsq"></table></div>
+    <div class="panel"><h3>Register alias table <span class="dim">(speculative → committed where they differ)</span></h3>
+      <div id="ratGrid"></div></div>
+    <div class="panel"><h3>Function units &amp; CDB</h3><div id="fu"></div></div>
+    <div class="panel"><h3>Branch predictor</h3><div id="bp"></div></div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------- state ----
+let header = null;        // the {"type":"header"} record
+let cycles = [];          // cycle records in order
+let cycleIndex = {};      // cycle number -> index into cycles[]
+let insns = new Map();    // rowKey -> instruction {fid, seq, pc, asm, events:{cycle:[codes]}}
+let seq2row = new Map();  // seq -> rowKey
+let rows = [];            // ordered rowKeys
+let cur = 0;              // index into cycles[]
+let playing = null;
+
+const EV_LETTER = { F:"F", D:"D", R:"R", DI:"d", I:"I", RP:"r", C:"C", CM:"X",
+                    SQ:"~", SF:"~", MP:"!" };
+const EV_COLOR  = { F:"#5b90c9", D:"#5bb0c9", R:"#b085e0", d:"#9a8fd0",
+                    I:"#e2b345", r:"#e2645a", C:"#55c47a", X:"#2f9d5b",
+                    "~":"#e2645a", "!":"#ff7b70" };
+const hex = n => "0x" + (n >>> 0).toString(16).toUpperCase();
+
+// ---------------------------------------------------------------- load -----
+function loadText(text) {
+  header = null; cycles = []; cycleIndex = {}; insns = new Map();
+  seq2row = new Map(); rows = [];
+
+  for (const line of text.split("\n")) {
+    const s = line.trim();
+    if (!s) continue;
+    let rec;
+    try { rec = JSON.parse(s); } catch (e) { console.warn("bad line", e); continue; }
+    if (rec.type === "header") { header = rec; continue; }
+    if (rec.type !== "cycle") continue;
+    cycleIndex[rec.cycle] = cycles.length;
+    cycles.push(rec);
+    for (const ev of rec.ev || []) noteEvent(rec.cycle, ev);
+    // Instructions visible only in snapshots (trace window started late).
+    for (const e of rec.rob || []) {
+      if (!seq2row.has(e.seq)) {
+        const key = "s" + e.seq;
+        seq2row.set(e.seq, key);
+        insns.set(key, { fid: null, seq: e.seq, pc: e.pc, asm: e.asm, events: {} });
+      } else {
+        const insn = insns.get(seq2row.get(e.seq));
+        if (insn.asm == null) { insn.asm = e.asm; insn.pc = e.pc; }
+      }
+    }
+  }
+
+  rows = [...insns.keys()].sort((a, b) => {
+    const A = insns.get(a), B = insns.get(b);
+    const ka = A.fid != null ? A.fid : 1e15 + A.seq;
+    const kb = B.fid != null ? B.fid : 1e15 + B.seq;
+    return ka - kb;
+  });
+
+  const slider = document.getElementById("slider");
+  slider.max = Math.max(0, cycles.length - 1);
+  slider.value = 0;
+  cur = 0;
+
+  document.getElementById("drop").style.display = "none";
+  document.getElementById("main").style.display = "flex";
+  const c = header ? header.config : {};
+  document.getElementById("cfgLabel").textContent = header
+    ? `width=${c.width} rob=${c.rob_size} prf=${c.prf_size} iq=${c.iq_size} ` +
+      `lq/sq=${c.lq_size}/${c.sq_size} cdb=${c.num_cdb} · entry ${hex(header.entry_pc)}`
+    : "";
+  render();
+}
+
+function rowKeyFor(ev) {
+  if (ev.fid !== undefined && ev.fid !== null) return "f" + ev.fid;
+  if (ev.seq !== undefined && seq2row.has(ev.seq)) return seq2row.get(ev.seq);
+  if (ev.seq !== undefined) return "s" + ev.seq;
+  return null;
+}
+
+function noteEvent(cycle, ev) {
+  const key = rowKeyFor(ev);
+  if (key === null) return;
+  if (!insns.has(key)) {
+    insns.set(key, { fid: ev.fid ?? null, seq: ev.seq ?? null,
+                     pc: ev.pc ?? null, asm: ev.asm ?? null, events: {} });
+  }
+  const insn = insns.get(key);
+  if (ev.e === "R") {                       // rename links fid to seq
+    insn.seq = ev.seq;
+    insn.asm = ev.asm ?? insn.asm;
+    insn.pc  = ev.pc ?? insn.pc;
+    seq2row.set(ev.seq, key);
+  }
+  if (ev.asm && insn.asm == null) insn.asm = ev.asm;
+  if (ev.pc !== undefined && insn.pc == null) insn.pc = ev.pc;
+  if (ev.seq !== undefined && insn.seq == null) { insn.seq = ev.seq; seq2row.set(ev.seq, key); }
+  (insn.events[cycle] = insn.events[cycle] || []).push(EV_LETTER[ev.e] || "?");
+}
+
+// ------------------------------------------------------------- diagram -----
+const CELL_W = 16, CELL_H = 15, LABEL_W = 300, TOP_H = 18;
+const WINDOW = 56;                         // columns drawn around the cursor
+
+function render() {
+  if (!cycles.length) return;
+  const rec = cycles[cur];
+  document.getElementById("slider").value = cur;
+  document.getElementById("cycleLabel").textContent =
+    `cycle ${rec.cycle} (${cur + 1}/${cycles.length})`;
+  drawPipe(rec);
+  renderEvents(rec);
+  renderState(rec);
+}
+
+function drawPipe(rec) {
+  const canvas = document.getElementById("pipe");
+  const c0 = Math.max(cycles[0].cycle, rec.cycle - Math.floor(WINDOW * 0.7));
+  const cols = WINDOW;
+
+  // Rows that have any event, snapshot presence, or lifetime in the window.
+  const lastC = c0 + cols - 1;
+  const active = rows.filter(k => {
+    const ins = insns.get(k);
+    const evc = Object.keys(ins.events).map(Number);
+    if (!evc.length) return false;
+    return Math.min(...evc) <= lastC && Math.max(...evc) >= c0;
+  });
+
+  const W = LABEL_W + cols * CELL_W + 8;
+  const H = TOP_H + Math.max(1, active.length) * CELL_H + 6;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  const g = canvas.getContext("2d");
+  g.scale(dpr, dpr);
+  g.font = "11px monospace";
+
+  // column headers + cursor highlight
+  for (let i = 0; i < cols; i++) {
+    const cyc = c0 + i, x = LABEL_W + i * CELL_W;
+    if (cyc === rec.cycle) {
+      g.fillStyle = "rgba(108,178,255,.16)";
+      g.fillRect(x, 0, CELL_W, H);
+    }
+    if (cyc % 5 === 0) {
+      g.fillStyle = "#566";
+      g.fillText(String(cyc), x + 1, 12);
+    }
+  }
+
+  active.forEach((key, r) => {
+    const ins = insns.get(key);
+    const y = TOP_H + r * CELL_H;
+    const evc = Object.keys(ins.events).map(Number).sort((a, b) => a - b);
+    const squashed = evc.some(c => ins.events[c].includes("~"));
+
+    // label: seq | pc | asm
+    g.fillStyle = squashed ? "#7d5a58" : "#aab";
+    const seqs = ins.seq != null ? String(ins.seq).padStart(4) : "  --";
+    const pcs  = ins.pc  != null ? hex(ins.pc) : "";
+    g.fillText(`${seqs}  ${pcs.padEnd(8)} ${ins.asm || ""}`.slice(0, 42), 4, y + 11);
+
+    // waiting fill between first and last event
+    const first = evc[0], last = evc[evc.length - 1];
+    const xs = Math.max(first, c0), xe = Math.min(last, lastC);
+    if (xe >= xs) {
+      g.fillStyle = squashed ? "rgba(226,100,90,.10)" : "rgba(226,179,69,.10)";
+      g.fillRect(LABEL_W + (xs - c0) * CELL_W, y + 2,
+                 (xe - xs + 1) * CELL_W, CELL_H - 4);
+    }
+
+    // the events themselves
+    for (const cyc of evc) {
+      if (cyc < c0 || cyc > lastC) continue;
+      const x = LABEL_W + (cyc - c0) * CELL_W;
+      for (const L of ins.events[cyc]) {
+        g.fillStyle = EV_COLOR[L] || "#889";
+        g.fillRect(x + 1, y + 2, CELL_W - 2, CELL_H - 4);
+        g.fillStyle = "#0e1014";
+        g.fillText(L, x + 4, y + 11);
+      }
+    }
+  });
+
+  g.strokeStyle = "#2a2e3a";
+  g.beginPath();
+  g.moveTo(LABEL_W - 4, 0); g.lineTo(LABEL_W - 4, H);
+  g.stroke();
+}
+
+// ------------------------------------------------------------ side panel ---
+const EV_NAME = { F:"fetch", D:"decode", R:"rename", DI:"dispatch", I:"issue",
+                  RP:"replay", C:"complete", CM:"commit", SQ:"squash",
+                  SF:"squash (front-end)", MP:"MISPREDICT" };
+
+function renderEvents(rec) {
+  document.getElementById("evCycle").textContent = rec.cycle;
+  const box = document.getElementById("events");
+  if (!(rec.ev || []).length) { box.textContent = "— quiet cycle —"; return; }
+  box.innerHTML = rec.ev.map(ev => {
+    const who = ev.seq !== undefined ? `seq ${ev.seq}` : `fid ${ev.fid}`;
+    const extra = [];
+    if (ev.pc   !== undefined) extra.push(`pc=${hex(ev.pc)}`);
+    if (ev.asm)                extra.push(ev.asm);
+    if (ev.dest !== undefined && ev.dest !== null) extra.push(`dest=p${ev.dest}`);
+    if (ev.stale !== undefined && ev.stale !== null) extra.push(`stale=p${ev.stale}`);
+    if (ev.val  !== undefined) extra.push(`val=${hex(ev.val)}`);
+    if (ev.wb   !== undefined) extra.push(`wb@${ev.wb}`);
+    if (ev.next !== undefined) extra.push(`→ ${hex(ev.next)}`);
+    const cls = ev.e === "MP" ? "misp" : (ev.e === "SQ" || ev.e === "SF") ? "misp"
+              : ev.e === "CM" ? "done" : "";
+    return `<div class="${cls}"><b>${EV_NAME[ev.e] || ev.e}</b> ${who} ` +
+           `<span class="dim">${extra.join("  ")}</span></div>`;
+  }).join("");
+}
+
+function renderState(rec) {
+  const ctr = rec.ctr || {};
+  document.getElementById("machine").innerHTML =
+    `<span>fetch pc <b>${hex(rec.pc)}</b>${rec.fetch_stalled ? " (stalled)" : ""}</span>` +
+    `<span>retired <b>${ctr.retired}</b></span><span>issued <b>${ctr.issued}</b></span>` +
+    `<span>mispredicts <b>${ctr.mispredicts}</b></span>` +
+    `<span>fwd <b>${ctr.forwards}</b></span><span>replays <b>${ctr.replays}</b></span>` +
+    `<span>squashed <b>${ctr.squashed}</b></span>` +
+    `<span>free regs <b>${rec.free_regs}</b></span>` +
+    `<span>free ckpts <b>${rec.free_ckpts}</b></span>`;
+
+  // ROB
+  const rob = rec.rob || [];
+  document.getElementById("robCount").textContent =
+    `${rob.length}/${header ? header.config.rob_size : "?"} — head first`;
+  document.getElementById("rob").innerHTML =
+    `<tr><th>seq</th><th>pc</th><th>instruction</th><th>state</th><th>dest</th><th>stale</th></tr>` +
+    rob.map(e => {
+      const st = e.mis ? `<span class="misp">mispredicted</span>`
+               : e.done ? `<span class="done">complete</span>`
+               : `<span class="wait">executing</span>`;
+      const flags = (e.br ? " br" : "") + (e.st ? " st" : "");
+      return `<tr><td>${e.seq}</td><td class="dim">${hex(e.pc)}</td>` +
+             `<td>${e.asm}<span class="dim">${flags}</span></td><td>${st}</td>` +
+             `<td>${e.dest == null ? "—" : "p" + e.dest}</td>` +
+             `<td class="dim">${e.stale == null ? "—" : "p" + e.stale}</td></tr>`;
+    }).join("");
+
+  // IQ
+  const iq = rec.iq || [];
+  document.getElementById("iqCount").textContent =
+    `${iq.length}/${header ? header.config.iq_size : "?"} — oldest first`;
+  document.getElementById("iq").innerHTML =
+    `<tr><th>seq</th><th>kind</th><th>src1</th><th>src2</th><th>dest</th><th>ready</th></tr>` +
+    iq.map(e => {
+      const s1 = `<span class="${e.r1 ? "done" : "wait"}">p${e.s1}</span>`;
+      const s2 = `<span class="${e.r2 ? "done" : "wait"}">p${e.s2}</span>`;
+      const rdy = e.r1 && e.r2 ? `<span class="done">yes</span>`
+                               : `<span class="wait">waiting</span>`;
+      return `<tr><td>${e.seq}</td><td>${e.kind}</td><td>${s1}</td><td>${s2}</td>` +
+             `<td>${e.dest == null ? "—" : "p" + e.dest}</td><td>${rdy}</td></tr>`;
+    }).join("");
+
+  // LQ / SQ
+  const lq = rec.lq || [], sq = rec.sq || [];
+  document.getElementById("lsq").innerHTML =
+    `<tr><th></th><th>seq</th><th>addr</th><th>size</th><th>data</th></tr>` +
+    lq.map(e =>
+      `<tr><td class="dim">load</td><td>${e.seq}</td>` +
+      `<td>${e.aok ? hex(e.addr) : '<span class="wait">unresolved</span>'}</td>` +
+      `<td>${e.sz}</td><td class="dim">—</td></tr>`).join("") +
+    sq.map(e =>
+      `<tr><td class="dim">store</td><td>${e.seq}</td>` +
+      `<td>${e.aok ? hex(e.addr) : '<span class="wait">unresolved</span>'}</td>` +
+      `<td>${e.sz}</td>` +
+      `<td>${e.dok ? hex(e.data) : '<span class="wait">pending</span>'}</td></tr>`).join("") ||
+    `<tr><td class="dim">both empty</td></tr>`;
+
+  // RAT
+  const names = ["zero","ra","sp","gp","tp","t0","t1","t2","s0","s1","a0","a1",
+                 "a2","a3","a4","a5","a6","a7","s2","s3","s4","s5","s6","s7",
+                 "s8","s9","s10","s11","t3","t4","t5","t6"];
+  const rat = rec.rat || [], arat = rec.arat || [];
+  const prf = rec.prf || { val: [], ready: [] };
+  document.getElementById("ratGrid").innerHTML = names.map((n, i) => {
+    const spec = rat[i], com = arat[i];
+    const rd = prf.ready[spec] ? "" : ' class="wait"';
+    const differs = spec !== com;
+    const val = prf.val[spec] !== undefined ? hex(prf.val[spec]) : "";
+    return `<div><span class="dim">${n}</span> ` +
+           (differs
+             ? `<span class="spec">p${spec}</span><span class="dim">→p${com}</span>`
+             : `p${spec}`) +
+           ` <span${rd}>${val}</span></div>`;
+  }).join("");
+
+  // FU + CDB
+  const fu = rec.fu || {};
+  const fuLine = Object.entries(fu).map(([name, pool]) =>
+    `<span class="dim">${name}:</span> ` + pool.map(busyUntil =>
+      busyUntil > rec.cycle
+        ? `<span class="wait">busy→${busyUntil}</span>`
+        : `<span class="done">free</span>`).join(" ")).join("  ·  ");
+  const cdb = (rec.cdb || []).map(b =>
+    `<span class="wait">cycle ${b.c}: ${b.n} booked</span>`).join("  ") ||
+    `<span class="done">no future reservations</span>`;
+  document.getElementById("fu").innerHTML =
+    fuLine + `<div style="margin-top:4px"><span class="dim">CDB:</span> ${cdb}</div>`;
+
+  // branch predictor
+  const bp = rec.bp || { ghr: 0, ras: [] };
+  const ras = bp.ras.length
+    ? bp.ras.map(a => hex(a)).join(" ")
+    : '<span class="dim">empty</span>';
+  document.getElementById("bp").innerHTML =
+    `<span class="dim">GHR</span> ${bp.ghr.toString(2).padStart(
+        header ? header.config.ghr_bits : 12, "0")}` +
+    `<div><span class="dim">RAS (top first)</span> ${ras}</div>`;
+}
+
+// ------------------------------------------------------------- controls ----
+function step(delta) {
+  if (!cycles.length) return;
+  cur = Math.min(cycles.length - 1, Math.max(0, cur + delta));
+  render();
+}
+document.getElementById("prev").onclick = () => step(-1);
+document.getElementById("next").onclick = () => step(+1);
+document.getElementById("slider").oninput = e => { cur = +e.target.value; render(); };
+document.getElementById("play").onclick = () => {
+  const btn = document.getElementById("play");
+  if (playing) { clearInterval(playing); playing = null; btn.textContent = "play"; return; }
+  btn.textContent = "pause";
+  playing = setInterval(() => {
+    if (cur >= cycles.length - 1) { clearInterval(playing); playing = null; btn.textContent = "play"; return; }
+    step(+1);
+  }, 90);
+};
+document.addEventListener("keydown", e => {
+  if (e.key === "ArrowLeft")  { step(-1); e.preventDefault(); }
+  if (e.key === "ArrowRight") { step(+1); e.preventDefault(); }
+  if (e.key === " ")          { document.getElementById("play").click(); e.preventDefault(); }
+});
+
+document.getElementById("file").onchange = e => {
+  const f = e.target.files[0];
+  if (f) f.text().then(loadText);
+};
+for (const target of [document.body, document.getElementById("drop")]) {
+  target.addEventListener("dragover", e => e.preventDefault());
+  target.addEventListener("drop", e => {
+    e.preventDefault();
+    const f = e.dataTransfer.files[0];
+    if (f) f.text().then(loadText);
+  });
+}
+</script>
+</body>
+</html>

@@ -5,7 +5,24 @@
 #include <vector>
 
 #include "config.h"
-#include "types.h"
+#include "instruction.h"
+
+// The reorder buffer: the center of precise state. Instructions enter in
+// program order at rename, execute in whatever order the issue queue finds
+// profitable, and leave — again in program order — only from the head.
+//
+// Completion vs. commit, the distinction everything here exists to enforce:
+//
+//   completion   `complete = true`, set by writeback. The result exists in a
+//                physical register, but the instruction is still speculative:
+//                an older branch can still squash it, and nothing outside the
+//                pipeline may observe it.
+//   commit       pop_head_if_complete() at the head. Only now does the write
+//                become architectural, the store reach memory, the stale
+//                physical register return to the free list, and a trap fire.
+//
+// An entry can be complete for many cycles before it commits (a fast op behind
+// a slow one) and is discarded without ever committing when squashed.
 
 // What an in-flight instruction needs at commit time. The value it produced
 // lives in the physical register file, not here.
@@ -18,7 +35,7 @@ struct RobEntry {
     PhysReg  stale_phys   = INVALID_PHYSREG;   // returned to the free list at commit
     bool     is_branch    = false;
     bool     is_store     = false;             // its store queue entry drains at commit
-    bool     complete     = false;             // set by writeback; commit waits on it
+    bool     complete     = false;             // speculatively done; commit waits on it
     bool     mispredicted = false;
     CheckpointId ckpt     = INVALID_CHECKPOINT;   // snapshot a branch recovers from
 };

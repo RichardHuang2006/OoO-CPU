@@ -5,39 +5,59 @@
 #include <deque>
 #include <vector>
 
-#include "bpred.h"
+#include "branch_predictor.h"
 #include "config.h"
-#include "decoder.h"
-#include "freelist.h"
+#include "instruction.h"
 #include "issue_queue.h"
 #include "lsq.h"
 #include "memory.h"
-#include "prf.h"
-#include "rat.h"
+#include "rename.h"
 #include "rob.h"
 #include "stats.h"
-#include "types.h"
 
-// Seven-stage out-of-order pipeline (fetch, decode, rename, dispatch, issue,
-// execute, writeback) with in-order commit from the ROB head, `Config::width`
-// uops per stage per cycle.
+// The seven-stage out-of-order pipeline, with in-order commit from the ROB
+// head and `Config::width` uops per stage per cycle.
 //
-// tick() runs the stages in reverse order so the inter-stage queues behave as
-// latches. Writeback is the exception: it broadcasts before issue in the same
-// cycle, so a dependent single-cycle op can issue back to back with its
-// producer.
+// The seven modeled stages, and the internal functions that implement them:
+//
+//   1. fetch              fetch()                predict and read one bundle
+//   2. decode             decode_stage()         raw word → Decoded
+//   3. rename/dispatch    rename() + dispatch()  map registers, take ROB / IQ /
+//                                                LSQ seats (split in two
+//                                                functions, one queue between
+//                                                them, so each is one idea)
+//   4. issue/reg-read     issue()                oldest-ready select, then read
+//                                                operand values from the PRF
+//   5. execute            execute_uop() /        compute results, targets, and
+//                         execute()              store data; multi-cycle ops
+//                                                wait here for their latency
+//   6. memory/writeback   execute_load() +       loads search the store queue
+//                         writeback()            or read memory; results land
+//                                                in the PRF and broadcast tags
+//   7. commit             commit()               architectural state advances,
+//                                                in program order only
+//
+// tick() runs the stages in reverse order (commit first, fetch last) so the
+// inter-stage queues behave as latches: each stage drains what its producer
+// left last cycle before the producer refills it. Writeback is the exception:
+// it broadcasts before issue in the same cycle, so a dependent single-cycle op
+// can issue back to back with its producer.
 //
 // Rename maps sources to the RAT's current physical tags and destinations to
 // free-list registers, holding the displaced mapping in the ROB entry until
-// commit returns it. WAW and WAR hazards disappear, so only true dependences
-// reach the issue queue, which selects the oldest ready ops the function units
-// and writeback ports can accept. Loads consult the store queue for forwarding
-// instead of waiting for older stores to commit.
+// commit returns it (the full transaction is documented in rename.h). WAW and
+// WAR hazards disappear, so only true dependences reach the issue queue, which
+// selects the oldest ready ops the function units and writeback ports can
+// accept. Loads consult the store queue for forwarding instead of waiting for
+// older stores to commit.
 //
-// Branches checkpoint the register mapping, global history, and return stack at
-// rename. On misprediction, recovery reclaims younger physical registers,
-// flushes younger entries from every structure, restores the checkpoint, and
-// redirects fetch in the same cycle.
+// Branches checkpoint the register mapping, global history, and return stack
+// at rename, and stall if the pool is exhausted. On misprediction, recovery
+// reclaims younger physical registers youngest first, flushes younger entries
+// from every structure, cancels their CDB reservations, restores the
+// checkpoint, and redirects fetch in the same cycle.
+
+class Trace;   // optional cycle tracer (trace.h); never alters behavior
 
 enum class TrapCause : uint8_t {
     NONE,
@@ -51,6 +71,7 @@ enum class TrapCause : uint8_t {
 // index, issue fills the operand values and the result, store address or
 // branch target.
 struct Uop {
+    uint64_t  fid        = 0;                  // fetch order, for traces only
     SeqNum    seq        = INVALID_SEQNUM;
     RobIndex  rob        = INVALID_ROBINDEX;
     uint32_t  pc         = 0;
@@ -127,13 +148,14 @@ public:
     bool commit_in_order() const { return commit_in_order_; }
 
     // ---- pipeline observability -------------------------------------------
-    const Rob&        rob()       const { return rob_; }
-    const Prf&        prf()       const { return prf_; }
-    const Rat&        rat()       const { return rat_; }
-    const FreeList&   free_list() const { return free_list_; }
-    const IssueQueue& iq()        const { return iq_; }
-    const Lsq&        lsq()       const { return lsq_; }
-    const BranchPredictor& bpred() const { return bpred_; }
+    const Rob&                  rob()         const { return rob_; }
+    const PhysicalRegisterFile& prf()         const { return prf_; }
+    const RegisterAliasTable&   rat()         const { return rat_; }
+    const FreeList&             free_list()   const { return free_list_; }
+    const CheckpointPool&       checkpoints() const { return ckpts_; }
+    const IssueQueue&           iq()          const { return iq_; }
+    const Lsq&                  lsq()         const { return lsq_; }
+    const BranchPredictor&      bpred()       const { return bpred_; }
 
     uint32_t fetch_queue()   const { return static_cast<uint32_t>(fetch_q_.size()); }
     uint32_t decode_queue()  const { return static_cast<uint32_t>(decode_q_.size()); }
@@ -145,7 +167,21 @@ public:
     // Committed mapping of an architectural register.
     PhysReg committed_map(ArchReg r) const { return arch_rat_[r]; }
 
-    // ---- traces, recorded only when a test asks for them -------------------
+    // Writeback ports already booked for a (current or future) cycle.
+    uint32_t cdb_reserved_at(uint64_t cycle) const {
+        return cdb_booked_[static_cast<std::size_t>(cycle % cdb_window_)];
+    }
+
+    // The in-flight uop occupying a ROB slot; valid while the slot is live.
+    const Uop& uop_at(RobIndex idx) const { return inflight_[idx]; }
+
+    // ---- cycle tracing ------------------------------------------------------
+    // Attach a Trace (trace.h) to record events and per-cycle snapshots. The
+    // tracer only observes: attaching one never changes any result, statistic,
+    // or cycle count. Pass nullptr to detach.
+    void attach_trace(Trace* t) { trace_ = t; }
+
+    // ---- per-stage logs, recorded only when a test asks for them -----------
     struct DecodeRecord {
         uint64_t cycle;
         uint32_t pc;
@@ -176,6 +212,8 @@ public:
     const std::vector<IssueRecord>&  issue_log()  const { return issue_log_; }
 
 private:
+    friend class Trace;   // snapshots internal queues; strictly read-only
+
     // Function-unit pools. NONE covers the ops that occupy no unit.
     enum class Fu : uint8_t { ALU, BRANCH, MUL, DIV, MEM, NONE };
     static constexpr int FU_COUNT = 5;
@@ -236,19 +274,16 @@ private:
         q.swap(kept);
     }
 
-    Memory&     mem_;
-    Config      cfg_;
-    Rob         rob_;
-    Prf         prf_;
-    FreeList    free_list_;
-    Rat         rat_;
-    IssueQueue  iq_;
-    Lsq         lsq_;
-    BranchPredictor bpred_;
-
-    // History and return stack as of each checkpointed branch's fetch, indexed
-    // by the id the RAT's pool handed out.
-    std::vector<BranchPredictor::Snapshot> ckpt_fe_;
+    Memory&              mem_;
+    Config               cfg_;
+    Rob                  rob_;
+    PhysicalRegisterFile prf_;
+    FreeList             free_list_;
+    RegisterAliasTable   rat_;
+    CheckpointPool       ckpts_;
+    IssueQueue           iq_;
+    Lsq                  lsq_;
+    BranchPredictor      bpred_;
 
     // Per-instruction payload, indexed by ROB slot, read back at commit.
     std::vector<Uop> inflight_;
@@ -286,6 +321,7 @@ private:
     bool     fetch_stalled_ = false;   // waiting on a control transfer to resolve
 
     uint64_t  cycle_      = 0;
+    uint64_t  next_fid_   = 0;         // fetch-order stamp, for traces only
     bool      halted_     = false;
     bool      trapped_    = false;
     uint32_t  exit_code_  = 0;
@@ -293,6 +329,8 @@ private:
     bool      commit_in_order_ = true;
     SeqNum    last_committed_seq_ = INVALID_SEQNUM;
     Stats     stats_{};
+
+    Trace* trace_ = nullptr;
 
     bool record_decode_ = false;
     bool record_rename_ = false;

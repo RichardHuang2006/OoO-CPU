@@ -11,8 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 
-#include "alu.h"
-#include "decoder.h"
+#include "instruction.h"
 #include "memory.h"
 
 namespace ref {
@@ -41,12 +40,10 @@ struct Options {
     std::FILE* trace_out = stderr;
 };
 
-// ADDI and ADD share an Op, so the opcode is what says whether the second
-// operand is the immediate or rs2.
-inline bool uses_immediate(const Decoded& d) { return (d.raw & 0x7Fu) == 0x13u; }
-
 // Execute one instruction, updating registers, memory, PC, the retired
-// count, and the halt/trap flags.
+// count, and the halt/trap flags. The switch shares only decode() and the
+// alu:: primitives with the pipeline (via instruction.h); the sequencing is
+// written independently on purpose.
 inline void step(Memory& mem, Result& st, const Options& opts) {
     const uint32_t pc  = st.pc;
     const uint32_t raw = mem.load_u32(pc);

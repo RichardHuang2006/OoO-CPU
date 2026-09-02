@@ -1,6 +1,6 @@
 # Mini-CPU — 7-stage out-of-order RV32IM simulator
 #
-# Targets: all (release) · debug (ASan+UBSan) · test · clean · help
+# Targets: all (release) · debug (ASan+UBSan) · test · examples · clean · help
 
 CXX      ?= g++
 CXXSTD    = -std=c++17
@@ -20,12 +20,15 @@ CPU_SRC = $(wildcard src/*.cpp)
 CPU_OBJ = $(patsubst src/%.cpp,$(OBJDIR)/%.o,$(CPU_SRC))
 DBG_OBJ = $(patsubst src/%.cpp,$(DBGDIR)/%.o,$(CPU_SRC))
 
-TEST_SRC   = tests/test_main.cpp
+# One test binary per tests/test_*.cpp; test_support.h provides main().
+TEST_SRC   = $(wildcard tests/test_*.cpp)
+TEST_BIN   = $(patsubst tests/%.cpp,$(BUILD)/%,$(TEST_SRC))
+TEST_DBG   = $(patsubst tests/%.cpp,$(BUILD)/%-debug,$(TEST_SRC))
 TOOLS_SRC  = tools/gen_examples.cpp
 HDR        = $(wildcard src/*.h) $(wildcard tests/*.h)
 
-# The tests reuse every src/*.cpp but main.cpp, whose main() they replace by
-# #including it.
+# The tests reuse every src/*.cpp but main.cpp, whose main() test_pipeline
+# replaces by #including it.
 LIB_SRC = $(filter-out src/main.cpp,$(CPU_SRC))
 
 .PHONY: all debug test examples clean help
@@ -41,11 +44,31 @@ $(BUILD)/oooc: $(CPU_OBJ) | $(BUILD)
 $(OBJDIR)/%.o: src/%.cpp | $(OBJDIR)
 	$(CXX) $(CXXFLAGS_REL) -MMD -MP -c $< -o $@
 
+# ------------------------------------------------------------------ test ---
+# Each test binary is one translation unit plus the simulator sources; they
+# pull in nearly every header, so they rebuild on any header change rather
+# than being tracked dependency by dependency.
+$(BUILD)/test_%: tests/test_%.cpp $(LIB_SRC) $(CPU_SRC) $(HDR) | $(BUILD)
+	$(CXX) $(CXXFLAGS_REL) $< $(LIB_SRC) -o $@
+
+test: $(TEST_BIN) examples
+	@fail=0; \
+	for t in $(TEST_BIN); do \
+	  echo "==== $$t ===="; \
+	  ./$$t || fail=1; \
+	done; \
+	exit $$fail
+
 # ------------------------------------------------------ debug / sanitized ---
-# Builds the instrumented CLI binary and runs the full test suite under
+# Builds the instrumented CLI binary and runs the whole suite under
 # ASan + UBSan.
-debug: $(BUILD)/oooc-debug $(BUILD)/test_main-debug examples
-	./$(BUILD)/test_main-debug
+debug: $(BUILD)/oooc-debug $(TEST_DBG) examples
+	@fail=0; \
+	for t in $(TEST_DBG); do \
+	  echo "==== $$t ===="; \
+	  ./$$t || fail=1; \
+	done; \
+	exit $$fail
 
 $(BUILD)/oooc-debug: $(DBG_OBJ) | $(BUILD)
 	@if [ -z "$(DBG_OBJ)" ]; then echo "no src/*.cpp to build"; exit 1; fi
@@ -54,33 +77,15 @@ $(BUILD)/oooc-debug: $(DBG_OBJ) | $(BUILD)
 $(DBGDIR)/%.o: src/%.cpp | $(DBGDIR)
 	$(CXX) $(CXXFLAGS_DBG) -MMD -MP -c $< -o $@
 
-$(BUILD)/test_main-debug: $(TEST_SRC) $(CPU_SRC) $(HDR) | $(BUILD)
-	@if [ ! -f $(TEST_SRC) ]; then echo "no $(TEST_SRC)"; exit 1; fi
-	$(CXX) $(CXXFLAGS_DBG) $(TEST_SRC) $(LIB_SRC) -o $@ $(LDFLAGS_DBG)
+$(BUILD)/test_%-debug: tests/test_%.cpp $(LIB_SRC) $(CPU_SRC) $(HDR) | $(BUILD)
+	$(CXX) $(CXXFLAGS_DBG) $< $(LIB_SRC) -o $@ $(LDFLAGS_DBG)
 
 # --------------------------------------------------------------- tooling ---
-$(BUILD)/gen_examples: $(TOOLS_SRC) | $(BUILD)
+$(BUILD)/gen_examples: $(TOOLS_SRC) tests/workloads.h tests/asm.h | $(BUILD)
 	$(CXX) $(CXXFLAGS_REL) $(TOOLS_SRC) -o $@
 
-# Skipped while the generator does not exist, rather than failing on a
-# prerequisite that cannot be built.
-examples:
-	@if [ -f $(TOOLS_SRC) ]; then \
-	  $(MAKE) --no-print-directory $(BUILD)/gen_examples && \
-	  mkdir -p examples && ./$(BUILD)/gen_examples; \
-	else \
-	  echo "examples: skipped, no $(TOOLS_SRC)"; \
-	fi
-
-# ------------------------------------------------------------------ test ---
-# One translation unit that pulls in nearly every header, so it is rebuilt on
-# any header change rather than tracked dependency by dependency.
-$(BUILD)/test_main: $(TEST_SRC) $(CPU_SRC) $(HDR) | $(BUILD)
-	@if [ ! -f $(TEST_SRC) ]; then echo "no $(TEST_SRC)"; exit 1; fi
-	$(CXX) $(CXXFLAGS_REL) $(TEST_SRC) $(LIB_SRC) -o $@
-
-test: $(BUILD)/test_main examples
-	./$(BUILD)/test_main
+examples: $(BUILD)/gen_examples
+	@mkdir -p examples && ./$(BUILD)/gen_examples
 
 # ---------------------------------------------------------------- housekeeping
 $(BUILD) $(OBJDIR) $(DBGDIR):
@@ -91,9 +96,10 @@ clean:
 
 help:
 	@echo "Mini-CPU targets:"
-	@echo "  all      build/oooc         (release, -O2, warnings-as-errors off)"
-	@echo "  debug    build/oooc-debug + run the test suite under ASan + UBSan"
-	@echo "  test     compile+run tests/test_main after regenerating examples/"
+	@echo "  all      build/oooc          (release, -O2)"
+	@echo "  test     build and run the six test binaries (release)"
+	@echo "  debug    the same suite plus build/oooc-debug under ASan + UBSan"
+	@echo "  examples assemble the bundled programs into examples/"
 	@echo "  clean    remove build/ and examples/"
 
 # Auto-generated header dependencies.

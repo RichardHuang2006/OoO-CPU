@@ -5,7 +5,21 @@
 #include <vector>
 
 #include "config.h"
-#include "types.h"
+#include "instruction.h"
+
+// The front end's whole prediction apparatus in one file:
+//   - BranchKind and classify():   what sort of control transfer is this?
+//   - Gshare:                      direction, from global history × PC
+//   - Btb:                         target, PC-tagged and set-associative, LRU
+//   - Ras:                         return targets, a small LIFO
+//   - BranchPredictor:             the three combined, plus the Snapshot a
+//                                  per-branch checkpoint saves and restores
+//
+// Speculative vs. learned state: the global history register and the return
+// stack advance speculatively at fetch, because the next prediction depends on
+// them; a checkpoint (rename.h) therefore snapshots both, and misprediction
+// recovery restores them. The learning tables — the two-bit counters and the
+// BTB — are written only at commit, so a wrong path can never train them.
 
 // The control-transfer classes the predictor distinguishes. Direction comes
 // from global history for a conditional branch, from the return stack for a
@@ -17,6 +31,22 @@ enum class BranchKind : uint8_t {
     CALL,          // pushes a return address
     RETURN,        // pops one
 };
+
+// x1 and x5 are the link registers, which is how the ISA distinguishes a call
+// or a return from a plain jump.
+inline bool is_link_reg(ArchReg r) { return r == 1 || r == 5; }
+
+// Classify a decoded instruction for the predictor and the RAS.
+inline BranchKind classify(const Decoded& d) {
+    if (!d.is_branch) return BranchKind::NONE;
+    if (d.op == Op::JAL)  return is_link_reg(d.rd) ? BranchKind::CALL : BranchKind::JUMP;
+    if (d.op == Op::JALR) {
+        if (is_link_reg(d.rd))  return BranchKind::CALL;
+        if (is_link_reg(d.rs1)) return BranchKind::RETURN;
+        return BranchKind::JUMP;
+    }
+    return BranchKind::CONDITIONAL;
+}
 
 // gshare: a table of two-bit saturating counters indexed by the global history
 // XORed with the PC. The XOR gives one branch distinct counters under distinct
@@ -151,6 +181,18 @@ public:
 
     uint32_t peek() const { return count_ == 0 ? 0 : stack_[top_]; }
 
+    // Top-down contents, for traces and tests; never read by prediction.
+    std::vector<uint32_t> entries() const {
+        std::vector<uint32_t> out;
+        out.reserve(count_);
+        uint32_t idx = top_;
+        for (uint32_t k = 0; k < count_; ++k) {
+            out.push_back(stack_[idx]);
+            idx = (idx + size_ - 1) % size_;
+        }
+        return out;
+    }
+
 private:
     std::array<uint32_t, MAX_ENTRIES> stack_{};
     uint32_t size_;
@@ -159,10 +201,6 @@ private:
 };
 
 // The three structures that together produce the next fetch PC.
-//
-// Global history and the return stack advance speculatively at fetch, since the
-// next prediction depends on them. The learning tables, the counters and the
-// BTB, are written only at commit, so a wrong path cannot train them.
 class BranchPredictor {
 public:
     struct Prediction {
@@ -185,7 +223,9 @@ public:
 
     uint32_t ghr() const { return gshare_.ghr(); }
 
-    // Speculative state, as a pair a checkpoint can hold and restore.
+    // The speculative state a per-branch checkpoint must save: global history
+    // and the return stack. The checkpoint pool in rename.h stores one of
+    // these per in-flight branch; restore() is the recovery half.
     struct Snapshot {
         uint32_t ghr = 0;
         Ras      ras{1u};

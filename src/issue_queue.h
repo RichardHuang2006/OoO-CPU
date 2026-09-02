@@ -4,15 +4,21 @@
 #include <vector>
 
 #include "config.h"
-#include "types.h"
+#include "instruction.h"
 
 // Non-data-capture issue queue: entries hold physical register tags and ready
 // bits, never values. Operands are read from the PRF at select, so an entry
-// costs two tags instead of two 32-bit words and tag wakeup is a tag compare
-// rather than a value copy.
+// costs two tags instead of two 32-bit words and tag wakeup (wakeup()) is a
+// tag compare rather than a value copy.
 //
 // Entries stay in dispatch order, which is program order, so oldest-ready
-// select is the first match in a forward scan.
+// select (select()) is the first match in a forward scan.
+//
+// The queue owns readiness only. Structural resources — a function unit of the
+// right class, and a writeback port (CDB) reserved for the cycle the result
+// will land — belong to the caller: Cpu::issue() walks the ready set oldest
+// first and skips any candidate whose unit or CDB slot is unavailable, without
+// blocking the candidates behind it.
 
 class IssueQueue {
 public:

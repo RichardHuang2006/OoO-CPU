@@ -5,14 +5,23 @@
 #include <vector>
 
 #include "config.h"
-#include "types.h"
+#include "instruction.h"
 
 // Load and store queues. Entries are allocated at dispatch in program order, so
 // "older than me" is a sequence-number comparison rather than a search.
 //
 // Stores reach memory only at commit, making the store queue a speculative
-// write buffer: a load searches it for store-to-load forwarding and falls
-// through to memory only when no older store can cover it.
+// write buffer. A load that has computed its address searches the older stores
+// and reaches exactly one of three outcomes (search_older_stores):
+//
+//   FORWARD    the youngest older store that fully covers the load's bytes has
+//              known data: take it from the queue, never touching memory.
+//   NO_MATCH   every older store is known not to conflict: reading memory is
+//              safe, and the load pays the memory latency.
+//   REPLAY     some older store might still conflict — its address (or the
+//              data of a covering store) is unresolved, or it only partially
+//              overlaps the load. Guessing would read stale or stitched-up
+//              bytes, so the load keeps its seat and asks again next cycle.
 
 struct LsqEntry {
     SeqNum   seq        = INVALID_SEQNUM;

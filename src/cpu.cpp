@@ -2,14 +2,9 @@
 
 #include <algorithm>
 
-#include "alu.h"
+#include "trace.h"
 
 namespace {
-
-// OP-IMM is the only class taking its second operand from the immediate. ADDI
-// and ADD share an Op, since the function unit is indifferent to the operand's
-// source.
-bool uses_immediate(const Decoded& d) { return (d.raw & 0x7Fu) == 0x13u; }
 
 // The proxy-kernel exit syscall: ecall with a7 == 93 halts and yields a0.
 constexpr uint32_t SYS_EXIT = 93;
@@ -35,21 +30,6 @@ uint32_t extend_load(Op op, uint32_t v) {
     }
 }
 
-// x1 and x5 are the link registers, which is how the ISA distinguishes a call
-// or a return from a plain jump.
-bool is_link(ArchReg r) { return r == 1 || r == 5; }
-
-BranchKind kind_of(const Decoded& d) {
-    if (!d.is_branch) return BranchKind::NONE;
-    if (d.op == Op::JAL)  return is_link(d.rd) ? BranchKind::CALL : BranchKind::JUMP;
-    if (d.op == Op::JALR) {
-        if (is_link(d.rd))  return BranchKind::CALL;
-        if (is_link(d.rs1)) return BranchKind::RETURN;
-        return BranchKind::JUMP;
-    }
-    return BranchKind::CONDITIONAL;
-}
-
 }  // namespace
 
 Cpu::Cpu(Memory& mem, const Config& cfg, uint32_t entry_pc)
@@ -58,11 +38,10 @@ Cpu::Cpu(Memory& mem, const Config& cfg, uint32_t entry_pc)
       rob_(cfg),
       prf_(cfg),
       free_list_(cfg),
-      rat_(cfg),
+      ckpts_(cfg),
       iq_(cfg),
       lsq_(cfg),
       bpred_(cfg),
-      ckpt_fe_(cfg.num_checkpoints),
       inflight_(cfg.rob_size),
       pc_(entry_pc),
       arch_pc_(entry_pc),
@@ -97,15 +76,17 @@ void Cpu::tick() {
     ++stats_.cycles;
 
     commit();
-    if (done()) return;   // squashed by the halt; no stage may refill
+    if (!done()) {   // a committed halt squashes; no stage may refill
+        writeback();
+        execute();
+        issue();
+        dispatch();
+        rename();
+        decode_stage();
+        fetch();
+    }
 
-    writeback();
-    execute();
-    issue();
-    dispatch();
-    rename();
-    decode_stage();
-    fetch();
+    if (trace_) trace_->end_cycle(*this);
 }
 
 bool Cpu::run(uint64_t max_cycles) {
@@ -126,6 +107,7 @@ void Cpu::fetch() {
 
     for (uint32_t n = 0; n < cfg_.width && fetch_q_.size() < queue_cap_; ++n) {
         Uop u;
+        u.fid = next_fid_++;
         u.pc  = pc_;
         u.raw = mem_.load_u32(pc_);
 
@@ -141,6 +123,7 @@ void Cpu::fetch() {
         pc_ = pr.taken ? pr.target : pc_ + 4;
         fetch_q_.push_back(u);
         ++stats_.fetched;
+        if (trace_) trace_->on_fetch(u);
 
         // One redirect per cycle: the rest of this bundle lives somewhere else.
         if (pr.taken) break;
@@ -157,12 +140,13 @@ void Cpu::decode_stage() {
         fetch_q_.pop_front();
         u.dec     = decode(u.raw);
         u.next_pc = u.pc + 4;
-        u.bkind   = kind_of(u.dec);
+        u.bkind   = classify(u.dec);
         if (u.dec.op == Op::INVALID) u.trap = TrapCause::ILLEGAL;
 
         decode_q_.push_back(u);
         ++stats_.decoded;
         if (record_decode_) decode_log_.push_back({cycle_, u.pc, u.raw});
+        if (trace_) trace_->on_decode(u);
 
         // Nothing past a trap is worth fetching: it either never runs or is
         // squashed when the trap commits.
@@ -175,11 +159,11 @@ void Cpu::decode_stage() {
 }
 
 // --------------------------------------------------------------- rename ---
-// Sources take the RAT's current physical tags; the destination takes a fresh
-// free-list register and the displaced mapping rides in the ROB entry until
-// commit returns it. Two writers of one architectural register never share
-// storage, so WAW and WAR disappear and only true dependences reach the issue
-// queue.
+// The renaming transaction documented in rename.h: sources take the RAT's
+// current physical tags; the destination takes a fresh free-list register and
+// the displaced mapping rides in the ROB entry until commit returns it. Two
+// writers of one architectural register never share storage, so WAW and WAR
+// disappear and only true dependences reach the issue queue.
 void Cpu::rename() {
     for (uint32_t n = 0; n < cfg_.width; ++n) {
         if (decode_q_.empty()) break;
@@ -191,7 +175,7 @@ void Cpu::rename() {
 
         // A branch that cannot be checkpointed cannot be recovered from, so it
         // waits for a slot rather than going unprotected.
-        if (u.dec.is_branch && rat_.num_free_checkpoints() == 0) {
+        if (u.dec.is_branch && ckpts_.num_free() == 0) {
             stats_.stall(Stall::CHECKPOINT);
             break;
         }
@@ -204,20 +188,20 @@ void Cpu::rename() {
         }
         decode_q_.pop_front();
 
-        u.src1 = rat_.map(u.dec.rs1);
+        u.src1 = rat_.map(u.dec.rs1);                     // step 1
         u.src2 = rat_.map(u.dec.rs2);
         if (needs_reg) {
-            u.stale = rat_.map(u.dec.rd);
-            u.dest  = dest;
-            rat_.set(u.dec.rd, dest);
-            prf_.mark_pending(dest);
+            u.stale = rat_.map(u.dec.rd);                 // step 3
+            u.dest  = dest;                               // step 2 (allocated above)
+            rat_.set(u.dec.rd, dest);                     // step 4
+            prf_.mark_pending(dest);                      // step 5
         }
 
         // Snapshotted after its own destination is mapped, because the branch
         // itself survives recovery and its result must survive with it.
         if (u.dec.is_branch) {
-            u.ckpt = *rat_.alloc_checkpoint();
-            ckpt_fe_[u.ckpt] = u.fe_snap;
+            u.ckpt = *ckpts_.alloc();
+            ckpts_.at(u.ckpt) = Checkpoint{rat_.mapping(), u.fe_snap};
         }
 
         RobEntry e;
@@ -239,6 +223,7 @@ void Cpu::rename() {
             rename_log_.push_back({cycle_, u.seq, u.pc, needs_reg ? u.dec.rd : INVALID_ARCHREG,
                                    u.dest, u.stale, u.src1, u.src2});
         }
+        if (trace_) trace_->on_rename(u);
     }
 }
 
@@ -282,6 +267,7 @@ void Cpu::dispatch() {
         e.latency    = latency_of(u.dec);
         iq_.insert(e);
         ++stats_.dispatched;
+        if (trace_) trace_->on_dispatch(u);
     }
 }
 
@@ -380,6 +366,7 @@ void Cpu::issue() {
                     cycle_ + 1;
                 ++stats_.load_replays;
                 blocked.push_back(Stall::STORE_ORDER);
+                if (trace_) trace_->on_replay(u);
                 continue;
             }
         } else {
@@ -428,6 +415,7 @@ void Cpu::issue() {
         if (u.dec.is_load)  ++stats_.loads;
         if (u.dec.is_store) ++stats_.stores;
         if (record_issue_) issue_log_.push_back({cycle_, u.seq, u.pc, u.dest, u.wb_cycle});
+        if (trace_) trace_->on_issue(u);
     }
 
     uint32_t lost = cfg_.width - issued;
@@ -458,11 +446,14 @@ void Cpu::release_cdb(const Uop& u) {
 // allocated rather than the stale one it displaced. The stale mapping still
 // belongs to an older entry, which returns it at its own commit.
 void Cpu::recover(const Uop& br) {
+    if (trace_) trace_->on_mispredict(br);
+
     const std::vector<RobEntry> killed = rob_.truncate_to(br.rob);
     for (const RobEntry& e : killed) {
         free_list_.free(e.dest_phys);
-        rat_.free_checkpoint(e.ckpt);
+        ckpts_.free(e.ckpt);
         ++stats_.squashed;
+        if (trace_) trace_->on_squash(e.seq);
     }
 
     iq_.squash_after(br.seq);
@@ -471,19 +462,23 @@ void Cpu::recover(const Uop& br) {
     squash_queue(wb_fast_, br.seq);
     squash_queue(wb_slow_, br.seq);
 
-    rat_.restore_checkpoint(br.ckpt);
-    bpred_.restore(ckpt_fe_[br.ckpt]);
+    rat_.adopt(ckpts_.at(br.ckpt).rat);
+    bpred_.restore(ckpts_.at(br.ckpt).front_end);
     // Replace the speculative history bit this branch shifted in with the
     // resolved outcome.
     if (br.btb_hit && br.bkind == BranchKind::CONDITIONAL) {
         bpred_.shift_history(br.next_pc != br.pc + 4);
     }
-    // The branch survives, so its slot stays reserved and is released once,
-    // when it commits, like every other branch's.
+    // The branch survives, so its checkpoint slot stays reserved and is
+    // released once, when it commits, like every other branch's.
 
+    if (trace_) {
+        for (const Uop& u : fetch_q_)  trace_->on_squash_fe(u.fid);
+        for (const Uop& u : decode_q_) trace_->on_squash_fe(u.fid);
+    }
     fetch_q_.clear();
     decode_q_.clear();
-    rename_q_.clear();
+    rename_q_.clear();   // already counted: everything here holds a ROB entry
     fetch_stalled_ = false;
     pc_ = br.next_pc;
     ++stats_.mispredicts;
@@ -504,9 +499,9 @@ void Cpu::execute() {
     executing_.swap(still_running);
 }
 
-// Three outcomes, one of which touches memory. Forwarding lets a load read an
-// uncommitted store; replay prevents it from guessing while an older store
-// address is unresolved.
+// Three outcomes, one of which touches memory (see lsq.h). Forwarding lets a
+// load read an uncommitted store; replay prevents it from guessing while an
+// older store address is unresolved.
 bool Cpu::execute_load(Uop& u, uint32_t& latency) {
     const uint32_t addr = u.val1 + static_cast<uint32_t>(u.dec.imm);
     lsq_.resolve_load_addr(u.lsq_idx, addr);
@@ -534,6 +529,8 @@ bool Cpu::execute_load(Uop& u, uint32_t& latency) {
     return true;
 }
 
+// Pure computation: operand values in, result / target / store payload out.
+// The semantics all come from instruction.h and never read pipeline state.
 void Cpu::execute_uop(Uop& u) {
     const Decoded& d   = u.dec;
     const uint32_t rs1 = u.val1;
@@ -567,22 +564,22 @@ void Cpu::execute_uop(Uop& u) {
     case Op::REMU:   u.result = alu::remu  (rs1, rs2); u.has_result = true; break;
 
     // ---- Control flow -----------------------------------------------------
-    case Op::BEQ:  if (alu::beq (rs1, rs2)) u.next_pc = u.pc + imm; break;
-    case Op::BNE:  if (alu::bne (rs1, rs2)) u.next_pc = u.pc + imm; break;
-    case Op::BLT:  if (alu::blt (rs1, rs2)) u.next_pc = u.pc + imm; break;
-    case Op::BGE:  if (alu::bge (rs1, rs2)) u.next_pc = u.pc + imm; break;
-    case Op::BLTU: if (alu::bltu(rs1, rs2)) u.next_pc = u.pc + imm; break;
-    case Op::BGEU: if (alu::bgeu(rs1, rs2)) u.next_pc = u.pc + imm; break;
+    case Op::BEQ:  case Op::BNE:  case Op::BLT:
+    case Op::BGE:  case Op::BLTU: case Op::BGEU:
+        if (alu::branch_taken(d.op, rs1, rs2)) {
+            u.next_pc = alu::branch_target(u.pc, d.imm);
+        }
+        break;
 
     case Op::JAL:
-        u.result = u.pc + 4; u.has_result = true;
-        u.next_pc = u.pc + imm;
+        u.result = alu::link_address(u.pc); u.has_result = true;
+        u.next_pc = alu::branch_target(u.pc, d.imm);
         break;
     case Op::JALR:
         // Target drops its low bit, and the link comes from the old PC, which
         // matters when rd == rs1.
-        u.result = u.pc + 4; u.has_result = true;
-        u.next_pc = (rs1 + imm) & ~1u;
+        u.result = alu::link_address(u.pc); u.has_result = true;
+        u.next_pc = alu::jalr_target(rs1, d.imm);
         break;
 
     // ---- Loads: handled by execute_load, which has to ask the queue -------
@@ -622,6 +619,7 @@ void Cpu::complete(const Uop& u) {
     rob_.at(u.rob).complete = true;
     inflight_[u.rob] = u;
     ++stats_.wrote_back;
+    if (trace_) trace_->on_complete(u);
 }
 
 // Runs before issue, so a tag broadcast this cycle reaches select in the same
@@ -673,7 +671,7 @@ void Cpu::commit() {
         if (u.dec.is_branch) {
             const bool taken = u.next_pc != u.pc + 4;
             bpred_.commit(u.pc, u.pht_index, u.bkind, taken, u.next_pc);
-            rat_.free_checkpoint(u.ckpt);
+            ckpts_.free(u.ckpt);
 
             ++stats_.branches;
             ++stats_.btb_lookups;
@@ -718,8 +716,9 @@ void Cpu::commit() {
         }
 
         // The mapping becomes architectural and the displaced one returns to
-        // the free list. This is the only correct-path free, so two writers of
-        // one architectural register never alias the same physical storage.
+        // the free list (step 6 in rename.h). This is the only correct-path
+        // free, so two writers of one architectural register never alias the
+        // same physical storage.
         if (u.dest != INVALID_PHYSREG) {
             arch_rat_[u.dec.rd] = u.dest;
             free_list_.free(u.stale);
@@ -732,6 +731,7 @@ void Cpu::commit() {
 
         arch_pc_ = done() ? u.pc : u.next_pc;   // a trap reports its own PC
         ++stats_.retired;
+        if (trace_) trace_->on_commit(u);
 
         // The halting instruction retires; anything behind it does not.
         if (done()) {
@@ -746,8 +746,14 @@ void Cpu::commit() {
 void Cpu::squash_in_flight() {
     for (const RobEntry& e : rob_.squash_all()) {
         free_list_.free(e.dest_phys);
-        rat_.free_checkpoint(e.ckpt);
+        ckpts_.free(e.ckpt);
         ++stats_.squashed;
+        if (trace_) trace_->on_squash(e.seq);
+    }
+
+    if (trace_) {
+        for (const Uop& u : fetch_q_)  trace_->on_squash_fe(u.fid);
+        for (const Uop& u : decode_q_) trace_->on_squash_fe(u.fid);
     }
 
     rat_.adopt(arch_rat_);

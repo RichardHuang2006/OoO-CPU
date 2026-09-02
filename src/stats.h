@@ -45,8 +45,10 @@ inline const char* stall_name(Stall s) {
     return "none";
 }
 
-// Everything the run reports. Counters are plain fields because each is written
-// from exactly one place in the pipeline.
+// Aggregate measurements for a whole run: totals, rates, and the stall-cause
+// breakdown. Counters are plain fields because each is written from exactly
+// one place in the pipeline. Per-cycle observation belongs to trace.h, which
+// is a separate subsystem; nothing here records anything per cycle.
 struct Stats {
     uint64_t cycles   = 0;
     uint64_t fetched  = 0;
@@ -80,6 +82,14 @@ struct Stats {
 
     double ipc() const { return cycles ? static_cast<double>(retired) / cycles : 0.0; }
     double cpi() const { return retired ? static_cast<double>(cycles) / retired : 0.0; }
+
+    // Fraction of offered issue slots actually used. The machine offers
+    // `width` slots per cycle; the stall breakdown accounts for every slot
+    // this ratio says went unused.
+    double issue_utilization(uint32_t width) const {
+        const double offered = static_cast<double>(cycles) * width;
+        return offered > 0.0 ? static_cast<double>(issued) / offered : 0.0;
+    }
 
     double mispredict_rate() const {
         return branches ? static_cast<double>(mispredicts) / branches : 0.0;

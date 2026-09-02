@@ -5,7 +5,9 @@
 // including it twice does not violate ODR.
 //
 // Programs run on the out-of-order model by default; --ref selects the in-order
-// reference interpreter the model is validated against.
+// reference interpreter the model is validated against. --trace writes a
+// newline-delimited JSON cycle trace (viewable in tools/oooviz.html) from the
+// pipeline, or a plain retired-instruction log from the interpreter.
 
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -23,6 +26,7 @@
 #include "memory.h"
 #include "ref.h"
 #include "stats.h"
+#include "trace.h"
 
 // ============================================================================
 // CLI surface
@@ -35,13 +39,18 @@ struct CliOpts {
     uint32_t    base = 0;
     bool        has_base = false;
     bool        print_regs = false;
-    bool        trace = false;
     bool        show_help = false;
     bool        use_ref = false;      // interpreter instead of the pipeline
     bool        show_stats = false;
     bool        ipc_table = false;    // same program, four machines
     uint64_t    max_insts = 100'000'000;
     uint64_t    max_cycles = 1'000'000'000;
+
+    // Cycle tracing (trace.h): output path and window.
+    std::string trace_path;
+    uint64_t    trace_start  = 0;
+    uint64_t    trace_cycles = 5000;
+
     Config      cfg;
 };
 
@@ -123,16 +132,27 @@ inline int parse_args(int argc, char** argv, CliOpts& opts) {
             val = argv[++i];
             return true;
         };
+        auto take_u64 = [&](uint64_t& out) -> bool {
+            std::string v;
+            if (!take_value(v)) return false;
+            if (!parse_u64(v, out)) {
+                std::fprintf(stderr, "oooc: bad %s '%s'\n", flag.c_str(), v.c_str());
+                return false;
+            }
+            return true;
+        };
 
         if (flag == "--help" || flag == "-h") { opts.show_help = true; return 0; }
         if (flag == "--regs")      { opts.print_regs = true; continue; }
-        if (flag == "--trace")     { opts.trace = true; continue; }
         if (flag == "--ref")       { opts.use_ref = true; continue; }
         if (flag == "--stats")     { opts.show_stats = true; continue; }
         if (flag == "--ipc-table") { opts.ipc_table = true; continue; }
 
         if (flag == "--hex") { if (!take_value(opts.hex_path)) return 1; continue; }
         if (flag == "--raw") { if (!take_value(opts.raw_path)) return 1; continue; }
+        if (flag == "--trace") { if (!take_value(opts.trace_path)) return 1; continue; }
+        if (flag == "--trace-start")  { if (!take_u64(opts.trace_start))  return 1; continue; }
+        if (flag == "--trace-cycles") { if (!take_u64(opts.trace_cycles)) return 1; continue; }
         if (flag == "--base") {
             std::string v;
             if (!take_value(v))       return 1;
@@ -142,22 +162,8 @@ inline int parse_args(int argc, char** argv, CliOpts& opts) {
             opts.has_base = true;
             continue;
         }
-        if (flag == "--max-insts") {
-            std::string v;
-            if (!take_value(v))                     return 1;
-            if (!parse_u64(v, opts.max_insts)) {
-                std::fprintf(stderr, "oooc: bad --max-insts '%s'\n", v.c_str()); return 1;
-            }
-            continue;
-        }
-        if (flag == "--max-cycles") {
-            std::string v;
-            if (!take_value(v))                      return 1;
-            if (!parse_u64(v, opts.max_cycles)) {
-                std::fprintf(stderr, "oooc: bad --max-cycles '%s'\n", v.c_str()); return 1;
-            }
-            continue;
-        }
+        if (flag == "--max-insts")  { if (!take_u64(opts.max_insts))  return 1; continue; }
+        if (flag == "--max-cycles") { if (!take_u64(opts.max_cycles)) return 1; continue; }
 
         // Config knob table
         bool matched = false;
@@ -204,10 +210,14 @@ inline void print_help() {
     std::printf("  --stats           print cycles, IPC, prediction and the stall breakdown\n");
     std::printf("  --ipc-table       run the program 1-, 2-, 4-wide and starved, and compare\n");
     std::printf("  --ref             run the in-order reference interpreter instead\n");
-    std::printf("  --trace           print each retired instruction to stderr (--ref only)\n");
     std::printf("  --max-insts N     abort after N retired instructions (default 1e8)\n");
     std::printf("  --max-cycles N    abort after N cycles (default 1e9)\n");
     std::printf("  --help, -h        this message\n");
+    std::printf("\nCycle tracing:\n");
+    std::printf("  --trace PATH      pipeline: NDJSON cycle trace for tools/oooviz.html;\n");
+    std::printf("                    with --ref: plain retired-instruction log\n");
+    std::printf("  --trace-start N   first cycle to record (default 0)\n");
+    std::printf("  --trace-cycles N  maximum cycle records (default 5000)\n");
     std::printf("\nMicroarchitectural knobs:\n");
     for (const auto& k : KNOBS) {
         std::printf("  %-14s  %s\n", k.flag, k.desc);
@@ -221,10 +231,11 @@ inline void print_help() {
 // Everything the run measured, in pipeline order: the fetch-to-commit funnel,
 // front-end prediction, memory behaviour, then the reasons issue slots went
 // unused.
-inline void print_stats(const Stats& s) {
-    std::printf("\ncycles %llu  retired %llu  IPC %.3f  CPI %.3f\n",
+inline void print_stats(const Stats& s, const Config& cfg) {
+    std::printf("\ncycles %llu  retired %llu  IPC %.3f  CPI %.3f  issue slots used %.1f%%\n",
                 static_cast<unsigned long long>(s.cycles),
-                static_cast<unsigned long long>(s.retired), s.ipc(), s.cpi());
+                static_cast<unsigned long long>(s.retired), s.ipc(), s.cpi(),
+                100.0 * s.issue_utilization(cfg.width));
 
     std::printf("  stages   fetch %llu  decode %llu  rename %llu  dispatch %llu"
                 "  issue %llu  writeback %llu  squashed %llu\n",
@@ -354,25 +365,47 @@ int main(int argc, char** argv) {
     if (opts.use_ref) {
         ref::Options ropts;
         ropts.max_insts = opts.max_insts;
-        ropts.trace     = opts.trace;
+        std::FILE* ref_trace = nullptr;
+        if (!opts.trace_path.empty()) {
+            ref_trace = std::fopen(opts.trace_path.c_str(), "w");
+            if (!ref_trace) {
+                std::fprintf(stderr, "oooc: cannot write %s\n", opts.trace_path.c_str());
+                return 2;
+            }
+            ropts.trace     = true;
+            ropts.trace_out = ref_trace;
+        }
         const ref::Result r = ref::run(mem, loaded.entry, ropts);
+        if (ref_trace) std::fclose(ref_trace);
         for (int i = 0; i < 32; ++i) regs[i] = r.regs[i];
         halted = r.halted; trapped = r.trapped; budget = r.budget;
         retired = r.retired; exit_code = r.exit_code;
     } else {
-        if (opts.trace) {
-            std::fprintf(stderr, "oooc: --trace needs --ref\n");
-            return 2;
+        std::ofstream trace_out;
+        std::optional<Trace> trace;
+        if (!opts.trace_path.empty()) {
+            trace_out.open(opts.trace_path);
+            if (!trace_out) {
+                std::fprintf(stderr, "oooc: cannot write %s\n", opts.trace_path.c_str());
+                return 2;
+            }
+            Trace::Options topt;
+            topt.start      = opts.trace_start;
+            topt.max_cycles = opts.trace_cycles;
+            trace.emplace(trace_out, opts.cfg, loaded.entry, topt);
         }
+
         Cpu cpu(mem, opts.cfg, loaded.entry);
+        if (trace) cpu.attach_trace(&*trace);
         cpu.run(opts.max_cycles);
+
         regs      = cpu.regs();
         halted    = cpu.halted();
         trapped   = cpu.trapped();
         budget    = !cpu.done();
         retired   = cpu.retired();
         exit_code = cpu.exit_code();
-        if (opts.show_stats) print_stats(cpu.stats());
+        if (opts.show_stats) print_stats(cpu.stats(), opts.cfg);
     }
 
     if (opts.print_regs) {
