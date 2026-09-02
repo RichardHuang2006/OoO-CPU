@@ -102,16 +102,20 @@ SECTION("cli") {
     { CliOpts o; REQUIRE(parse({"oooc", "--stats"}, o) == 0); REQUIRE(o.show_stats); }
     { CliOpts o; REQUIRE(parse({"oooc", "--ipc-table"}, o) == 0); REQUIRE(o.ipc_table); }
 
-    // Trace flags: a path plus the window controls.
-    { CliOpts o; REQUIRE(parse({"oooc", "--trace", "out.ndjson"}, o) == 0);
-      REQUIRE(o.trace_path == "out.ndjson"); }
-    { CliOpts o; REQUIRE(parse({"oooc", "--trace=t.json", "--trace-start", "100",
-                                "--trace-cycles=250"}, o) == 0);
-      REQUIRE(o.trace_path == "t.json");
-      REQUIRE(o.trace_start == 100);
-      REQUIRE(o.trace_cycles == 250); }
-    { CliOpts o; REQUIRE(parse({"oooc", "--trace"}, o) != 0); }          // path required
-    { CliOpts o; REQUIRE(parse({"oooc", "--trace-start", "x"}, o) != 0); }
+    // Trace flags. Bare --trace turns tracing on with the default path; only
+    // the --trace=PATH spelling supplies one, so a positional ELF after it is
+    // never swallowed.
+    { CliOpts o; REQUIRE(parse({"oooc", "--trace"}, o) == 0);
+      REQUIRE(o.trace); REQUIRE(o.trace_path.empty()); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--trace=t.ndjson", "prog.elf"}, o) == 0);
+      REQUIRE(o.trace); REQUIRE(o.trace_path == "t.ndjson");
+      REQUIRE(o.elf_path == "prog.elf"); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--trace-from", "100",
+                                "--trace-max=250"}, o) == 0);
+      REQUIRE(o.trace_from == 100);
+      REQUIRE(o.trace_max == 250); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--trace-from", "x"}, o) != 0); }
+    { CliOpts o; REQUIRE(parse({"oooc", "--trace-max", "x"},  o) != 0); }
 
     // The pipeline is what runs unless the interpreter is asked for by name.
     { CliOpts o; REQUIRE(parse({"oooc", "prog.elf"}, o) == 0); REQUIRE(!o.use_ref); }
@@ -871,151 +875,272 @@ SECTION("stats") {
     }
 }
 
-// ------------------------------------------------------- @section("trace") ---
-// The cycle tracer is an observer: attaching it must change nothing, and what
-// it writes must be well-formed NDJSON that honors the window controls.
+// ------------------------------------------------------ @section("trace") ---
+namespace tracetest {
+
+inline std::string slurp(std::FILE* f) {
+    std::rewind(f);
+    std::string out;
+    char buf[4096];
+    std::size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    return out;
+}
+
+inline std::vector<std::string> split_lines(const std::string& s) {
+    std::vector<std::string> out;
+    std::size_t start = 0;
+    while (start < s.size()) {
+        const std::size_t nl = s.find('\n', start);
+        if (nl == std::string::npos) { out.push_back(s.substr(start)); break; }
+        out.push_back(s.substr(start, nl - start));
+        start = nl + 1;
+    }
+    return out;
+}
+
+// Enough of a JSON check to catch what a hand-rolled writer gets wrong: an
+// unbalanced container, an unterminated string, or a comma with nothing on one
+// side of it. Delimiters inside strings do not count, which matters because
+// instruction text is full of commas.
+inline bool json_ok(const std::string& s) {
+    int depth = 0;
+    bool in_str = false, esc = false;
+    char last = 0;                       // last significant char outside a string
+    for (const char c : s) {
+        if (in_str) {
+            if (esc)             esc = false;
+            else if (c == '\\')  esc = true;
+            else if (c == '"')   { in_str = false; last = '"'; }
+            continue;
+        }
+        switch (c) {
+        case '"': in_str = true; break;
+        case '{': case '[':
+            if (last == '"' || last == '}' || last == ']') return false;  // missing comma
+            ++depth; break;
+        case '}': case ']':
+            if (last == ',') return false;                                // trailing comma
+            if (--depth < 0) return false;
+            break;
+        case ',':
+            if (last == ',' || last == '{' || last == '[' || last == 0) return false;
+            break;
+        case ' ': continue;
+        default: break;
+        }
+        last = c;
+    }
+    return depth == 0 && !in_str && last == '}';
+}
+
+inline std::size_t count_of(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0, at = 0;
+    while ((at = hay.find(needle, at)) != std::string::npos) { ++n; at += needle.size(); }
+    return n;
+}
+
+// The text between "key":[ and the matching ], for shallow arrays.
+inline std::string array_of(const std::string& line, const std::string& key) {
+    const std::size_t at = line.find("\"" + key + "\":[");
+    if (at == std::string::npos) return "";
+    const std::size_t open = line.find('[', at);
+    const std::size_t close = line.find(']', open);
+    return line.substr(open + 1, close - open - 1);
+}
+
+}  // namespace tracetest
+
 SECTION("trace") {
-    using namespace asmc;
+    using namespace tracetest;
 
-    // ---- Trace invariance ---------------------------------------------------
-    // The same workload, traced and untraced: identical architectural results,
-    // identical cycle count, identical statistics, on a program with
-    // mispredicts, forwarding, replays, and squashes in play.
-    {
-        const wl::Workload& w = stattest::named("lcg_branch");
-        const Config cfg;
+    // fib exercises everything the trace has to describe: branches that
+    // mispredict, loads that forward, stores that drain at commit.
+    const wl::Workload& w = stattest::named("fib");
+    const Config cfg;
+    constexpr uint64_t WINDOW = 300;
 
-        Memory m_plain = cputest::image(w.words);
-        Cpu plain(m_plain, cfg, wl::TEXT);
-        REQUIRE(plain.run(w.budget * 8 + 1000));
+    Memory mem = cputest::image(w.words);
+    Cpu cpu(mem, cfg, wl::TEXT);
 
-        std::ostringstream sink;
-        Trace::Options topt;
-        topt.max_cycles = 1u << 30;                   // trace everything
-        Memory m_traced = cputest::image(w.words);
-        Cpu traced(m_traced, cfg, wl::TEXT);
-        Trace trace(sink, cfg, wl::TEXT, topt);
-        traced.attach_trace(&trace);
-        REQUIRE(traced.run(w.budget * 8 + 1000));
+    std::FILE* f = std::tmpfile();
+    REQUIRE(f != nullptr);
+    if (!f) return;
 
-        REQUIRE(traced.cycle()     == plain.cycle());
-        REQUIRE(traced.retired()   == plain.retired());
-        REQUIRE(traced.exit_code() == plain.exit_code());
-        REQUIRE(traced.halted()    == plain.halted());
-        for (int i = 0; i < 32; ++i) {
-            REQUIRE(traced.reg(static_cast<ArchReg>(i)) ==
-                    plain.reg(static_cast<ArchReg>(i)));
-        }
-        // The whole Stats block, field by field and stall by stall.
-        const Stats& a = plain.stats();
-        const Stats& b = traced.stats();
-        REQUIRE(a.cycles == b.cycles);
-        REQUIRE(a.fetched == b.fetched);
-        REQUIRE(a.decoded == b.decoded);
-        REQUIRE(a.renamed == b.renamed);
-        REQUIRE(a.dispatched == b.dispatched);
-        REQUIRE(a.issued == b.issued);
-        REQUIRE(a.wrote_back == b.wrote_back);
-        REQUIRE(a.retired == b.retired);
-        REQUIRE(a.squashed == b.squashed);
-        REQUIRE(a.branches == b.branches);
-        REQUIRE(a.mispredicts == b.mispredicts);
-        REQUIRE(a.btb_lookups == b.btb_lookups);
-        REQUIRE(a.btb_hits == b.btb_hits);
-        REQUIRE(a.ras_pops == b.ras_pops);
-        REQUIRE(a.ras_hits == b.ras_hits);
-        REQUIRE(a.loads == b.loads);
-        REQUIRE(a.stores == b.stores);
-        REQUIRE(a.load_forwards == b.load_forwards);
-        REQUIRE(a.load_replays == b.load_replays);
-        REQUIRE(a.load_memory == b.load_memory);
-        for (std::size_t i = 0; i < a.stalls.size(); ++i) {
-            REQUIRE(a.stalls[i] == b.stalls[i]);
-        }
+    CycleTrace tr(f);
+    tr.header(cfg, wl::TEXT, cpu.cdb_window());
+    cpu.observe(true);
+    while (!cpu.done() && cpu.cycle() < WINDOW) {
+        cpu.tick();
+        tr.snapshot(cpu);
+    }
+    cpu.observe(false);
 
-        // One header plus one record per cycle, all shaped like JSON objects.
-        const std::string text = sink.str();
-        std::istringstream lines(text);
-        std::string line;
-        uint64_t total = 0, cycles = 0;
-        bool header_first = false;
-        while (std::getline(lines, line)) {
-            REQUIRE(!line.empty());
-            REQUIRE(line.front() == '{');
-            REQUIRE(line.back()  == '}');
-            if (total == 0) {
-                header_first = line.find("\"type\":\"header\"") != std::string::npos;
-            } else {
-                REQUIRE(line.find("\"type\":\"cycle\"") != std::string::npos);
-                ++cycles;
-            }
-            ++total;
-        }
-        REQUIRE(header_first);
-        REQUIRE(cycles == plain.cycle());
-        REQUIRE(trace.cycles_recorded() == plain.cycle());
+    const std::string text = slurp(f);
+    std::fclose(f);
+    const std::vector<std::string> lines = split_lines(text);
 
-        // The header carries the configuration; the body carries the events
-        // the run demonstrably contained.
-        REQUIRE(text.find("\"config\":{") != std::string::npos);
-        REQUIRE(text.find("\"width\":2")  != std::string::npos);
-        REQUIRE(text.find("\"e\":\"F\"")  != std::string::npos);   // fetch
-        REQUIRE(text.find("\"e\":\"R\"")  != std::string::npos);   // rename
-        REQUIRE(text.find("\"e\":\"I\"")  != std::string::npos);   // issue
-        REQUIRE(text.find("\"e\":\"C\"")  != std::string::npos);   // complete
-        REQUIRE(text.find("\"e\":\"CM\"") != std::string::npos);   // commit
-        REQUIRE(text.find("\"e\":\"SQ\"") != std::string::npos);   // squash
-        REQUIRE(text.find("\"e\":\"MP\"") != std::string::npos);   // mispredict
-        REQUIRE(text.find("\"rob\":[")    != std::string::npos);
-        REQUIRE(text.find("\"iq\":[")     != std::string::npos);
-        REQUIRE(text.find("\"rat\":[")    != std::string::npos);
-        REQUIRE(text.find("\"asm\":\"")   != std::string::npos);
+    // ---- One header and one record per cycle, in order -------------------
+    REQUIRE(tr.records() == cpu.cycle());
+    REQUIRE(lines.size() == cpu.cycle() + 1);
+    REQUIRE(lines[0].find("\"kind\":\"header\"") != std::string::npos);
+    REQUIRE(lines[0].find("\"rob_size\":32") != std::string::npos);
+    REQUIRE(lines[0].find("\"cycle\":") == std::string::npos);   // how a reader tells it apart
+
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        REQUIRE_MSG(json_ok(lines[i]), "    malformed record on line " + std::to_string(i));
+    }
+    for (uint64_t c = 1; c <= cpu.cycle(); ++c) {
+        const std::string want = "{\"cycle\":" + std::to_string(c) + ",";
+        REQUIRE_MSG(lines[c].rfind(want, 0) == 0, "    line " + std::to_string(c) +
+                    " does not start with cycle " + std::to_string(c));
     }
 
-    // ---- Replay events appear when replays happen ---------------------------
-    {
-        const wl::Workload& w = stattest::named("store_forward");
-        std::ostringstream sink;
-        Trace::Options topt;
-        topt.max_cycles = 1u << 30;
-        Memory m = cputest::image(w.words);
-        Cpu cpu(m, Config{}, wl::TEXT);
-        Trace trace(sink, Config{}, wl::TEXT, topt);
-        cpu.attach_trace(&trace);
-        REQUIRE(cpu.run(w.budget * 8 + 1000));
-        if (cpu.stats().load_replays > 0) {
-            REQUIRE(sink.str().find("\"e\":\"RP\"") != std::string::npos);
+    // ---- Every structure the viewer draws is in every record -------------
+    for (const char* key : {"stalls", "stats", "fetch_q", "decode_q", "rename_q",
+                            "iq", "rob", "rob_head", "rob_count", "executing",
+                            "wb_fast", "wb_slow", "rat", "arch_rat", "free_list",
+                            "prf", "lq", "sq", "fu", "cdb_booked", "bpred",
+                            "events", "squashed_seqs", "retired_seqs"}) {
+        const std::string k = std::string("\"") + key + "\":";
+        for (std::size_t i = 1; i < lines.size(); ++i) {
+            REQUIRE_MSG(lines[i].find(k) != std::string::npos,
+                        std::string("    line ") + std::to_string(i) + " is missing " + key);
         }
-        REQUIRE(sink.str().find("\"lq\":[") != std::string::npos);
-        REQUIRE(sink.str().find("\"sq\":[") != std::string::npos);
     }
 
-    // ---- The window: start and maximum-cycle controls -----------------------
-    {
-        std::ostringstream sink;
-        Trace::Options topt;
-        topt.start      = 10;
-        topt.max_cycles = 5;
-        Memory m = cputest::image(fetest::addi_chain(60));
-        Cpu cpu(m, Config{}, wl::TEXT);
-        Trace trace(sink, Config{}, wl::TEXT, topt);
-        cpu.attach_trace(&trace);
-        REQUIRE(cpu.run(4000));
-        REQUIRE(cpu.cycle() > 20);                    // the run outlives the window
+    // ---- The mapping tables are always 32 wide ---------------------------
+    for (std::size_t i = 1; i < lines.size(); ++i) {
+        REQUIRE(count_of(array_of(lines[i], "rat"), ",") == 31);
+        REQUIRE(count_of(array_of(lines[i], "arch_rat"), ",") == 31);
+    }
 
-        std::istringstream lines(sink.str());
+    // ---- Every stall cause has a key, so no bar can go missing -----------
+    {
+        const std::size_t at = lines[1].find("\"stalls\":{");
+        const std::size_t end = lines[1].find('}', at);
+        const std::string block = lines[1].substr(at, end - at);
+        REQUIRE(count_of(block, ":") == static_cast<std::size_t>(Stall::COUNT) + 1);
+        for (int s = 0; s < static_cast<int>(Stall::COUNT); ++s) {
+            const std::string k = std::string("\"") +
+                                  trace_detail::stall_key(static_cast<Stall>(s)) + "\":";
+            REQUIRE(block.find(k) != std::string::npos);
+        }
+    }
+
+    // ---- A sentinel is written as absence, never as its numeric value ----
+    for (const char* k : {"\"seq\":4294967295", "\"dest\":4294967295",
+                          "\"dest_arch\":4294967295", "\"dest_phys\":4294967295",
+                          "\"stale_phys\":4294967295", "\"ckpt\":4294967295",
+                          "\"rob_head\":4294967295"}) {
+        REQUIRE_MSG(text.find(k) == std::string::npos,
+                    std::string("    sentinel leaked into the trace: ") + k);
+    }
+
+    // ---- Instruction text is sent once per PC ----------------------------
+    // The dictionary is what keeps a long trace small; a PC that re-registers
+    // every cycle would quietly undo that.
+    REQUIRE(lines[1].find("\"disasm\":{") != std::string::npos);
+    REQUIRE(count_of(text, "\"" + std::to_string(wl::TEXT) + "\":\"") == 1);
+    REQUIRE(count_of(text, "\"" + std::to_string(wl::TEXT + 4) + "\":\"") == 1);
+
+    // ---- Events name the instructions they are about ---------------------
+    REQUIRE(count_of(text, "issue seq") > 0);
+    REQUIRE(count_of(text, "retire seq") > 0);
+    REQUIRE(count_of(text, "MISPREDICT seq") > 0);      // fib mispredicts early and often
+
+    // ---- Observing a run does not change it ------------------------------
+    // The one property that makes a trace worth trusting.
+    {
+        Memory quiet_mem = cputest::image(w.words);
+        Cpu quiet(quiet_mem, cfg, wl::TEXT);
+        while (!quiet.done() && quiet.cycle() < WINDOW) quiet.tick();
+
+        REQUIRE(quiet.cycle() == cpu.cycle());
+        REQUIRE(quiet.retired() == cpu.retired());
+        REQUIRE(quiet.issued() == cpu.issued());
+        REQUIRE(quiet.stats().squashed == cpu.stats().squashed);
+        REQUIRE(quiet.stats().mispredicts == cpu.stats().mispredicts);
+        REQUIRE(quiet.fetch_pc() == cpu.fetch_pc());
+        REQUIRE(quiet.regs() == cpu.regs());
+        for (int s = 0; s < static_cast<int>(Stall::COUNT); ++s) {
+            REQUIRE(quiet.stats().stalls[static_cast<std::size_t>(s)] ==
+                    cpu.stats().stalls[static_cast<std::size_t>(s)]);
+        }
+    }
+
+    // ---- Per-cycle logs describe one cycle and not the ones before it ----
+    {
+        Memory m2 = cputest::image(w.words);
+        Cpu c2(m2, cfg, wl::TEXT);
+        c2.observe(true);
+        std::size_t cycles_with_events = 0;
+        for (int i = 0; i < 60; ++i) {
+            c2.tick();
+            if (!c2.events().empty()) ++cycles_with_events;
+            REQUIRE(c2.events().size() < 64);          // cleared, not accumulated
+        }
+        REQUIRE(cycles_with_events > 0);
+        c2.observe(false);
+        c2.tick();
+        REQUIRE(c2.events().empty());                  // nothing recorded while unobserved
+    }
+
+    // ---- The stage stamps are consistent with the pipeline ---------------
+    // Fetch happens before decode before rename before dispatch, and nothing
+    // is stamped with a cycle that has not happened yet.
+    {
+        Memory m3 = cputest::image(w.words);
+        Cpu c3(m3, cfg, wl::TEXT);
+        for (int i = 0; i < 200 && !c3.done(); ++i) c3.tick();
+        REQUIRE(c3.rob().size() > 0);
+        for (uint32_t k = 0; k < c3.rob().size(); ++k) {
+            const Uop& u = c3.inflight(c3.rob().nth(k));
+            REQUIRE(u.at.fetch >= 1);
+            REQUIRE(u.at.fetch <= u.at.decode);
+            REQUIRE(u.at.decode <= u.at.rename);
+            REQUIRE(u.at.rename <= c3.cycle());
+            // A ROB entry exists from rename, so the stages after it may not
+            // have happened yet — 0 means "not yet", never cycle zero.
+            if (u.at.dispatch) REQUIRE(u.at.rename <= u.at.dispatch);
+            if (u.at.issue)    REQUIRE(u.at.issue >= u.at.dispatch);
+            if (u.at.complete) REQUIRE(u.at.complete >= u.at.issue);
+            REQUIRE(c3.rob().nth_entry(k).complete == (u.at.complete != 0));
+        }
+    }
+
+    // ---- The CLI window: --trace-from and --trace-max ---------------------
+    // run_with_trace (main.cpp, included by this TU) runs the pre-window
+    // cycles unobserved, records exactly the window, and leaves the machine
+    // running so the caller can finish the program untraced.
+    {
+        const std::string path = "build/test_trace_window.ndjson";
+        CliOpts opts;
+        opts.trace       = true;
+        opts.trace_path  = path;
+        opts.trace_from  = 10;
+        opts.trace_max   = 5;
+
+        Memory m4 = cputest::image(w.words);
+        Cpu c4(m4, cfg, wl::TEXT);
+        REQUIRE(run_with_trace(c4, opts, wl::TEXT));
+        REQUIRE(!c4.observing());                      // observation switched off after
+        REQUIRE(c4.cycle() == 14);                     // from=10 + 5 records - 1
+        REQUIRE(c4.run(w.budget * 8 + 1000));          // and the run still finishes
+        REQUIRE(c4.exit_code() == 144);
+
+        std::ifstream in(path);
+        REQUIRE(bool(in));
         std::string line;
-        std::vector<uint64_t> recorded;
-        while (std::getline(lines, line)) {
-            const auto pos = line.find("\"cycle\":");
-            if (line.find("\"type\":\"cycle\"") == std::string::npos) continue;
-            recorded.push_back(std::stoull(line.substr(pos + 8)));
+        std::vector<std::string> got;
+        while (std::getline(in, line)) got.push_back(line);
+        REQUIRE(got.size() == 6);                      // header + five records
+        REQUIRE(got[0].find("\"kind\":\"header\"") != std::string::npos);
+        for (std::size_t i = 1; i < got.size(); ++i) {
+            const std::string want = "{\"cycle\":" + std::to_string(9 + i) + ",";
+            REQUIRE_MSG(got[i].rfind(want, 0) == 0,
+                        "    window record " + std::to_string(i) + " off cycle");
         }
-        REQUIRE(recorded.size() == 5);                // max_cycles honored
-        REQUIRE(recorded.front() == 10);              // start honored
-        for (std::size_t i = 1; i < recorded.size(); ++i) {
-            REQUIRE(recorded[i] == recorded[i - 1] + 1);
-        }
-        REQUIRE(trace.cycles_recorded() == 5);
+        std::remove(path.c_str());
     }
 }

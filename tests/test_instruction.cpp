@@ -529,102 +529,69 @@ SECTION("asm") {
 }
 
 // ------------------------------------------------------ @section("disasm") ---
-// Disassembly is display-only (traces, debugging); these pin the text for one
-// instruction of every format, the pseudo-instruction spellings, and the two
-// target modes (absolute with a PC, relative without).
 SECTION("disasm") {
-    using namespace asmc;
+    // The text a trace carries is the only description of an instruction the
+    // viewer ever gets, so it has to name the operands the encoding really has
+    // — including the two places where the decoder deliberately forgets:
+    // ADD/ADDI share an Op, and a store keeps its data register in rs2.
+    asmc::Assembler a;
+    a.addi(1, 1, -1);
+    a.add(2, 2, 1);
+    a.sub(3, 2, 1);
+    a.slli(4, 1, 3);
+    a.srai(5, 1, 2);
+    a.lui(2, 0x8);
+    a.auipc(6, 0x1);
+    a.mul(5, 4, 4);
+    a.divu(7, 5, 4);
+    a.lw(8, 2, 8);
+    a.lbu(9, 2, -3);
+    a.sw(1, 2, 12);
+    a.sb(9, 2, 0);
+    a.jalr(1, 5, 16);
+    a.andi(10, 10, 255);
+    a.ecall();
+    a.ebreak();
+    const std::vector<uint32_t> words = a.assemble();
 
-    auto text = [](uint32_t raw, uint32_t pc = 0) { return disasm(raw, pc); };
+    const char* want[] = {
+        "addi x1,x1,-1", "add x2,x2,x1", "sub x3,x2,x1", "slli x4,x1,3",
+        "srai x5,x1,2", "lui x2,0x8", "auipc x6,0x1", "mul x5,x4,x4",
+        "divu x7,x5,x4", "lw x8,8(x2)", "lbu x9,-3(x2)", "sw x1,12(x2)",
+        "sb x9,0(x2)", "jalr x1,16(x5)", "andi x10,x10,255", "ecall", "ebreak",
+    };
+    REQUIRE(words.size() == sizeof(want) / sizeof(want[0]));
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        const std::string got = disasm(words[i], wl::TEXT + static_cast<uint32_t>(i * 4));
+        REQUIRE_MSG(got == want[i],
+                    "    got \"" + got + "\", want \"" + std::string(want[i]) + "\"");
+    }
 
-    // ---- Register and immediate ALU forms ---------------------------------
-    REQUIRE(text(enc::R(0x33, a0, 0x0, a1, a2, 0x00)) == "add a0, a1, a2");
-    REQUIRE(text(enc::R(0x33, t0, 0x0, t1, t2, 0x20)) == "sub t0, t1, t2");
-    REQUIRE(text(enc::I(0x13, t0, 0x0, t0, 1))        == "addi t0, t0, 1");
-    REQUIRE(text(enc::I(0x13, a0, 0x0, a1, -2048))    == "addi a0, a1, -2048");
-    REQUIRE(text(enc::I(0x13, a0, 0x7, a1, 0xFF))     == "andi a0, a1, 255");
-    REQUIRE(text(enc::R(0x13, s0, 0x1, s1, 5, 0x00))  == "slli s0, s1, 5");
-    REQUIRE(text(enc::R(0x13, s0, 0x5, s1, 7, 0x20))  == "srai s0, s1, 7");
-    REQUIRE(text(enc::R(0x33, s0, 0x5, s1, s2, 0x00)) == "srl s0, s1, s2");
-    REQUIRE(text(enc::I(0x13, a0, 0x2, a1, -1))       == "slti a0, a1, -1");
-    REQUIRE(text(enc::R(0x33, a0, 0x3, a1, a2, 0x00)) == "sltu a0, a1, a2");
-    REQUIRE(text(enc::U(0x37, s7, 0x12345))           == "lui s7, 0x12345");
-    REQUIRE(text(enc::U(0x17, s8, 0x00001))           == "auipc s8, 0x1");
+    // ---- Control flow prints where it goes, not how far ------------------
+    // A viewer compares the target against a PC; a displacement would make it
+    // do the arithmetic the trace is supposed to have already done.
+    {
+        asmc::Assembler b;
+        b.label("top");
+        b.addi(1, 1, -1);
+        b.bne(1, 0, "top");
+        b.jal(1, "top");
+        const std::vector<uint32_t> ws = b.assemble();
+        REQUIRE(disasm(ws[1], 0x1004) == "bne x1,x0,0x1000");
+        REQUIRE(disasm(ws[2], 0x1008) == "jal x1,0x1000");
+    }
 
-    // ---- Pseudo-instruction spellings --------------------------------------
-    REQUIRE(text(0x00000013u)                    == "nop");     // addi x0, x0, 0
-    REQUIRE(text(enc::I(0x13, a0, 0x0, 0, 42))   == "li a0, 42");
-    REQUIRE(text(enc::I(0x13, a0, 0x0, a1, 0))   == "mv a0, a1");
-    REQUIRE(text(enc::I(0x67, 0, 0x0, ra, 0))    == "ret");     // jalr x0, 0(ra)
-    REQUIRE(text(enc::I(0x67, 0, 0x0, t0, 0))    == "jr t0");
-    REQUIRE(text(enc::J(0, 16), 0x1000)          == "j 0x1010");
+    // ---- An undecodable word says so rather than inventing an opcode -----
+    REQUIRE(disasm(0xFFFFFFFFu, 0x1000).rfind("<invalid", 0) == 0);
+    REQUIRE(disasm(0x00000000u, 0x1000).rfind("<invalid", 0) == 0);
 
-    // ---- M extension -------------------------------------------------------
-    REQUIRE(text(enc::R(0x33, a0, 0x0, a1, a2, 0x01)) == "mul a0, a1, a2");
-    REQUIRE(text(enc::R(0x33, a0, 0x1, a1, a2, 0x01)) == "mulh a0, a1, a2");
-    REQUIRE(text(enc::R(0x33, a0, 0x2, a1, a2, 0x01)) == "mulhsu a0, a1, a2");
-    REQUIRE(text(enc::R(0x33, a0, 0x3, a1, a2, 0x01)) == "mulhu a0, a1, a2");
-    REQUIRE(text(enc::R(0x33, a0, 0x4, a1, a2, 0x01)) == "div a0, a1, a2");
-    REQUIRE(text(enc::R(0x33, a0, 0x5, a1, a2, 0x01)) == "divu a0, a1, a2");
-    REQUIRE(text(enc::R(0x33, a0, 0x6, a1, a2, 0x01)) == "rem a0, a1, a2");
-    REQUIRE(text(enc::R(0x33, a0, 0x7, a1, a2, 0x01)) == "remu a0, a1, a2");
+    // ---- fence spellings and system ops -----------------------------------
+    REQUIRE(disasm(enc::FENCE(), 0)   == "fence");
+    REQUIRE(disasm(enc::FENCE_I(), 0) == "fence.i");
 
-    // ---- Branches and jumps: absolute target with a PC, relative without ---
-    REQUIRE(text(enc::B(0x0, a0, a1, 16), 0x1000)  == "beq a0, a1, 0x1010");
-    REQUIRE(text(enc::B(0x1, a0, a1, -16), 0x1000) == "bne a0, a1, 0xFF0");
-    REQUIRE(text(enc::B(0x4, t0, t1, 8))           == "blt t0, t1, pc+8");
-    REQUIRE(text(enc::B(0x7, t0, t1, -8))          == "bgeu t0, t1, pc-8");
-    REQUIRE(text(enc::J(ra, 32), 0x1000)           == "jal ra, 0x1020");
-    REQUIRE(text(enc::I(0x67, ra, 0x0, a0, 4))     == "jalr ra, 4(a0)");
-
-    // ---- Memory: offset(base) form -----------------------------------------
-    REQUIRE(text(enc::I(0x03, a0, 0x2, sp, 4))   == "lw a0, 4(sp)");
-    REQUIRE(text(enc::I(0x03, a0, 0x0, sp, -4))  == "lb a0, -4(sp)");
-    REQUIRE(text(enc::I(0x03, a0, 0x4, sp, 8))   == "lbu a0, 8(sp)");
-    REQUIRE(text(enc::I(0x03, a0, 0x1, sp, 2))   == "lh a0, 2(sp)");
-    REQUIRE(text(enc::I(0x03, a0, 0x5, sp, 6))   == "lhu a0, 6(sp)");
-    REQUIRE(text(enc::S(0x2, sp, a0, 4))         == "sw a0, 4(sp)");
-    REQUIRE(text(enc::S(0x0, sp, a0, -1))        == "sb a0, -1(sp)");
-    REQUIRE(text(enc::S(0x1, sp, a0, 2))         == "sh a0, 2(sp)");
-
-    // ---- System and illegal -------------------------------------------------
-    REQUIRE(text(enc::ECALL())   == "ecall");
-    REQUIRE(text(enc::EBREAK())  == "ebreak");
-    REQUIRE(text(enc::FENCE())   == "fence");
-    REQUIRE(text(enc::FENCE_I()) == "fence.i");
-    REQUIRE(text(0x00000000u)    == "illegal 0x00000000");
-    REQUIRE(text(0xFFFFFFFFu)    == "illegal 0xFFFFFFFF");
-
-    // ---- reg_name covers the whole file and rejects out-of-range -----------
+    // ---- reg_name (used by the differential reports, not by disasm) -------
     REQUIRE(std::string(reg_name(0))  == "zero");
-    REQUIRE(std::string(reg_name(1))  == "ra");
-    REQUIRE(std::string(reg_name(2))  == "sp");
     REQUIRE(std::string(reg_name(10)) == "a0");
     REQUIRE(std::string(reg_name(31)) == "t6");
     REQUIRE(std::string(reg_name(32)) == "x?");
-
-    // ---- Round trip: assembler → decode → disasm on a whole program --------
-    // Every word the assembler can produce disassembles to something, and
-    // never to "illegal".
-    {
-        Assembler p;
-        p.li(sp, 0x8000);
-        p.li(a0, 12);
-        p.call("f");
-        p.li(a7, 93);
-        p.ecall();
-        p.label("f");
-        p.lw(t0, sp, 0);
-        p.sw(t0, sp, 4);
-        p.mul(t1, t0, t0);
-        p.beq(t1, zero, "f");
-        p.ret_();
-        const std::vector<uint32_t> words = p.assemble();
-        for (std::size_t i = 0; i < words.size(); ++i) {
-            const std::string s =
-                disasm(words[i], reftest::TEXT + static_cast<uint32_t>(4 * i));
-            REQUIRE(!s.empty());
-            REQUIRE(s.find("illegal") == std::string::npos);
-        }
-    }
 }

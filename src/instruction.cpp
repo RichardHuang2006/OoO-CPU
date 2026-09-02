@@ -266,42 +266,30 @@ const char* reg_name(ArchReg r) {
 
 namespace {
 
-std::string hex_of(uint32_t v) {
+// ---- 8. helpers ------------------------------------------------------------
+
+std::string reg(ArchReg r) { return "x" + std::to_string(r); }
+
+std::string hex32(uint32_t v) {
     char buf[16];
     std::snprintf(buf, sizeof(buf), "0x%X", v);
     return buf;
 }
 
-// Branch / JAL target: absolute when the caller knows the PC, relative
-// otherwise, so a lone decode still disassembles readably.
-std::string target_of(uint32_t pc, int32_t imm) {
-    if (pc != 0) return hex_of(alu::branch_target(pc, imm));
-    char buf[24];
-    std::snprintf(buf, sizeof(buf), "pc%+d", imm);
-    return buf;
-}
+std::string dec(int32_t v) { return std::to_string(v); }
 
-std::string r3(const char* m, ArchReg rd, ArchReg a, ArchReg b) {
-    return std::string(m) + " " + reg_name(rd) + ", " + reg_name(a) + ", " + reg_name(b);
+std::string rrr(const char* m, const Decoded& d) {
+    return std::string(m) + " " + reg(d.rd) + "," + reg(d.rs1) + "," + reg(d.rs2);
 }
-std::string ri(const char* m, ArchReg rd, ArchReg a, int32_t imm) {
-    return std::string(m) + " " + reg_name(rd) + ", " + reg_name(a) + ", " +
-           std::to_string(imm);
+std::string rri(const char* m, const Decoded& d) {
+    return std::string(m) + " " + reg(d.rd) + "," + reg(d.rs1) + "," + dec(d.imm);
 }
-std::string mem_form(const char* m, ArchReg r, ArchReg base, int32_t off) {
-    return std::string(m) + " " + reg_name(r) + ", " + std::to_string(off) +
-           "(" + reg_name(base) + ")";
+std::string mem_form(const char* m, ArchReg data, const Decoded& d) {
+    return std::string(m) + " " + reg(data) + "," + dec(d.imm) + "(" + reg(d.rs1) + ")";
 }
-
-const char* branch_mnemonic(Op op) {
-    switch (op) {
-    case Op::BEQ:  return "beq";
-    case Op::BNE:  return "bne";
-    case Op::BLT:  return "blt";
-    case Op::BGE:  return "bge";
-    case Op::BLTU: return "bltu";
-    default:       return "bgeu";
-    }
+std::string br(const char* m, const Decoded& d, uint32_t pc) {
+    return std::string(m) + " " + reg(d.rs1) + "," + reg(d.rs2) + "," +
+           hex32(pc + static_cast<uint32_t>(d.imm));
 }
 
 }  // namespace
@@ -310,76 +298,61 @@ std::string disasm(const Decoded& d, uint32_t pc) {
     const bool imm_form = uses_immediate(d);   // OP-IMM vs OP spelling
 
     switch (d.op) {
-    // ---- ALU, immediate and register forms ---------------------------------
-    case Op::ADD:
-        if (!imm_form) return r3("add", d.rd, d.rs1, d.rs2);
-        // The canonical pseudo-instructions are all ADDI in disguise.
-        if (d.rd == 0 && d.rs1 == 0 && d.imm == 0) return "nop";
-        if (d.rs1 == 0) return std::string("li ") + reg_name(d.rd) + ", " +
-                               std::to_string(d.imm);
-        if (d.imm == 0) return std::string("mv ") + reg_name(d.rd) + ", " +
-                               reg_name(d.rs1);
-        return ri("addi", d.rd, d.rs1, d.imm);
-    case Op::SUB:  return r3("sub", d.rd, d.rs1, d.rs2);
-    case Op::SLL:  return imm_form ? ri("slli", d.rd, d.rs1, d.imm) : r3("sll", d.rd, d.rs1, d.rs2);
-    case Op::SRL:  return imm_form ? ri("srli", d.rd, d.rs1, d.imm) : r3("srl", d.rd, d.rs1, d.rs2);
-    case Op::SRA:  return imm_form ? ri("srai", d.rd, d.rs1, d.imm) : r3("sra", d.rd, d.rs1, d.rs2);
-    case Op::AND:  return imm_form ? ri("andi", d.rd, d.rs1, d.imm) : r3("and", d.rd, d.rs1, d.rs2);
-    case Op::OR:   return imm_form ? ri("ori",  d.rd, d.rs1, d.imm) : r3("or",  d.rd, d.rs1, d.rs2);
-    case Op::XOR:  return imm_form ? ri("xori", d.rd, d.rs1, d.imm) : r3("xor", d.rd, d.rs1, d.rs2);
-    case Op::SLT:  return imm_form ? ri("slti", d.rd, d.rs1, d.imm) : r3("slt", d.rd, d.rs1, d.rs2);
-    case Op::SLTU: return imm_form ? ri("sltiu", d.rd, d.rs1, d.imm) : r3("sltu", d.rd, d.rs1, d.rs2);
+    case Op::ADD:  return imm_form ? rri("addi",  d) : rrr("add",  d);
+    case Op::SLT:  return imm_form ? rri("slti",  d) : rrr("slt",  d);
+    case Op::SLTU: return imm_form ? rri("sltiu", d) : rrr("sltu", d);
+    case Op::XOR:  return imm_form ? rri("xori",  d) : rrr("xor",  d);
+    case Op::OR:   return imm_form ? rri("ori",   d) : rrr("or",   d);
+    case Op::AND:  return imm_form ? rri("andi",  d) : rrr("and",  d);
+    case Op::SLL:  return imm_form ? rri("slli",  d) : rrr("sll",  d);
+    case Op::SRL:  return imm_form ? rri("srli",  d) : rrr("srl",  d);
+    case Op::SRA:  return imm_form ? rri("srai",  d) : rrr("sra",  d);
+    case Op::SUB:  return rrr("sub", d);
 
+    // The immediate already sits at bits 31..12; print the field, the way an
+    // assembler wrote it.
     case Op::LUI:
-        return std::string("lui ") + reg_name(d.rd) + ", " +
-               hex_of((static_cast<uint32_t>(d.imm) >> 12) & 0xFFFFF);
+        return "lui " + reg(d.rd) + "," + hex32(static_cast<uint32_t>(d.imm) >> 12);
     case Op::AUIPC:
-        return std::string("auipc ") + reg_name(d.rd) + ", " +
-               hex_of((static_cast<uint32_t>(d.imm) >> 12) & 0xFFFFF);
+        return "auipc " + reg(d.rd) + "," + hex32(static_cast<uint32_t>(d.imm) >> 12);
 
-    // ---- M extension --------------------------------------------------------
-    case Op::MUL:    return r3("mul",    d.rd, d.rs1, d.rs2);
-    case Op::MULH:   return r3("mulh",   d.rd, d.rs1, d.rs2);
-    case Op::MULHSU: return r3("mulhsu", d.rd, d.rs1, d.rs2);
-    case Op::MULHU:  return r3("mulhu",  d.rd, d.rs1, d.rs2);
-    case Op::DIV:    return r3("div",    d.rd, d.rs1, d.rs2);
-    case Op::DIVU:   return r3("divu",   d.rd, d.rs1, d.rs2);
-    case Op::REM:    return r3("rem",    d.rd, d.rs1, d.rs2);
-    case Op::REMU:   return r3("remu",   d.rd, d.rs1, d.rs2);
+    case Op::MUL:    return rrr("mul",    d);
+    case Op::MULH:   return rrr("mulh",   d);
+    case Op::MULHSU: return rrr("mulhsu", d);
+    case Op::MULHU:  return rrr("mulhu",  d);
+    case Op::DIV:    return rrr("div",    d);
+    case Op::DIVU:   return rrr("divu",   d);
+    case Op::REM:    return rrr("rem",    d);
+    case Op::REMU:   return rrr("remu",   d);
 
-    // ---- Control flow --------------------------------------------------------
-    case Op::BEQ: case Op::BNE: case Op::BLT:
-    case Op::BGE: case Op::BLTU: case Op::BGEU:
-        return std::string(branch_mnemonic(d.op)) + " " + reg_name(d.rs1) +
-               ", " + reg_name(d.rs2) + ", " + target_of(pc, d.imm);
+    case Op::BEQ:  return br("beq",  d, pc);
+    case Op::BNE:  return br("bne",  d, pc);
+    case Op::BLT:  return br("blt",  d, pc);
+    case Op::BGE:  return br("bge",  d, pc);
+    case Op::BLTU: return br("bltu", d, pc);
+    case Op::BGEU: return br("bgeu", d, pc);
 
     case Op::JAL:
-        if (d.rd == 0) return std::string("j ") + target_of(pc, d.imm);
-        return std::string("jal ") + reg_name(d.rd) + ", " + target_of(pc, d.imm);
+        return "jal " + reg(d.rd) + "," + hex32(pc + static_cast<uint32_t>(d.imm));
     case Op::JALR:
-        if (d.rd == 0 && d.rs1 == 1 && d.imm == 0) return "ret";
-        if (d.rd == 0 && d.imm == 0) return std::string("jr ") + reg_name(d.rs1);
-        return std::string("jalr ") + reg_name(d.rd) + ", " +
-               std::to_string(d.imm) + "(" + reg_name(d.rs1) + ")";
+        return "jalr " + reg(d.rd) + "," + dec(d.imm) + "(" + reg(d.rs1) + ")";
 
-    // ---- Memory --------------------------------------------------------------
-    case Op::LB:  return mem_form("lb",  d.rd,  d.rs1, d.imm);
-    case Op::LH:  return mem_form("lh",  d.rd,  d.rs1, d.imm);
-    case Op::LW:  return mem_form("lw",  d.rd,  d.rs1, d.imm);
-    case Op::LBU: return mem_form("lbu", d.rd,  d.rs1, d.imm);
-    case Op::LHU: return mem_form("lhu", d.rd,  d.rs1, d.imm);
-    case Op::SB:  return mem_form("sb",  d.rs2, d.rs1, d.imm);
-    case Op::SH:  return mem_form("sh",  d.rs2, d.rs1, d.imm);
-    case Op::SW:  return mem_form("sw",  d.rs2, d.rs1, d.imm);
+    case Op::LB:  return mem_form("lb",  d.rd, d);
+    case Op::LH:  return mem_form("lh",  d.rd, d);
+    case Op::LW:  return mem_form("lw",  d.rd, d);
+    case Op::LBU: return mem_form("lbu", d.rd, d);
+    case Op::LHU: return mem_form("lhu", d.rd, d);
 
-    // ---- System ----------------------------------------------------------------
+    // A store names the register it reads, which the decoder keeps in rs2.
+    case Op::SB: return mem_form("sb", d.rs2, d);
+    case Op::SH: return mem_form("sh", d.rs2, d);
+    case Op::SW: return mem_form("sw", d.rs2, d);
+
     case Op::FENCE:   return "fence";
     case Op::FENCE_I: return "fence.i";
     case Op::ECALL:   return "ecall";
     case Op::EBREAK:  return "ebreak";
     case Op::INVALID: break;
     }
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "illegal 0x%08X", d.raw);
-    return buf;
+    return "<invalid " + hex32(d.raw) + ">";
 }

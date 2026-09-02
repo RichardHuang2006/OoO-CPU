@@ -296,19 +296,27 @@ checkpoints, queue seats, or reservations.
 ## 13. Cycle tracing
 
 `trace.h` is a debugging/visualization subsystem, deliberately separate from
-the statistics. `--trace out.ndjson` writes newline-delimited JSON: one header
-record carrying the full configuration, then one record per traced cycle with
-the cycle's events (fetch/decode/rename/dispatch/issue/replay/complete/commit/
-squash/mispredict, each stamped with the instruction's sequence number) and
-end-of-cycle snapshots of the ROB, issue queue, load/store queues, speculative
-and committed RAT, PRF values and ready bits, free-list and checkpoint
-headroom, functional-unit occupancy, future CDB reservations, and predictor
-state. `--trace-start N` and `--trace-cycles N` bound the window.
+the statistics. `--trace[=PATH]` (default `trace.ndjson`) writes
+newline-delimited JSON: one header record carrying the full configuration,
+then one record per traced cycle — a photograph of the machine, never an
+opinion about it. Each record holds the cycle's events (predict/rename/issue/
+replay/forward/writeback/retire/mispredict/trap, each naming the instruction's
+sequence number), per-instruction stage timestamps, and snapshots of the
+front-end queues, ROB, issue queue, load/store queues, speculative and
+committed RAT, the live physical registers, free-list and checkpoint headroom,
+functional-unit occupancy, the CDB booking ring, and predictor state (GHR, RAS
+contents, sampled PHT counters). Instruction text is disassembled once per PC
+into a `disasm` map; sentinels are written as `null`, false booleans by
+omission, which keeps a long trace browser-sized. `--trace-from N` and
+`--trace-max N` bound the window; the run itself always continues to
+completion, so the exit code and `--stats` match an untraced run.
 
 The tracer only observes: a traced run is cycle-for-cycle and
 statistic-for-statistic identical to an untraced one (a test enforces this).
-Open `tools/oooviz.html` in a browser and drop a trace on it to scrub through
-a pipeline diagram and per-cycle machine state.
+`make trace` writes `build/fib.ndjson` in one step; open `tools/oooviz.html`
+in a browser and load the file to replay the machine pane by pane,
+cross-highlight one instruction everywhere it appears, or switch to the
+pipeline diagram view.
 
 A *cycle trace* answers "what happened on cycle 812?"; the *aggregate
 statistics* answer "how did the whole run go?" — keep the two ideas apart.
@@ -350,6 +358,8 @@ trace invariance. `make debug` runs everything under ASan + UBSan.
 make                 # build build/oooc (release, -O2)
 make test            # build and run all six test binaries (regenerates examples/)
 make debug           # the same suite + CLI binary under ASan + UBSan
+make trace           # write build/fib.ndjson for tools/oooviz.html
+                     # (TRACE_PROG=matmul TRACE_CYCLES=5000 to vary)
 make examples        # assemble the bundled workloads into examples/*.hex
 make clean           # remove build/ and examples/
 
@@ -362,9 +372,10 @@ build/oooc program.elf --regs
 build/oooc --hex examples/fib.hex --base 0x1000 --ref
 
 # record a cycle trace and view it
-build/oooc --hex examples/fib.hex --base 0x1000 --trace fib.ndjson --trace-cycles 2000
-# then open tools/oooviz.html in a browser and drop fib.ndjson on it
-# (--ref --trace PATH writes a plain retired-instruction log instead)
+build/oooc --hex examples/fib.hex --base 0x1000 --trace=fib.ndjson --trace-max 2000
+# then open tools/oooviz.html in a browser and load fib.ndjson
+# (--trace-from N starts the window later; with --ref, --trace[=PATH] writes a
+#  plain retired-instruction log instead)
 
 # every microarchitectural knob is a flag; see them all:
 build/oooc --help    # --width --rob --prf --iq --lq --sq --cdb --alu --mul ...

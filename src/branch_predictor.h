@@ -181,15 +181,19 @@ public:
 
     uint32_t peek() const { return count_ == 0 ? 0 : stack_[top_]; }
 
-    // Top-down contents, for traces and tests; never read by prediction.
+    // The k-th live entry counting down from the top, k == 0 being what pop()
+    // would return. Out of range reads as 0, the same as popping an empty
+    // stack, so a caller walking the whole stack needs no bound of its own.
+    uint32_t peek_at(uint32_t k) const {
+        if (k >= count_) return 0;
+        return stack_[(top_ + size_ - (k % size_)) % size_];
+    }
+
+    // Top-down contents, for tests; never read by prediction.
     std::vector<uint32_t> entries() const {
         std::vector<uint32_t> out;
         out.reserve(count_);
-        uint32_t idx = top_;
-        for (uint32_t k = 0; k < count_; ++k) {
-            out.push_back(stack_[idx]);
-            idx = (idx + size_ - 1) % size_;
-        }
+        for (uint32_t k = 0; k < count_; ++k) out.push_back(peek_at(k));
         return out;
     }
 

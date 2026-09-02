@@ -234,18 +234,26 @@ constexpr uint32_t remu(uint32_t a, uint32_t b) {
 }  // namespace alu
 
 // ---------------------------------------------------------------------------
-// 8. Disassembly, for traces and debugging. Never consulted by execution.
+// 8. Disassembly, for traces and for anything a human reads. Never consulted
+//    by execution.
+//
+//    The decoder throws away the distinction between ADD and ADDI — the
+//    function unit does not care where the second operand came from — so the
+//    mnemonic is recovered here from the opcode field, the one place the raw
+//    word still says it. Branch and jump targets print absolute, because a
+//    trace viewer wants an address it can compare against a PC, not a
+//    displacement it would have to add.
 // ---------------------------------------------------------------------------
 
 // ABI name of an architectural register: 10 → "a0". Out-of-range → "x?".
+// The differential test reports use this; disasm() itself prints x-numbers.
 const char* reg_name(ArchReg r);
 
-// One instruction as text, e.g. "addi t0, t0, 1" or "beq a0, a1, 0x1010".
-// `pc` resolves PC-relative targets; branch and JAL targets print absolute
-// when it is supplied and as "pc+off" when it is zero. Common pseudo-forms
-// (nop, li, mv, j, jr, ret) print in their pseudo spelling.
-std::string disasm(const Decoded& d, uint32_t pc = 0);
+// One decoded instruction as text, e.g. "addi x5,x5,1" or "lw x10,4(x2)".
+// `pc` only matters for the ops whose printed form names an address.
+std::string disasm(const Decoded& d, uint32_t pc);
 
-inline std::string disasm(uint32_t raw, uint32_t pc = 0) {
+// Convenience for callers holding only the word.
+inline std::string disasm(uint32_t raw, uint32_t pc) {
     return disasm(decode(raw), pc);
 }

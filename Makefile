@@ -1,6 +1,6 @@
 # Mini-CPU — 7-stage out-of-order RV32IM simulator
 #
-# Targets: all (release) · debug (ASan+UBSan) · test · examples · clean · help
+# Targets: all (release) · debug (ASan+UBSan) · test · trace · examples · clean · help
 
 CXX      ?= g++
 CXXSTD    = -std=c++17
@@ -31,7 +31,7 @@ HDR        = $(wildcard src/*.h) $(wildcard tests/*.h)
 # replaces by #including it.
 LIB_SRC = $(filter-out src/main.cpp,$(CPU_SRC))
 
-.PHONY: all debug test examples clean help
+.PHONY: all debug test examples trace clean help
 .DEFAULT_GOAL := all
 
 # ---------------------------------------------------------------- release ---
@@ -80,6 +80,21 @@ $(DBGDIR)/%.o: src/%.cpp | $(DBGDIR)
 $(BUILD)/test_%-debug: tests/test_%.cpp $(LIB_SRC) $(CPU_SRC) $(HDR) | $(BUILD)
 	$(CXX) $(CXXFLAGS_DBG) $< $(LIB_SRC) -o $@ $(LDFLAGS_DBG)
 
+# ----------------------------------------------------------------- trace ---
+# A cycle trace of a bundled program, sized for the visualiser rather than for
+# a full run: records average ~8 KB, so a window is what you want.
+TRACE_PROG   ?= fib
+TRACE_CYCLES ?= 2000
+TRACE_OUT     = $(BUILD)/$(TRACE_PROG).ndjson
+
+# oooc exits with the traced program's own exit code, so the status says
+# nothing about whether the trace was written — the file does.
+trace: all examples
+	./$(BUILD)/oooc --hex examples/$(TRACE_PROG).hex --base 0x1000 \
+	  --trace=$(TRACE_OUT) --trace-max $(TRACE_CYCLES) || true
+	@test -s $(TRACE_OUT) || { echo "trace: nothing written to $(TRACE_OUT)"; exit 1; }
+	@echo "open tools/oooviz.html in a browser and load $(TRACE_OUT)"
+
 # --------------------------------------------------------------- tooling ---
 $(BUILD)/gen_examples: $(TOOLS_SRC) tests/workloads.h tests/asm.h | $(BUILD)
 	$(CXX) $(CXXFLAGS_REL) $(TOOLS_SRC) -o $@
@@ -99,6 +114,8 @@ help:
 	@echo "  all      build/oooc          (release, -O2)"
 	@echo "  test     build and run the six test binaries (release)"
 	@echo "  debug    the same suite plus build/oooc-debug under ASan + UBSan"
+	@echo "  trace    write a cycle trace for tools/oooviz.html"
+	@echo "           (TRACE_PROG=fib TRACE_CYCLES=2000)"
 	@echo "  examples assemble the bundled programs into examples/"
 	@echo "  clean    remove build/ and examples/"
 
